@@ -7,9 +7,82 @@ on:
       - main
 
 jobs:
-  dukascopy-quant-pipeline:
+  # ==================== جاب اول: دانلود و کش ====================
+  download-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Requirements
+        run: pip install pandas numpy
+
+      # تلاش برای restore کش
+      - name: Restore Cache
+        id: cache-data
+        uses: actions/cache/restore@v4
+        with:
+          path: ./data
+          key: dukascopy-raw-eurusd-gbpusd-2022-2024-v5
+
+      - name: Cache Status
+        run: |
+          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
+          echo "=== محتوای data ==="
+          ls -lah ./data/ 2>/dev/null || echo "پوشه data خالی است"
+
+      # دانلود فقط اگر کش نبود
+      - name: Download Market Data
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: python download_dukascopy.py
+
+      # verify بعد از دانلود (یا کش)
+      - name: Verify Data Exists
+        run: |
+          echo "=== بررسی فایل‌ها ==="
+          ls -lah ./data/
+          
+          FILE_COUNT=$(ls ./data/*.csv 2>/dev/null | wc -l)
+          echo "تعداد فایل‌های CSV: $FILE_COUNT"
+          
+          if [ "$FILE_COUNT" -lt 2 ]; then
+            echo "❌ خطا: فایل‌های کافی یافت نشد!"
+            exit 1
+          fi
+          
+          for f in ./data/*.csv; do
+            lines=$(wc -l < "$f")
+            size=$(du -sh "$f" | cut -f1)
+            echo "✅ $f | $lines خط | $size"
+            
+            if [ "$lines" -lt 1000 ]; then
+              echo "❌ خطا: فایل $f خیلی کوچک است!"
+              exit 1
+            fi
+          done
+          
+          echo "✅ همه فایل‌ها سالم هستند"
+
+      # ذخیره کش بلافاصله بعد از verify موفق
+      - name: Save Cache
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./data
+          key: dukascopy-raw-eurusd-gbpusd-2022-2024-v5
+
+  # ==================== جاب دوم: بک‌تست ====================
+  run-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: download-data  # منتظر جاب اول می‌ماند
 
     steps:
       - name: Checkout Repository
@@ -23,33 +96,26 @@ jobs:
 
       - name: Install Python Requirements
         run: |
-          python -m pip install --upgrade pip
           pip install pandas numpy
 
-      # کش بر اساس بازه زمانی - نیازی به Node.js نیست
-      - name: Cache Dukascopy Data
+      # restore کش در جاب دوم
+      - name: Restore Data Cache
         id: cache-data
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ./data
           key: dukascopy-raw-eurusd-gbpusd-2022-2024-v5
 
-      # دانلود مستقیم با Python خالص - بدون وابستگی خارجی
-      - name: Download Market Data
-        if: steps.cache-data.outputs.cache-hit != 'true'
+      - name: Verify Cache Restored
         run: |
-          python download_dukascopy.py
-
-      - name: Verify Data
-        run: |
-          echo "=== فایل‌های دانلود شده ==="
+          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
           ls -lah ./data/
           
-          # چک تعداد خطوط
-          for f in ./data/*.csv; do
-            lines=$(wc -l < "$f")
-            echo "$f : $lines خط"
-          done
+          if [ -z "$(ls -A ./data/*.csv 2>/dev/null)" ]; then
+            echo "❌ کش restore نشد!"
+            exit 1
+          fi
+          echo "✅ داده‌ها آماده هستند"
 
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
