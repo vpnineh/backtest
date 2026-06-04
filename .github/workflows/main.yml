@@ -1,7 +1,7 @@
 name: 5-Years Ultimate Backtest (M15, M5, M2, M1)
 
 on:
-  workflow_dispatch: # برای اجرای دستی از پنل گیت‌هاب
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -9,6 +9,9 @@ on:
 jobs:
   dukascopy-quant-pipeline:
     runs-on: ubuntu-latest
+    
+    # افزایش timeout برای دانلود ۵ ساله
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -30,25 +33,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
+      # نصب صریح پکیج به جای npx (جلوگیری از مشکل نسخه)
+      - name: Install Dukascopy-Node
+        run: |
+          npm install -g dukascopy-node
+          # نمایش نسخه و آپشن‌های معتبر
+          dukascopy-node --version
+          dukascopy-node --help
+
       # ----------------- سیستم هوشمند کش دیتا -----------------
       - name: Cache Dukascopy Data
         id: cache-data
         uses: actions/cache@v4
         with:
           path: ./data
-          # اگر زمانی خواستید تاریخ را عوض کنید، این نام را تغییر دهید تا کش رفرش شود
-          key: dukascopy-m1-eurusd-gbpusd-2019-2024-v1
+          key: dukascopy-m1-eurusd-gbpusd-2019-2024-v3
 
-      # ----------------- مرحله اول: دانلود ایمن (عبور از فایروال) -----------------
-      # ----------------- مرحله اول: دانلود ایمن (عبور از فایروال) -----------------
+      # ----------------- دانلود داده (فقط اگر کش نداشت) -----------------
       - name: Download 5-Year M1 Data from Dukascopy
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
           mkdir -p data
-          # استفاده از فلگ‌های کامل برای جلوگیری از تداخل
-          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data --debug --batch-size 5 --retries 10 --pause 500
-          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data --debug --batch-size 5 --retries 10 --pause 500
-      # ----------------- مرحله دوم: اجرای پردازشگر پایتون -----------------
+          
+          echo "=== شروع دانلود EURUSD M1 (۵ سال) ==="
+          # فقط از آپشن‌های معتبر استفاده می‌کنیم
+          dukascopy-node \
+            --instrument eurusd \
+            --timeframe m1 \
+            --date-from 2019-01-01 \
+            --date-to 2024-01-01 \
+            --format csv \
+            --directory ./data \
+            --debug
+          
+          echo "=== شروع دانلود GBPUSD M1 (۵ سال) ==="
+          dukascopy-node \
+            --instrument gbpusd \
+            --timeframe m1 \
+            --date-from 2019-01-01 \
+            --date-to 2024-01-01 \
+            --format csv \
+            --directory ./data \
+            --debug
+          
+          echo "=== بررسی فایل‌های دانلود شده ==="
+          ls -lah ./data/
+          du -sh ./data/
+
+      # ----------------- مرحله دوم: پردازش پایتون -----------------
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
 
