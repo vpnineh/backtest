@@ -16,31 +16,56 @@ class DukascopyMultiTimeframeOptimizer:
         self.base_data = pd.DataFrame()
 
     def load_base_m1_data(self):
-        logging.info("در حال بارگذاری دیتای خام 1 دقیقه‌ای از فایل‌های دانلود شده...")
-        try:
-            eurusd_file = glob.glob('data/*eurusd*.csv')[0]
-            gbpusd_file = glob.glob('data/*gbpusd*.csv')[0]
+    logging.info("در حال بارگذاری دیتای خام 1 دقیقه‌ای از فایل‌های دانلود شده...")
+    try:
+        # لیست همه فایل‌های CSV
+        all_files = glob.glob('data/*.csv')
+        logging.info(f"فایل‌های یافت شده: {all_files}")
+        
+        if not all_files:
+            raise FileNotFoundError("هیچ فایل CSV در پوشه data یافت نشد!")
+        
+        # پیدا کردن فایل‌ها بدون case sensitivity
+        eurusd_file = None
+        gbpusd_file = None
+        
+        for f in all_files:
+            f_lower = f.lower()
+            if 'eurusd' in f_lower:
+                eurusd_file = f
+            elif 'gbpusd' in f_lower:
+                gbpusd_file = f
+        
+        if not eurusd_file:
+            raise FileNotFoundError(f"فایل EURUSD یافت نشد. فایل‌های موجود: {all_files}")
+        if not gbpusd_file:
+            raise FileNotFoundError(f"فایل GBPUSD یافت نشد. فایل‌های موجود: {all_files}")
             
-            df_eur = pd.read_csv(eurusd_file)
-            df_gbp = pd.read_csv(gbpusd_file)
-            
-            # تبدیل زمان به فرمت استاندارد
-            df_eur['timestamp'] = pd.to_datetime(df_eur['timestamp'], unit='ms')
-            df_gbp['timestamp'] = pd.to_datetime(df_gbp['timestamp'], unit='ms')
-            
-            df_eur.set_index('timestamp', inplace=True)
-            df_gbp.set_index('timestamp', inplace=True)
-            
-            df_eur = df_eur[['close']].rename(columns={'close': 'EURUSD'})
-            df_gbp = df_gbp[['close']].rename(columns={'close': 'GBPUSD'})
-            
-            # ادغام دیتاها
-            self.base_data = df_eur.join(df_gbp, how='inner').dropna()
-            logging.info(f"دیتای 1 دقیقه با موفقیت لود شد. تعداد کندل‌ها: {len(self.base_data)}")
-            
-        except Exception as e:
-            logging.error(f"خطا در پردازش دیتای پایه: {e}")
-            raise
+        logging.info(f"EURUSD: {eurusd_file}")
+        logging.info(f"GBPUSD: {gbpusd_file}")
+        
+        df_eur = pd.read_csv(eurusd_file)
+        df_gbp = pd.read_csv(gbpusd_file)
+        
+        logging.info(f"ستون‌های EURUSD: {df_eur.columns.tolist()}")
+        logging.info(f"نمونه داده EURUSD:\n{df_eur.head(3)}")
+        
+        # تبدیل زمان - هم string هم timestamp را handle می‌کند
+        df_eur['timestamp'] = pd.to_datetime(df_eur['timestamp'])
+        df_gbp['timestamp'] = pd.to_datetime(df_gbp['timestamp'])
+        
+        df_eur.set_index('timestamp', inplace=True)
+        df_gbp.set_index('timestamp', inplace=True)
+        
+        df_eur = df_eur[['close']].rename(columns={'close': 'EURUSD'})
+        df_gbp = df_gbp[['close']].rename(columns={'close': 'GBPUSD'})
+        
+        self.base_data = df_eur.join(df_gbp, how='inner').dropna()
+        logging.info(f"✅ دیتا لود شد | تعداد کندل: {len(self.base_data):,}")
+        
+    except Exception as e:
+        logging.error(f"خطا در پردازش دیتای پایه: {e}")
+        raise
 
     def resample_data(self, timeframe: str) -> pd.DataFrame:
         """تبدیل دیتای 1 دقیقه به تایم‌فریم‌های بالاتر (مثلا 5min یا 15min)"""
