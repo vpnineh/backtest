@@ -1,4 +1,4 @@
-name: 5-Years Ultimate Backtest (M15, M5, M2, M1)
+name: 2-Years MVP Backtest (M15, M5, M2, M1)
 
 on:
   workflow_dispatch:
@@ -9,15 +9,13 @@ on:
 jobs:
   dukascopy-quant-pipeline:
     runs-on: ubuntu-latest
-    
-    # افزایش timeout برای دانلود ۵ ساله
-    timeout-minutes: 360
+    timeout-minutes: 120
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (For Dukascopy Downloader)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -33,57 +31,118 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      # نصب صریح پکیج (بدون دستورات اضافی که باعث باگ می‌شوند)
       - name: Install Dukascopy-Node
-        run: |
-          npm install -g dukascopy-node
+        run: npm install -g dukascopy-node
 
-      # ----------------- سیستم هوشمند کش دیتا -----------------
+      # کش با کلید روزانه برای جلوگیری از استفاده از کش قدیمی
       - name: Cache Dukascopy Data
         id: cache-data
         uses: actions/cache@v4
         with:
           path: ./data
-          key: dukascopy-m1-eurusd-gbpusd-2019-2024-v3
+          key: dukascopy-m1-eurusd-gbpusd-2022-2024-v3-${{ runner.os }}
+          restore-keys: |
+            dukascopy-m1-eurusd-gbpusd-2022-2024-v3-
 
-      # ----------------- دانلود داده (فقط اگر کش نداشت) -----------------
-      - name: Download 5-Year M1 Data from Dukascopy
+      - name: Download Data with Retry & Chunks
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
           mkdir -p data
           
-          echo "=== شروع دانلود EURUSD M1 (۵ سال) ==="
-          dukascopy-node \
-            --instrument eurusd \
-            --timeframe m1 \
-            --date-from 2019-01-01 \
-            --date-to 2024-01-01 \
-            --format csv \
-            --directory ./data \
-            --debug
+          download_chunk() {
+            local instrument=$1
+            local from=$2
+            local to=$3
+            local max_attempts=5
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo ">>> $instrument | $from → $to | تلاش $attempt"
+              
+              dukascopy-node \
+                --instrument $instrument \
+                --timeframe m1 \
+                --date-from $from \
+                --date-to $to \
+                --format csv \
+                --directory ./data \
+                --debug
+              
+              if [ $? -eq 0 ]; then
+                echo "✅ موفق: $instrument $from → $to"
+                return 0
+              fi
+              
+              local wait_time=$((attempt * 20))
+              echo "⚠️ ناموفق، $wait_time ثانیه صبر..."
+              sleep $wait_time
+              attempt=$((attempt + 1))
+            done
+            
+            echo "❌ خطا: $instrument $from → $to پس از $max_attempts تلاش"
+            return 1
+          }
           
-          echo "=== شروع دانلود GBPUSD M1 (۵ سال) ==="
-          dukascopy-node \
-            --instrument gbpusd \
-            --timeframe m1 \
-            --date-from 2019-01-01 \
-            --date-to 2024-01-01 \
-            --format csv \
-            --directory ./data \
-            --debug
+          # لیست بازه‌های زمانی
+          CHUNKS=(
+            "2022-01-01 2022-04-01"
+            "2022-04-01 2022-07-01"
+            "2022-07-01 2022-10-01"
+            "2022-10-01 2023-01-01"
+            "2023-01-01 2023-04-01"
+            "2023-04-01 2023-07-01"
+            "2023-07-01 2023-10-01"
+            "2023-10-01 2024-01-01"
+          )
           
-          echo "=== بررسی فایل‌های دانلود شده ==="
+          for instrument in eurusd gbpusd; do
+            echo "=============================="
+            echo "شروع دانلود: $instrument"
+            echo "=============================="
+            
+            for chunk in "${CHUNKS[@]}"; do
+              from=$(echo $chunk | cut -d' ' -f1)
+              to=$(echo $chunk | cut -d' ' -f2)
+              
+              download_chunk $instrument $from $to
+              
+              if [ $? -ne 0 ]; then
+                echo "❌ دانلود $instrument کامل نشد!"
+                exit 1
+              fi
+              
+              # تاخیر بین chunk ها
+              sleep 5
+            done
+            
+            # تاخیر بین instrument ها
+            sleep 15
+          done
+          
+          echo "=============================="
+          echo "✅ همه دانلودها کامل شد"
           ls -lah ./data/
           du -sh ./data/
 
-      # ----------------- مرحله دوم: پردازش پایتون -----------------
+      - name: Verify Downloaded Data
+        run: |
+          echo "=== بررسی فایل‌های دانلود شده ==="
+          ls -lah ./data/
+          
+          # چک وجود فایل‌ها
+          if [ -z "$(ls -A ./data/)" ]; then
+            echo "❌ خطا: پوشه data خالی است!"
+            exit 1
+          fi
+          
+          echo "✅ داده‌ها موجود هستند"
+
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
 
-      # ----------------- مرحله سوم: ذخیره نتایج -----------------
-      - name: Upload Final Optimization Results
+      - name: Upload Final Results
         uses: actions/upload-artifact@v4
         with:
-          name: Ultimate-5Years-MTF-Report
+          name: MVP-2Years-MTF-Report
           path: ultimate_5years_mtf_report.csv
           retention-days: 7
