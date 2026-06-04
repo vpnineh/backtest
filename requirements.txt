@@ -2,4 +2,4 @@ yfinance
 pandas==2.2.0
 numpy==1.26.4
 statsmodels==0.14.1
-matplotlib
+matplotlib==3.8.2
