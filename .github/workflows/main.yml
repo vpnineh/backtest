@@ -27,6 +27,17 @@ jobs:
 
       - name: Run Cointegration Script
         run: python cointegration_finder.py
+        
+      - name: Run Backtester Script
+        run: python zscore_backtester.py
+
+      - name: Upload Backtest Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Backtest-Result-Chart
+          path: eur_gbp_backtest.png
+          retention-days: 7
+
 
       - name: Upload Results as Artifact
         uses: actions/upload-artifact@v4
