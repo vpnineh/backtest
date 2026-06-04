@@ -33,13 +33,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      # نصب صریح پکیج به جای npx (جلوگیری از مشکل نسخه)
+      # نصب صریح پکیج (بدون دستورات اضافی که باعث باگ می‌شوند)
       - name: Install Dukascopy-Node
         run: |
           npm install -g dukascopy-node
-          # نمایش نسخه و آپشن‌های معتبر
-          dukascopy-node --version
-          dukascopy-node --help
 
       # ----------------- سیستم هوشمند کش دیتا -----------------
       - name: Cache Dukascopy Data
@@ -56,7 +53,6 @@ jobs:
           mkdir -p data
           
           echo "=== شروع دانلود EURUSD M1 (۵ سال) ==="
-          # فقط از آپشن‌های معتبر استفاده می‌کنیم
           dukascopy-node \
             --instrument eurusd \
             --timeframe m1 \
