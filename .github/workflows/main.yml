@@ -32,12 +32,13 @@ jobs:
 
       # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
       # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
+      # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
       - name: Download 5-Year M1 Data from Dukascopy
         run: |
           mkdir -p data
-          # دانلود 5 سال دیتای 1 دقیقه (استفاده از پارامترهای from- و to-)
-          npx dukascopy-node -i eurusd -timeframe m1 -from 2019-01-01 -to 2024-01-01 -format csv -dir ./data
-          npx dukascopy-node -i gbpusd -timeframe m1 -from 2019-01-01 -to 2024-01-01 -format csv -dir ./data
+          # استفاده از فلگ‌های مخفف و استاندارد (-t به جای -timeframe و -f به جای -format)
+          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data
+          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data
           
       # ----------------- مرحله دوم: اجرای پردازشگر پایتون -----------------
       - name: Run Python MTF Optimizer
