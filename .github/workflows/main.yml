@@ -1,18 +1,23 @@
-name: Pairs Trading Bot Pipeline
+name: 5-Years Ultimate Backtest (M15, M5, M2, M1)
 
 on:
-  workflow_dispatch: # امکان اجرای دستی را فراهم می‌کند
+  workflow_dispatch:
   push:
     branches:
-      - main # هر بار که کد روی شاخه اصلی پوش شود اجرا می‌گردد
+      - main
 
 jobs:
-  run-statistical-analysis:
+  dukascopy-quant-pipeline:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Setup Node.js (For Dukascopy Downloader)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Setup Python 3.10
         uses: actions/setup-python@v5
@@ -20,40 +25,27 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Requirements
+      - name: Install Python Requirements
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy
 
-      # ----------------- مرحله اول: پیدا کردن جفت‌های همگرا -----------------
-      - name: Run Cointegration Script
-        run: python cointegration_finder.py
-        
-      - name: Upload Cointegrated Pairs Report
+      # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
+      - name: Download 5-Year M1 Data from Dukascopy
+        run: |
+          mkdir -p data
+          # دانلود 5 سال دیتای 1 دقیقه (این مرحله ممکن است 5 تا 10 دقیقه طول بکشد)
+          npx dukascopy-node -i eurusd -timeframe m1 -startdate 2019-01-01 -enddate 2024-01-01 -format csv -dir ./data
+          npx dukascopy-node -i gbpusd -timeframe m1 -startdate 2019-01-01 -enddate 2024-01-01 -format csv -dir ./data
+
+      # ----------------- مرحله دوم: اجرای پردازشگر پایتون -----------------
+      - name: Run Python MTF Optimizer
+        run: python dukascopy_mtf_optimizer.py
+
+      # ----------------- مرحله سوم: ذخیره نتایج -----------------
+      - name: Upload Final Optimization Results
         uses: actions/upload-artifact@v4
         with:
-          name: Cointegrated-Pairs-Report
-          path: cointegrated_pairs_report.csv
-          retention-days: 7
-
-      # ----------------- مرحله دوم: بک‌تست استراتژی روزانه -----------------
-      - name: Run Backtester Script
-        run: python zscore_backtester.py
-
-      - name: Upload Backtest Image
-        uses: actions/upload-artifact@v4
-        with:
-          name: Backtest-Result-Chart
-          path: eur_gbp_backtest.png
-          retention-days: 7
-
-      # ----------------- مرحله سوم: بهینه‌سازی (Grid Search) -----------------
-      - name: Run Optimizer Script
-        run: python zscore_optimizer.py
-
-      - name: Upload Optimized Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: Optimized-Parameters
-          path: multi_timeframe_optimization.csv
+          name: Ultimate-5Years-MTF-Report
+          path: ultimate_5years_mtf_report.csv
           retention-days: 7
