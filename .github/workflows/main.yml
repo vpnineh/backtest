@@ -1,4 +1,4 @@
-name: Pairs Trading Cointegration Finder
+name: Pairs Trading Bot Pipeline
 
 on:
   workflow_dispatch: # امکان اجرای دستی را فراهم می‌کند
@@ -25,9 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ----------------- مرحله اول: پیدا کردن جفت‌های همگرا -----------------
       - name: Run Cointegration Script
         run: python cointegration_finder.py
         
+      - name: Upload Cointegrated Pairs Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cointegrated-Pairs-Report
+          path: cointegrated_pairs_report.csv
+          retention-days: 7
+
+      # ----------------- مرحله دوم: بک‌تست استراتژی روزانه -----------------
       - name: Run Backtester Script
         run: python zscore_backtester.py
 
@@ -38,10 +47,13 @@ jobs:
           path: eur_gbp_backtest.png
           retention-days: 7
 
+      # ----------------- مرحله سوم: بهینه‌سازی (Grid Search) -----------------
+      - name: Run Optimizer Script
+        run: python zscore_optimizer.py
 
-      - name: Upload Results as Artifact
+      - name: Upload Optimized Results
         uses: actions/upload-artifact@v4
         with:
-          name: Cointegrated-Pairs-Report
-          path: cointegrated_pairs_report.csv
+          name: Optimized-Parameters
+          path: optimized_parameters.csv
           retention-days: 7
