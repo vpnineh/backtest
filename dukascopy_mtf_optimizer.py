@@ -72,35 +72,39 @@ class DukascopyMultiTimeframeOptimizer:
 
     def backtest(self, data: pd.DataFrame, window: int, z_entry: float, z_exit: float) -> dict:
         df = data.copy()
-
+        
+        # محاسبه اسپرد و Z-Score (همچنان با لاگ برای پایداری آماری)
         df['Spread'] = np.log(df['EURUSD']) - np.log(df['GBPUSD'])
         df['Spread_Mean'] = df['Spread'].rolling(window=window).mean()
         df['Spread_Std'] = df['Spread'].rolling(window=window).std()
         df['Z_Score'] = (df['Spread'] - df['Spread_Mean']) / df['Spread_Std']
-
+        
+        # سیگنال‌دهی
         df['Signal'] = 0
         df.loc[df['Z_Score'] < -z_entry, 'Signal'] = 1
         df.loc[df['Z_Score'] > z_entry, 'Signal'] = -1
         df.loc[abs(df['Z_Score']) <= z_exit, 'Signal'] = 0
-
+        
         df['Position'] = df['Signal'].replace(to_replace=0, method='ffill').shift(1)
         df.dropna(inplace=True)
-
-        if df.empty:
-            return None
-
-        ret1 = np.log(df['EURUSD'] / df['EURUSD'].shift(1))
-        ret2 = np.log(df['GBPUSD'] / df['GBPUSD'].shift(1))
-
+        
+        # محاسبه بازدهی ساده (به جای لگاریتمی برای جلوگیری از خطای بزرگ)
+        # بازدهی جفت ارز = (تغییر قیمت / قیمت قبل)
+        pct_ret1 = (df['EURUSD'] - df['EURUSD'].shift(1)) / df['EURUSD'].shift(1)
+        pct_ret2 = (df['GBPUSD'] - df['GBPUSD'].shift(1)) / df['GBPUSD'].shift(1)
+        
+        # هزینه تراکنش (به صورت درصدی)
         position_changes = df['Position'].diff().abs()
         costs = position_changes * self.transaction_cost
-
-        df['Strategy_Return'] = (df['Position'] * (ret1 - ret2)) - costs
-
-        total_trades = position_changes.sum() / 2
-        cumulative_return = np.exp(df['Strategy_Return'].cumsum().iloc[-1]) - 1
-
-        cum_ret_series = np.exp(df['Strategy_Return'].cumsum())
+        
+        # سود هر معامله = (پوزیشن * بازدهی) - هزینه
+        df['Strategy_Return'] = (df['Position'] * (pct_ret1 - pct_ret2)) - costs
+        
+        # محاسبه بازدهی تجمعی ساده
+        cumulative_return = (1 + df['Strategy_Return']).prod() - 1
+        
+        # محاسبه دراودان بر اساس بازدهی تجمعی
+        cum_ret_series = (1 + df['Strategy_Return']).cumprod()
         rolling_max = cum_ret_series.cummax()
         drawdown = (cum_ret_series - rolling_max) / rolling_max
         max_drawdown = drawdown.min()
@@ -111,7 +115,7 @@ class DukascopyMultiTimeframeOptimizer:
             'Z_Exit': z_exit,
             'Total_Return_%': round(cumulative_return * 100, 2),
             'Max_Drawdown_%': round(max_drawdown * 100, 2),
-            'Total_Trades': int(total_trades)
+            'Total_Trades': int(position_changes.sum() / 2)
         }
 
     def run_all_timeframes(self):
