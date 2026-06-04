@@ -1,7 +1,7 @@
 name: 5-Years Ultimate Backtest (M15, M5, M2, M1)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # برای اجرای دستی از پنل گیت‌هاب
   push:
     branches:
       - main
@@ -30,16 +30,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
-      # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
-      # ----------------- مرحله اول: دانلود دیتای 5 ساله M1 -----------------
+      # ----------------- سیستم هوشمند کش دیتا -----------------
+      - name: Cache Dukascopy Data
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: ./data
+          # اگر زمانی خواستید تاریخ را عوض کنید، این نام را تغییر دهید تا کش رفرش شود
+          key: dukascopy-m1-eurusd-gbpusd-2019-2024-v1
+
+      # ----------------- مرحله اول: دانلود ایمن (عبور از فایروال) -----------------
       - name: Download 5-Year M1 Data from Dukascopy
+        if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
           mkdir -p data
-          # استفاده از فلگ‌های مخفف و استاندارد (-t به جای -timeframe و -f به جای -format)
-          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data
-          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data
-          
+          # دانلود محافظت‌شده: دسته بندی 5 تایی، نیم ثانیه مکث، 10 بار تلاش مجدد
+          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data -d -r 10 -p 500 --batch-size 5
+          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data -d -r 10 -p 500 --batch-size 5
+
       # ----------------- مرحله دوم: اجرای پردازشگر پایتون -----------------
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
