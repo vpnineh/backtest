@@ -15,11 +15,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -31,116 +26,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      - name: Install Dukascopy-Node
-        run: npm install -g dukascopy-node
-
-      # کش با کلید روزانه برای جلوگیری از استفاده از کش قدیمی
+      # کش بر اساس بازه زمانی - نیازی به Node.js نیست
       - name: Cache Dukascopy Data
         id: cache-data
         uses: actions/cache@v4
         with:
           path: ./data
-          key: dukascopy-m1-eurusd-gbpusd-2022-2024-v3-${{ runner.os }}
-          restore-keys: |
-            dukascopy-m1-eurusd-gbpusd-2022-2024-v3-
+          key: dukascopy-raw-eurusd-gbpusd-2022-2024-v5
 
-      - name: Download Data with Retry & Chunks
+      # دانلود مستقیم با Python خالص - بدون وابستگی خارجی
+      - name: Download Market Data
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
-          mkdir -p data
-          
-          download_chunk() {
-            local instrument=$1
-            local from=$2
-            local to=$3
-            local max_attempts=5
-            local attempt=1
-            
-            while [ $attempt -le $max_attempts ]; do
-              echo ">>> $instrument | $from → $to | تلاش $attempt"
-              
-              dukascopy-node \
-                --instrument $instrument \
-                --timeframe m1 \
-                --date-from $from \
-                --date-to $to \
-                --format csv \
-                --directory ./data \
-                --debug
-              
-              if [ $? -eq 0 ]; then
-                echo "✅ موفق: $instrument $from → $to"
-                return 0
-              fi
-              
-              local wait_time=$((attempt * 20))
-              echo "⚠️ ناموفق، $wait_time ثانیه صبر..."
-              sleep $wait_time
-              attempt=$((attempt + 1))
-            done
-            
-            echo "❌ خطا: $instrument $from → $to پس از $max_attempts تلاش"
-            return 1
-          }
-          
-          # لیست بازه‌های زمانی
-          CHUNKS=(
-            "2022-01-01 2022-04-01"
-            "2022-04-01 2022-07-01"
-            "2022-07-01 2022-10-01"
-            "2022-10-01 2023-01-01"
-            "2023-01-01 2023-04-01"
-            "2023-04-01 2023-07-01"
-            "2023-07-01 2023-10-01"
-            "2023-10-01 2024-01-01"
-          )
-          
-          for instrument in eurusd gbpusd; do
-            echo "=============================="
-            echo "شروع دانلود: $instrument"
-            echo "=============================="
-            
-            for chunk in "${CHUNKS[@]}"; do
-              from=$(echo $chunk | cut -d' ' -f1)
-              to=$(echo $chunk | cut -d' ' -f2)
-              
-              download_chunk $instrument $from $to
-              
-              if [ $? -ne 0 ]; then
-                echo "❌ دانلود $instrument کامل نشد!"
-                exit 1
-              fi
-              
-              # تاخیر بین chunk ها
-              sleep 5
-            done
-            
-            # تاخیر بین instrument ها
-            sleep 15
-          done
-          
-          echo "=============================="
-          echo "✅ همه دانلودها کامل شد"
-          ls -lah ./data/
-          du -sh ./data/
+          python download_dukascopy.py
 
-      - name: Verify Downloaded Data
+      - name: Verify Data
         run: |
-          echo "=== بررسی فایل‌های دانلود شده ==="
+          echo "=== فایل‌های دانلود شده ==="
           ls -lah ./data/
           
-          # چک وجود فایل‌ها
-          if [ -z "$(ls -A ./data/)" ]; then
-            echo "❌ خطا: پوشه data خالی است!"
-            exit 1
-          fi
-          
-          echo "✅ داده‌ها موجود هستند"
+          # چک تعداد خطوط
+          for f in ./data/*.csv; do
+            lines=$(wc -l < "$f")
+            echo "$f : $lines خط"
+          done
 
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
 
-      - name: Upload Final Results
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: MVP-2Years-MTF-Report
