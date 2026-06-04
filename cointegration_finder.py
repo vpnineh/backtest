@@ -21,12 +21,18 @@ class PairsCointegrationFinder:
         self.data = pd.DataFrame()
 
     def fetch_data(self) -> None:
-        """دانلود دیتای قیمت بسته شدن (Close) برای تمام نمادها"""
+        """دانلود دیتای قیمت بسته شدن با استفاده از سشن مرورگر جعلی"""
         logging.info(f"شروع دانلود دیتا برای {len(self.tickers)} نماد...")
         try:
-            # دانلود گروهی دیتا برای جلوگیری از بلاک شدن توسط یاهو
-            df = yf.download(self.tickers, start=self.start_date, end=self.end_date)['Close']
-            # حذف روزهایی که دیتای ناقص دارند (مثل تعطیلات در یک بازار خاص)
+            import requests
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            })
+            
+            # ارسال سشن به همراه درخواست دانلود
+            df = yf.download(self.tickers, start=self.start_date, end=self.end_date, session=session)['Close']
+            
             self.data = df.dropna()
             logging.info(f"دیتا با موفقیت دریافت شد. ابعاد دیتا: {self.data.shape}")
         except Exception as e:
