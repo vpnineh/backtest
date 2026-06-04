@@ -40,14 +40,14 @@ jobs:
           key: dukascopy-m1-eurusd-gbpusd-2019-2024-v1
 
       # ----------------- مرحله اول: دانلود ایمن (عبور از فایروال) -----------------
+      # ----------------- مرحله اول: دانلود ایمن (عبور از فایروال) -----------------
       - name: Download 5-Year M1 Data from Dukascopy
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
           mkdir -p data
-          # دانلود محافظت‌شده: دسته بندی 5 تایی، نیم ثانیه مکث، 10 بار تلاش مجدد
-          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data -d -r 10 -p 500 --batch-size 5
-          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data -d -r 10 -p 500 --batch-size 5
-
+          # استفاده از فلگ‌های کامل برای جلوگیری از تداخل
+          npx dukascopy-node -i eurusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data --debug --batch-size 5 --retries 10 --pause 500
+          npx dukascopy-node -i gbpusd -t m1 -from 2019-01-01 -to 2024-01-01 -f csv -dir ./data --debug --batch-size 5 --retries 10 --pause 500
       # ----------------- مرحله دوم: اجرای پردازشگر پایتون -----------------
       - name: Run Python MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
