@@ -55,5 +55,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Optimized-Parameters
-          path: optimized_parameters.csv
+          path: multi_timeframe_optimization.csv
           retention-days: 7
