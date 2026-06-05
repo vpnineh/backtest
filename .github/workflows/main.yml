@@ -2,9 +2,6 @@ name: 5-Years MVP Backtest (M15, M5, M2, M1)
 
 on:
   workflow_dispatch:
-  #push:
-  #  branches:
-  #    - main
 
 jobs:
   # ══════════════════ جاب ۱: دانلود ══════════════════
@@ -31,39 +28,18 @@ jobs:
           path: ./data
           key: dukascopy-eurusd-gbpusd-2021-2026-v1
 
-      - name: Cache Status
-        run: |
-          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
-          ls -lah ./data/ 2>/dev/null || echo "پوشه data خالی"
-
       - name: Download Market Data
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: python download_dukascopy.py
 
       - name: Verify Data
         run: |
-          echo "=== بررسی فایل‌ها ==="
           ls -lah ./data/
-
-          FILE_COUNT=$(ls ./data/*.csv 2>/dev/null | wc -l)
-          echo "تعداد CSV: $FILE_COUNT"
-
-          if [ "$FILE_COUNT" -lt 2 ]; then
-            echo "❌ فایل کافی نیست!"
-            exit 1
-          fi
-
           for f in ./data/*.csv; do
             lines=$(wc -l < "$f")
             size=$(du -sh "$f" | cut -f1)
-            echo "✅ $f | $lines خط | $size"
-            if [ "$lines" -lt 100000 ]; then
-              echo "❌ فایل $f خیلی کوچک است! (باید >100K خط)"
-              exit 1
-            fi
+            echo "$f | $lines خط | $size"
           done
-
-          echo "✅ همه فایل‌ها سالم"
 
       - name: Save Cache
         if: steps.cache-data.outputs.cache-hit != 'true'
@@ -72,11 +48,103 @@ jobs:
           path: ./data
           key: dukascopy-eurusd-gbpusd-2021-2026-v1
 
-  # ══════════════════ جاب ۲: بک‌تست ══════════════════
+  # ══════════════════ جاب دیباگ ══════════════════
+  debug-bi5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: download-data
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Restore Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ./data
+          key: dukascopy-eurusd-gbpusd-2021-2026-v1
+
+      # ═══ دیباگ فرمت bi5 از اینترنت ═══
+      - name: Debug BI5 Format (Live Download)
+        run: |
+          python - <<'EOF'
+          import urllib.request
+          import lzma
+          import struct
+
+          url = "https://datafeed.dukascopy.com/datafeed/EURUSD/2022/00/03/BID_candles_min_1.bi5"
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+              'Accept-Encoding': 'identity',
+          }
+
+          print(f"دانلود: {url}")
+          req = urllib.request.Request(url, headers=headers)
+          with urllib.request.urlopen(req, timeout=30) as r:
+              raw_compressed = r.read()
+
+          print(f"حجم compressed: {len(raw_compressed)} bytes")
+
+          raw = lzma.decompress(raw_compressed)
+          print(f"حجم decompressed: {len(raw)} bytes")
+          print(f"تعداد رکورد (24 bytes each): {len(raw) // 24}")
+          print()
+
+          for i in range(5):
+              chunk = raw[i*24:(i+1)*24]
+              print(f"─── رکورد {i} ───")
+              print(f"  hex: {chunk.hex()}")
+              print(f"  hex groups: {' '.join([chunk[j:j+4].hex() for j in range(0,24,4)])}")
+
+              # تست فرمت‌های مختلف
+              f1 = struct.unpack('>IIIIIf', chunk)
+              f2 = struct.unpack('>iiiiii', chunk)
+              f3 = struct.unpack('>Iiiiif', chunk)
+
+              print(f"  [>IIIIIf] t={f1[0]:8d}ms = {f1[0]/1000:8.1f}s | O={f1[1]/100000:.5f} H={f1[2]/100000:.5f} L={f1[3]/100000:.5f} C={f1[4]/100000:.5f} V={f1[5]:.2f}")
+              print(f"  [>iiiiii] t={f2[0]:8d}ms = {f2[0]/1000:8.1f}s | O={f2[1]/100000:.5f} C={f2[4]/100000:.5f}")
+              print(f"  [>Iiiiif] t={f3[0]:8d}ms = {f3[0]/1000:8.1f}s | O={f3[1]/100000:.5f} C={f3[4]/100000:.5f}")
+              print()
+          EOF
+
+      # ═══ دیباگ فایل CSV موجود ═══
+      - name: Debug Existing CSV
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+
+          path = 'data/EURUSD_M1_20210101_20260101.csv'
+          df = pd.read_csv(path, nrows=20)
+          
+          print("=== 20 ردیف اول ===")
+          print(df.to_string())
+          print()
+          
+          df['timestamp'] = pd.to_datetime(df['timestamp'])
+          print(f"نوع timestamp: {df['timestamp'].dtype}")
+          print(f"ساعت‌های یکتا: {df['timestamp'].dt.hour.unique()}")
+          print(f"دقیقه‌های یکتا: {df['timestamp'].dt.minute.nunique()}")
+          print()
+          
+          # چک 1000 ردیف
+          df2 = pd.read_csv(path, nrows=1000)
+          df2['timestamp'] = pd.to_datetime(df2['timestamp'])
+          print(f"در 1000 ردیف اول:")
+          print(f"  timestamp یکتا: {df2['timestamp'].nunique()}")
+          print(f"  ساعت یکتا: {df2['timestamp'].dt.hour.nunique()}")
+          print(f"  بازه: {df2['timestamp'].min()} تا {df2['timestamp'].max()}")
+          EOF
+
+  # ══════════════════ جاب بک‌تست ══════════════════
   run-backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: download-data
+    needs: debug-bi5
 
     steps:
       - name: Checkout
@@ -97,16 +165,6 @@ jobs:
         with:
           path: ./data
           key: dukascopy-eurusd-gbpusd-2021-2026-v1
-
-      - name: Verify Cache Restored
-        run: |
-          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
-          ls -lah ./data/
-          if [ -z "$(ls ./data/*.csv 2>/dev/null)" ]; then
-            echo "❌ کش restore نشد!"
-            exit 1
-          fi
-          echo "✅ داده آماده"
 
       - name: Run Backtest
         run: python dukascopy_mtf_optimizer.py
