@@ -6,7 +6,7 @@ on:
 jobs:
   run-simulator:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Repository
@@ -18,17 +18,22 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Quant Libraries
+      - name: Install Libraries
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy statsmodels yfinance
+          pip install pandas numpy
 
-      - name: Run Real-World Simulator
+      - name: Run Simulator
         run: python realworld_quantsim.py
 
-      - name: Upload Equity Curve
+      - name: Upload Full Report
         uses: actions/upload-artifact@v4
         with:
-          name: RealWorld-5000-USD-Report
-          path: Equity_Curve_Report.csv
+          name: Prop-Backtest-Report
+          path: |
+            Equity_Curve_Report.csv
+            trades_detail.csv
+            equity_curve.csv
+            monthly_report.csv
+            yearly_report.csv
           retention-days: 30
