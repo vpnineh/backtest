@@ -1,12 +1,12 @@
-name: 5-Years Ultimate Quant Backtest
+name: 5-Strategies Arena Backtest
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-backtest:
+  run-arena:
     runs-on: ubuntu-latest
-    timeout-minutes: 30 
+    timeout-minutes: 20 
 
     steps:
       - name: Checkout Repository
@@ -21,14 +21,14 @@ jobs:
       - name: Install Quant Libraries
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy numba
+          pip install pandas numpy
 
-      - name: Run Advanced MTF Optimizer
-        run: python dukascopy_mtf_optimizer.py
+      - name: Run Multi-Strategy Engine
+        run: python multi_strategy_engine.py
 
-      - name: Upload Final 5-Years Report
+      - name: Upload Arena Results
         uses: actions/upload-artifact@v4
         with:
-          name: 5Years-Advanced-MTF-Report
-          path: ultimate_5years_advanced_report.csv
+          name: 5-Strategies-Arena-Report
+          path: Ultimate_5_Strategies_Arena.csv
           retention-days: 30
