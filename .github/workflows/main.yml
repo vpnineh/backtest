@@ -1,10 +1,10 @@
-name: 5-Strategies Arena Backtest
+name: Real-World Portfolio Simulator
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-arena:
+  run-simulator:
     runs-on: ubuntu-latest
     timeout-minutes: 20 
 
@@ -23,12 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      - name: Run Multi-Strategy Engine
-        run: python multi_strategy_engine.py
+      - name: Run Real-World Simulator
+        run: python realworld_quantsim.py
 
-      - name: Upload Arena Results
+      - name: Upload Equity Curve
         uses: actions/upload-artifact@v4
         with:
-          name: 5-Strategies-Arena-Report
-          path: Ultimate_5_Strategies_Arena.csv
+          name: RealWorld-5000-USD-Report
+          path: Equity_Curve_Report.csv
           retention-days: 30
