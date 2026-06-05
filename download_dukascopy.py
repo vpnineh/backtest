@@ -14,7 +14,7 @@ INSTRUMENTS = {
     'GBPUSD': {'point': 100000},
 }
 
-START_DATE = datetime(2021, 1, 1)
+START_DATE = datetime(2025, 1, 1)
 END_DATE   = datetime(2026, 1, 1)
 
 OUTPUT_DIR = './data'
@@ -39,14 +39,7 @@ HEADERS = {
 }
 
 RECORD_SIZE = 24
-# فرمت دوکاسکوپی:
-# uint32: milliseconds از ابتدای روز
-# uint32: open  × point
-# uint32: high  × point
-# uint32: low   × point
-# uint32: close × point
-# float32: volume
-RECORD_FMT = '>IIIIIf'
+RECORD_FMT  = '>IIIIIf'
 
 
 def download_bi5(url: str) -> bytes | None:
@@ -59,32 +52,34 @@ def download_bi5(url: str) -> bytes | None:
 
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                return None  # روز تعطیل یا بدون داده - نرمال است
+                return None
             print(f"    HTTP {e.code} | تلاش {attempt}/{MAX_RETRIES}")
-
-        except urllib.error.URLError as e:
-            print(f"    URLError: {e.reason} | تلاش {attempt}/{MAX_RETRIES}")
 
         except Exception as e:
             print(f"    خطا: {type(e).__name__} | تلاش {attempt}/{MAX_RETRIES}")
 
         if attempt < MAX_RETRIES:
-            wait = RETRY_DELAY * attempt
-            time.sleep(wait)
+            time.sleep(RETRY_DELAY * attempt)
 
     return None
 
 
 def parse_bi5(raw_compressed: bytes, date: datetime, point: int) -> list:
     """
-    پارس فایل bi5 دوکاسکوپی
-    
-    مهم: ماه در URL از صفر شروع می‌شه ولی date اینجا درسته
-    فرمت: uint32(ms) + uint32(O) + uint32(H) + uint32(L) + uint32(C) + float32(V)
+    فرمت bi5 دوکاسکوپی:
+      bytes 0-3  : uint32 = میلی‌ثانیه از ابتدای روز
+      bytes 4-7  : uint32 = open  × point
+      bytes 8-11 : uint32 = high  × point  
+      bytes 12-15: uint32 = low   × point
+      bytes 16-19: uint32 = close × point
+      bytes 20-23: float32 = volume
+
+    نکته مهم: چون تایم‌فریم M1 است، t_ms باید مضرب 60000 باشد
+    مثال: کندل ساعت 10:30 → t_ms = 37800000
     """
     try:
         raw = lzma.decompress(raw_compressed)
-    except lzma.LZMAError as e:
+    except lzma.LZMAError:
         return []
 
     if len(raw) < RECORD_SIZE:
@@ -95,22 +90,30 @@ def parse_bi5(raw_compressed: bytes, date: datetime, point: int) -> list:
 
     for i in range(total_records):
         offset = i * RECORD_SIZE
-        chunk = raw[offset: offset + RECORD_SIZE]
+        chunk  = raw[offset: offset + RECORD_SIZE]
 
         try:
             t_ms, o, h, l, c, v = struct.unpack(RECORD_FMT, chunk)
         except struct.error:
             continue
 
-        # فیلتر داده نامعتبر
+        # ── فیلترهای اعتبارسنجی ──
         if o == 0 or c == 0:
             continue
         if h < l:
             continue
-        if t_ms >= 86_400_000:  # بیشتر از 24 ساعت = نامعتبر
+        if t_ms >= 86_400_000:
             continue
 
-        ts = date + timedelta(milliseconds=t_ms)
+        # گرد کردن به دقیقه (M1 = هر 60 ثانیه یک کندل)
+        # t_ms ممکنه مثلاً 3600123 باشه که باید 3600000 بشه
+        t_ms_rounded = (t_ms // 60_000) * 60_000
+
+        ts = date + timedelta(milliseconds=t_ms_rounded)
+
+        # فیلتر کندل‌های تعطیل (volume=0 و OHLC یکسان)
+        if v == 0.0 and o == h == l == c:
+            continue
 
         candles.append([
             ts.strftime('%Y-%m-%d %H:%M:%S'),
@@ -121,32 +124,12 @@ def parse_bi5(raw_compressed: bytes, date: datetime, point: int) -> list:
             round(v, 2),
         ])
 
-    return candles
-
-
-def verify_file(path: str) -> bool:
-    """چک کردن صحت فایل CSV"""
-    try:
-        df = pd.read_csv(path, nrows=1000)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-        # چک توزیع timestamp
-        if df['timestamp'].nunique() < 100:
-            print(f"  ❌ timestamp های یکتا خیلی کم: {df['timestamp'].nunique()}")
-            return False
-
-        # چک اینکه ساعت‌های مختلف وجود داشته باشه
-        hours = df['timestamp'].dt.hour.nunique()
-        if hours < 5:
-            print(f"  ❌ فقط {hours} ساعت متفاوت در 1000 ردیف اول")
-            return False
-
-        print(f"  ✅ فایل سالم | ساعت‌های یکتا: {hours} | نمونه timestamp: {df['timestamp'].iloc[0]}")
-        return True
-
-    except Exception as e:
-        print(f"  ❌ خطا در verify: {e}")
-        return False
+    # حذف duplicate های همان دقیقه (نگه داشتن آخری)
+    seen = {}
+    for row in candles:
+        seen[row[0]] = row
+    
+    return list(seen.values())
 
 
 def download_instrument(symbol: str, point: int, start: datetime, end: datetime):
@@ -155,20 +138,18 @@ def download_instrument(symbol: str, point: int, start: datetime, end: datetime)
         f"{symbol}_M1_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv"
     )
 
-    # چک فایل موجود
     if os.path.exists(out_path):
         size = os.path.getsize(out_path)
-        if size > 10 * 1024 * 1024:  # بیشتر از 10MB
-            if verify_file(out_path):
-                print(f"✅ فایل موجود و سالم: {out_path} ({size/1024/1024:.0f} MB)")
-                return
-        print(f"⚠️ فایل ناقص یا خراب، دانلود مجدد...")
+        if size > 10 * 1024 * 1024:
+            print(f"✅ فایل موجود: {out_path} ({size/1024/1024:.0f} MB)")
+            return
+        print(f"⚠️ فایل ناقص ({size/1024:.0f} KB)، دانلود مجدد...")
         os.remove(out_path)
 
     print(f"\n{'='*60}")
     print(f"▶ دانلود: {symbol} | {start.date()} → {end.date()}")
     total_days = (end - start).days
-    print(f"  کل روز: {total_days} | تخمین زمان: {total_days*0.4/60:.0f} دقیقه")
+    print(f"  کل روز: {total_days} | تخمین: ~{total_days*0.4/60:.0f} دقیقه")
     print(f"{'='*60}")
 
     fieldnames = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
@@ -177,17 +158,16 @@ def download_instrument(symbol: str, point: int, start: datetime, end: datetime)
         writer = csv.writer(f)
         writer.writerow(fieldnames)
 
-        current = start
-        downloaded_days = 0
-        skipped_days = 0
-        total_candles = 0
+        current        = start
+        downloaded     = 0
+        skipped        = 0
+        total_candles  = 0
 
         while current < end:
-            # ⚠️ دوکاسکوپی: ماه از 0 شروع میشه (Jan=00, Dec=11)
             url = BASE_URL.format(
                 symbol=symbol,
                 year=current.year,
-                month=current.month - 1,
+                month=current.month - 1,  # دوکاسکوپی: ژانویه=00
                 day=current.day
             )
 
@@ -198,57 +178,51 @@ def download_instrument(symbol: str, point: int, start: datetime, end: datetime)
                 if candles:
                     writer.writerows(candles)
                     total_candles += len(candles)
-                    downloaded_days += 1
+                    downloaded += 1
                 else:
-                    skipped_days += 1
+                    skipped += 1
             else:
-                skipped_days += 1
+                skipped += 1
 
             current += timedelta(days=1)
             time.sleep(0.4)
 
-            # گزارش هر 60 روز
-            done = downloaded_days + skipped_days
+            done = downloaded + skipped
             if done % 60 == 0:
                 pct = done / total_days * 100
                 print(
                     f"  [{pct:5.1f}%] "
                     f"روز: {done}/{total_days} | "
-                    f"دانلود: {downloaded_days} | "
-                    f"خالی: {skipped_days} | "
+                    f"دانلود: {downloaded} | "
+                    f"خالی: {skipped} | "
                     f"کندل: {total_candles:,}"
                 )
 
     # گزارش نهایی
     size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"\n{'='*60}")
-    print(f"✅ {symbol} کامل شد:")
-    print(f"   فایل: {out_path}")
-    print(f"   حجم: {size_mb:.1f} MB")
-    print(f"   کندل: {total_candles:,}")
-    print(f"   روز با داده: {downloaded_days} | روز خالی: {skipped_days}")
+    print(f"\n✅ {symbol} کامل:")
+    print(f"   حجم: {size_mb:.1f} MB | کندل: {total_candles:,}")
+    print(f"   روز با داده: {downloaded} | خالی: {skipped}")
 
-    # verify
-    print(f"\n  بررسی صحت فایل...")
-    verify_file(out_path)
+    # نمایش نمونه برای تایید
+    df = pd.read_csv(out_path, nrows=5)
+    print(f"\n   نمونه اول:\n{df.to_string()}")
+    df_all = pd.read_csv(out_path)
+    print(f"\n   نمونه آخر:\n{df_all.tail(3).to_string()}")
 
-    # نمایش نمونه
-    df_sample = pd.read_csv(out_path, nrows=5)
-    print(f"\n  نمونه اول:\n{df_sample.to_string()}")
-    df_tail = pd.read_csv(out_path)
-    print(f"\n  نمونه آخر:\n{df_tail.tail(3).to_string()}")
-    print(f"{'='*60}")
+    # آمار timestamp
+    df_all['timestamp'] = pd.to_datetime(df_all['timestamp'])
+    daily = df_all.groupby(df_all['timestamp'].dt.date).size()
+    print(f"\n   کندل/روز → میانگین: {daily.mean():.0f} | max: {daily.max()} | min: {daily.min()}")
+    print(f"   ساعت‌های یکتا: {df_all['timestamp'].dt.hour.nunique()}")
 
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print(f"{'='*60}")
-    print(f"دانلود داده دوکاسکوپی")
-    print(f"بازه: {START_DATE.date()} → {END_DATE.date()}")
+    print(f"دانلود دوکاسکوپی: {START_DATE.date()} → {END_DATE.date()}")
     print(f"جفت ارزها: {list(INSTRUMENTS.keys())}")
-    total_est = (END_DATE - START_DATE).days * len(INSTRUMENTS) * 0.4 / 60
-    print(f"تخمین کل زمان: {total_est:.0f} دقیقه")
     print(f"{'='*60}\n")
 
     for symbol, config in INSTRUMENTS.items():
@@ -259,19 +233,18 @@ def main():
             end=END_DATE,
         )
         if symbol != list(INSTRUMENTS.keys())[-1]:
-            print(f"\n⏳ ۱۵ ثانیه تاخیر بین جفت ارزها...")
+            print(f"\n⏳ ۱۵ ثانیه تاخیر...")
             time.sleep(15)
 
     print(f"\n{'='*60}")
     print("✅ همه دانلودها کامل شد")
-    print(f"{'='*60}")
-    print("\nفایل‌های نهایی:")
     for f in os.listdir(OUTPUT_DIR):
         if f.endswith('.csv'):
             path = os.path.join(OUTPUT_DIR, f)
             size = os.path.getsize(path) / 1024 / 1024
             lines = sum(1 for _ in open(path)) - 1
-            print(f"  {f} | {lines:,} کندل | {size:.1f} MB")
+            print(f"  {f} | {lines:,} کندل | {size:.0f} MB")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':
