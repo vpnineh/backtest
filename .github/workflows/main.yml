@@ -1,16 +1,16 @@
-name: 2-Years MVP Backtest (M15, M5, M2, M1)
+name: 5-Years MVP Backtest (M15, M5, M2, M1)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+  #push:
+  #  branches:
+  #    - main
 
 jobs:
   # ══════════════════ جاب ۱: دانلود ══════════════════
   download-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 100
 
     steps:
       - name: Checkout
@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2022-2024-v6
+          key: dukascopy-eurusd-gbpusd-2021-2026-v1
 
       - name: Cache Status
         run: |
@@ -57,8 +57,8 @@ jobs:
             lines=$(wc -l < "$f")
             size=$(du -sh "$f" | cut -f1)
             echo "✅ $f | $lines خط | $size"
-            if [ "$lines" -lt 10000 ]; then
-              echo "❌ فایل $f خیلی کوچک!"
+            if [ "$lines" -lt 100000 ]; then
+              echo "❌ فایل $f خیلی کوچک است! (باید >100K خط)"
               exit 1
             fi
           done
@@ -70,7 +70,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2022-2024-v6
+          key: dukascopy-eurusd-gbpusd-2021-2026-v1
 
   # ══════════════════ جاب ۲: بک‌تست ══════════════════
   run-backtest:
@@ -96,9 +96,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2022-2024-v6
+          key: dukascopy-eurusd-gbpusd-2021-2026-v1
 
-      - name: Verify Cache
+      - name: Verify Cache Restored
         run: |
           echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
           ls -lah ./data/
@@ -106,6 +106,7 @@ jobs:
             echo "❌ کش restore نشد!"
             exit 1
           fi
+          echo "✅ داده آماده"
 
       - name: Run Backtest
         run: python dukascopy_mtf_optimizer.py
@@ -113,6 +114,6 @@ jobs:
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: MVP-2Years-MTF-Report
+          name: MVP-5Years-MTF-Report
           path: ultimate_5years_mtf_report.csv
           retention-days: 30
