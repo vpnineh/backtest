@@ -1,646 +1,127 @@
-import pandas as pd
-import numpy as np
+import pandas as pd, numpy as np, glob, warnings
+warnings.filterwarnings('ignore')
 
-# ============================================================
-# 1) CORR ARB ORIGINAL SIGNALS
-# ============================================================
-def strategy_corr_arb_original(df):
-    eurgbp = df['c_eur'] / df['c_gbp']
-    period = 96  # 1 trading day
+class Config:
+    init_bal = 5000.0; risk_pct = 0.015; max_dd_day = 0.045; max_dd_tot = 0.09
+    sp_eur = 1.0; sp_gbp = 1.2; comm = 6.0; pip = 0.0001; lot_sz = 100000; max_lot = 3.0
 
-    mean = eurgbp.rolling(period).mean()
-    std  = eurgbp.rolling(period).std()
-    z    = (eurgbp - mean) / std.replace(0, np.nan)
-
-    std_ok  = std > std.rolling(period * 4).mean() * 0.3
-    adx_eur = calc_adx_full(df['h_eur'], df['l_eur'], df['c_eur'], 14)[0]
-    adx_ok  = adx_eur < 28
-
-    hour    = pd.Series(df.index.hour, index=df.index)
-    time_ok = hour.between(7, 19)
-
-    sig = pd.DataFrame(index=df.index)
-    sig['signal']  = 0
-    sig['sl_pips'] = 0.0
-    sig['tp_pips'] = 0.0
-
-    long_cond  = (z < -2.0) & std_ok & adx_ok & time_ok
-    short_cond = (z >  2.0) & std_ok & adx_ok & time_ok
-
-    sig.loc[long_cond,  'signal'] =  1
-    sig.loc[short_cond, 'signal'] = -1
-    sig.loc[sig['signal'] != 0, 'sl_pips'] = 20.0
-    sig.loc[sig['signal'] != 0, 'tp_pips'] = 35.0
-
-    # فقط تغییر سیگنال
-    sig['signal'] = sig['signal'].where(sig['signal'] != sig['signal'].shift(), 0)
-
-    return sig, z
-
-
-# ============================================================
-# 2) RSI DIV - همان نسخه سودده فعلی
-# ============================================================
-def strategy_rsi_div_proven(df):
-    c = df['c_eur']; h = df['h_eur']
-    l = df['l_eur']; o = df['o_eur']
-
-    rsi = calc_rsi(c, 14)
-    atr = calc_atr(h, l, c, 14)
-    hour = pd.Series(df.index.hour, index=df.index)
-    active = hour.between(7, 18)
-
-    lb = 10
-    sw_lo = l.rolling(lb * 2 + 1, center=True).min()
-    sw_hi = h.rolling(lb * 2 + 1, center=True).max()
-
-    is_lo = (l == sw_lo) & (l < l.shift(1)) & (l < l.shift(-1))
-    is_hi = (h == sw_hi) & (h > h.shift(1)) & (h > h.shift(-1))
-
-    lp = l.where(is_lo).ffill()
-    lr = rsi.where(is_lo).ffill()
-    pp = lp.shift(lb)
-    pr = lr.shift(lb)
-
-    hp = h.where(is_hi).ffill()
-    hr = rsi.where(is_hi).ffill()
-    php = hp.shift(lb)
-    phr = hr.shift(lb)
-
-    bull = (
-        (lp < pp) &
-        (lr > pr + 3) &
-        (rsi < 40) &
-        (rsi > rsi.shift(1)) &
-        (c > o) &
-        active
-    )
-
-    bear = (
-        (hp > php) &
-        (hr < phr - 3) &
-        (rsi > 60) &
-        (rsi < rsi.shift(1)) &
-        (c < o) &
-        active
-    )
-
-    sig = pd.DataFrame(index=df.index)
-    sig['signal']  = 0
-    sig['sl_pips'] = 0.0
-    sig['tp_pips'] = 0.0
-
-    for i in range(250, len(df)):
-        atr_v = atr.iloc[i]
-        if pd.isna(atr_v) or atr_v <= 0:
-            continue
-
-        atr_pips = atr_v / Config.pip
-        idx = df.index[i]
-
-        if bull.iloc[i]:
-            sl = max(12, min(atr_pips * 1.2, 25))
-            sig.at[idx, 'signal']  =  1
-            sig.at[idx, 'sl_pips'] = sl
-            sig.at[idx, 'tp_pips'] = sl * 2.0
-
-        elif bear.iloc[i]:
-            sl = max(12, min(atr_pips * 1.2, 25))
-            sig.at[idx, 'signal']  = -1
-            sig.at[idx, 'sl_pips'] = sl
-            sig.at[idx, 'tp_pips'] = sl * 2.0
-
-    # فاصله حداقل 4 ساعت بین سیگنال‌ها
-    nz = sig[sig['signal'] != 0]
-    if len(nz) > 1:
-        keep = [nz.index[0]]
-        for idx in nz.index[1:]:
-            if (idx - keep[-1]).total_seconds() >= 4 * 3600:
-                keep.append(idx)
-        drop = [x for x in nz.index if x not in keep]
-        sig.loc[drop, 'signal'] = 0
-
-    return sig
-
-
-# ============================================================
-# 3) MONTHLY RETURNS - دقیق
-# ============================================================
-def build_precise_monthly_returns(risk, start_ts, end_ts):
-    eq = pd.DataFrame({
-        'ts': risk.curve_ts,
-        'equity': risk.curve
+def load_data(tf):
+    def read(pths, sfx):
+        dfs = []
+        for p in pths:
+            d = pd.read_csv(p, sep=';', header=None, names=['ts','o','h','l','c','v'])
+            d['ts'] = pd.to_datetime(d['ts'], format='%Y%m%d %H%M%S')
+            d = d.set_index('ts'); d = d[~d.index.duplicated(keep='last')]
+            d.columns = [f'{c}_{sfx}' for c in d.columns]; dfs.append(d)
+        return pd.concat(dfs).sort_index()
+    raw = read(sorted(glob.glob('data/*EURUSD*.csv')), 'eur').join(read(sorted(glob.glob('data/*GBPUSD*.csv')), 'gbp'), how='inner').dropna()
+    df = pd.DataFrame({
+        'o_eur': raw['o_eur'].resample(tf).first(), 'h_eur': raw['h_eur'].resample(tf).max(),
+        'l_eur': raw['l_eur'].resample(tf).min(),   'c_eur': raw['c_eur'].resample(tf).last(),
+        'c_gbp': raw['c_gbp'].resample(tf).last()
     }).dropna()
+    return df[df.index.weekday < 5]
 
-    if eq.empty:
-        return pd.DataFrame(columns=['equity_end', 'pnl', 'ret_pct'])
+def calc_atr(h, l, c, p=14): return pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1).rolling(p).mean()
+def calc_rsi(c, p=14):
+    d = c.diff(); g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
+    return 100 - 100 / (1 + g / (-d.clip(upper=0)).ewm(alpha=1/p, adjust=False).mean().replace(0, np.nan))
+def make_sigs(idx): return pd.DataFrame({'signal': 0, 'sl_pips': 0.0, 'tp_pips': 0.0}, index=idx, dtype=float)
+def throt(sigs, gap=3):
+    nz = sigs[sigs['signal']!=0]
+    if len(nz)<=1: return sigs
+    kp = [nz.index[0]]
+    for i in nz.index[1:]:
+        if (i - kp[-1]).total_seconds() >= gap*3600: kp.append(i)
+    sigs.loc[[i for i in nz.index if i not in kp], 'signal'] = 0
+    return sigs
+def sz(eq, slp): return round(np.clip((eq*Config.risk_pct)/(max(slp,0.1)*Config.pip*Config.lot_sz), 0.01, Config.max_lot), 2)
+def pnl(d, lot, en, ex, sym): return (d*(ex-en)*lot*Config.lot_sz) - ((Config.sp_eur if sym=='EUR' else Config.sp_gbp)*Config.pip*lot*Config.lot_sz + Config.comm*lot)
 
-    eq = eq.sort_values('ts').set_index('ts')
+def strat_rsi_div(df):
+    c, h, l, o = df['c_eur'], df['h_eur'], df['l_eur'], df['o_eur']
+    rsi, atr, act = calc_rsi(c, 14), calc_atr(h, l, c, 14), pd.Series(df.index.hour, index=df.index).between(7, 18)
+    sw_lo, sw_hi = l.rolling(21, center=True).min(), h.rolling(21, center=True).max()
+    is_lo, is_hi = (l==sw_lo) & (l<l.shift(1)) & (l<l.shift(-1)), (h==sw_hi) & (h>h.shift(1)) & (h>h.shift(-1))
+    lp, lr, hp, hr_ = l.where(is_lo).ffill(), rsi.where(is_lo).ffill(), h.where(is_hi).ffill(), rsi.where(is_hi).ffill()
+    bull, bear = (lp<lp.shift(10)) & (lr>lr.shift(10)+3) & (rsi<40) & (rsi>rsi.shift(1)) & (c>o) & act, (hp>hp.shift(10)) & (hr_<hr_.shift(10)-3) & (rsi>60) & (rsi<rsi.shift(1)) & (c<o) & act
+    sigs = make_sigs(df.index)
+    for i in range(250, len(df)):
+        if pd.notna(atr.iloc[i]) and atr.iloc[i]>0 and (bull.iloc[i] or bear.iloc[i]):
+            sl = max(12, min(atr.iloc[i]/Config.pip*1.2, 25))
+            sigs.at[df.index[i], 'signal'] = 1 if bull.iloc[i] else -1
+            sigs.at[df.index[i], 'sl_pips'], sigs.at[df.index[i], 'tp_pips'] = sl, sl*2.0
+    return throt(sigs, 4)
 
-    # daily equity with forward fill
-    daily_idx = pd.date_range(start=start_ts.normalize(), end=end_ts.normalize(), freq='D')
-    daily_eq = eq['equity'].resample('D').last().reindex(daily_idx).ffill()
-    daily_eq = daily_eq.fillna(Config.initial_balance)
+def strat_corr_arb_v3(df):
+    c_e, ratio, atr = df['c_eur'], df['c_eur']/df['c_gbp'], calc_atr(df['h_eur'], df['l_eur'], df['c_eur'], 14)
+    rsi, z = calc_rsi(c_e, 14), (ratio - ratio.rolling(200).mean()) / ratio.rolling(200).std().replace(0, np.nan)
+    sigs, act = make_sigs(df.index), pd.Series(df.index.hour, index=df.index).between(7, 19)
+    bull, bear = (z < -2.5) & (rsi < 35) & act, (z > 2.5) & (rsi > 65) & act
+    for i in range(250, len(df)):
+        if pd.notna(atr.iloc[i]) and atr.iloc[i]>0 and (bull.iloc[i] or bear.iloc[i]):
+            sl = max(10, min(atr.iloc[i]/Config.pip*1.0, 25))
+            sigs.at[df.index[i], 'signal'] = 1 if bull.iloc[i] else -1
+            sigs.at[df.index[i], 'sl_pips'], sigs.at[df.index[i], 'tp_pips'] = sl, sl*1.5
+    return throt(sigs, 4)
 
-    monthly_eq = daily_eq.resample('M').last()
+class Risk:
+    def __init__(self): self.eq = self.pk = self.ds = Config.init_bal; self.cd = None; self.hlt = False
+    def chk(self, ts, amt=0):
+        if ts.date() != self.cd: self.cd = ts.date(); self.ds = self.eq
+        self.eq += amt; self.pk = max(self.pk, self.eq)
+        if (self.eq-self.ds)/self.ds <= -Config.max_dd_day or (self.eq-self.pk)/self.pk <= -Config.max_dd_tot: self.hlt = True
+        return not self.hlt and (self.eq-self.ds)/self.ds > -Config.max_dd_day*0.7
 
-    monthly = pd.DataFrame(index=monthly_eq.index)
-    monthly['equity_end'] = monthly_eq
-    monthly['equity_start'] = monthly['equity_end'].shift(1)
-    monthly.iloc[0, monthly.columns.get_loc('equity_start')] = Config.initial_balance
-
-    monthly['pnl'] = monthly['equity_end'] - monthly['equity_start']
-    monthly['ret_pct'] = monthly['pnl'] / monthly['equity_start'] * 100
-
-    monthly.index = monthly.index.to_period('M').astype(str)
-    return monthly[['equity_end', 'pnl', 'ret_pct']]
-
-
-# ============================================================
-# 4) BACKTEST SINGLE - تمیز و درست
-#    نکته مهم:
-#    - CorrArb trailing ندارد
-#    - CorrArb وقتی |z|<0.3 شد با قیمت فعلی close می‌بندد
-#      نه اینکه fake روی TP ببندیم
-# ============================================================
-def run_single_clean(df, name, signals, symbol='EUR',
-                     zscore=None, time_stop_h=48, trailing=False):
-    risk   = RiskManager(name)
-    trades = []
-    pos    = None
-    warmup = 300
-
-    s_ = symbol.lower()
-    hc, lc, cc = f'h_{s_}', f'l_{s_}', f'c_{s_}'
-    atr = calc_atr(df[hc], df[lc], df[cc], 14)
-
-    for i in range(warmup, len(df)):
-        ts = df.index[i]
-        hi = df[hc].iloc[i]
-        lo = df[lc].iloc[i]
-        cp = df[cc].iloc[i]
-
-        risk.new_bar(ts)
-
-        if risk.halted:
-            if pos is not None:
-                pnl = calc_pnl(pos['dir'], pos['lot'], pos['entry'], cp, symbol)
-                trades.append({**pos, 'exit': cp, 'exit_ts': ts,
-                               'pnl': pnl, 'status': 'halt_close'})
-                risk.add_pnl(pnl, ts)
-                pos = None
+def run_combo(df, strats):
+    rsk = Risk(); trds = []; pos = {}; atr_e = calc_atr(df['h_eur'], df['l_eur'], df['c_eur'], 14)
+    for i in range(300, len(df)):
+        ts = df.index[i]; rsk.chk(ts)
+        if rsk.hlt:
+            for k, p in list(pos.items()):
+                c = df[f"c_{p['sym'].lower()}"].iloc[i]; pn = pnl(p['d'], p['l'], p['en'], c, p['sym'])
+                rsk.chk(ts, pn); trds.append({**p, 'ex': c, 'pnl': pn}); del pos[k]
             continue
+        for k, p in list(pos.items()):
+            s = p['sym'].lower(); h, l, c, d, av = df[f'h_{s}'].iloc[i], df[f'l_{s}'].iloc[i], df[f'c_{s}'].iloc[i], p['d'], atr_e.iloc[i]
+            if pd.notna(av) and av>0 and (d*(c-p['en'])) > av*1.2: p['sl'] = max(p['sl'], p['en']+d*av*0.3) if d==1 else min(p['sl'], p['en']+d*av*0.3)
+            hit_s, hit_t = (d==1 and l<=p['sl']) or (d==-1 and h>=p['sl']), (d==1 and h>=p['tp']) or (d==-1 and l<=p['tp'])
+            if hit_s or hit_t or (ts - p['ts']).total_seconds()/3600 >= 48 or (ts.weekday()==4 and ts.hour>=20):
+                xp = p['sl'] if hit_s else (p['tp'] if hit_t else c); pn = pnl(d, p['l'], p['en'], xp, p['sym'])
+                rsk.chk(ts, pn); trds.append({**p, 'ex': xp, 'pnl': pn}); del pos[k]
+        if rsk.chk(ts) and len(pos)<2:
+            for sn, sg in strats.items():
+                if sn in pos or sg.iloc[i]['signal']==0: continue
+                v, slp, tpp, c = int(sg.iloc[i]['signal']), sg.iloc[i]['sl_pips'], sg.iloc[i]['tp_pips'], df['c_eur'].iloc[i]
+                en = c + v*Config.sp_eur*Config.pip/2
+                pos[sn] = {'st': sn, 'sym': 'EUR', 'd': v, 'l': sz(rsk.eq, slp), 'en': en, 'ts': ts, 'sl': en-v*slp*Config.pip, 'tp': en+v*tpp*Config.pip}
+    return trds, rsk.eq
 
-        # =========================
-        # EXIT
-        # =========================
-        if pos is not None:
-            d  = pos['dir']
-            ep = pos['entry']
-
-            # trailing فقط برای RSI_Div
-            if trailing:
-                atr_v = atr.iloc[i]
-                if pd.notna(atr_v) and atr_v > 0:
-                    move = d * (cp - ep)
-                    if move > atr_v * 1.2:
-                        be = ep + d * atr_v * 0.3
-                        if d == 1:
-                            pos['sl'] = max(pos['sl'], be)
-                        else:
-                            pos['sl'] = min(pos['sl'], be)
-
-                    if move > atr_v * 2.0:
-                        lock = ep + d * atr_v * 1.0
-                        if d == 1:
-                            pos['sl'] = max(pos['sl'], lock)
-                        else:
-                            pos['sl'] = min(pos['sl'], lock)
-
-            sl = pos['sl']
-            tp = pos['tp']
-
-            hit_sl = (d == 1 and lo <= sl) or (d == -1 and hi >= sl)
-            hit_tp = (d == 1 and hi >= tp) or (d == -1 and lo <= tp)
-
-            exit_reason = None
-            exit_price  = None
-
-            # اولویت درست: SL/TP اول
-            if hit_sl and hit_tp:
-                exit_reason = 'SL'      # محافظه‌کارانه
-                exit_price  = sl
-            elif hit_sl:
-                exit_reason = 'SL'
-                exit_price  = sl
-            elif hit_tp:
-                exit_reason = 'TP'
-                exit_price  = tp
-
-            # CorrArb special exit
-            if exit_reason is None and name == 'CorrArb' and zscore is not None:
-                z_now = zscore.iloc[i]
-                if pd.notna(z_now) and abs(z_now) < 0.3:
-                    exit_reason = 'ZExit'
-                    exit_price  = cp   # مهم: قیمت واقعی فعلی، نه TP فیک
-
-            # Time stop
-            if exit_reason is None:
-                elapsed_h = (ts - pos['entry_ts']).total_seconds() / 3600
-                if elapsed_h >= time_stop_h:
-                    exit_reason = 'TimeStop'
-                    exit_price  = cp
-
-            # Weekend close
-            if exit_reason is None and ts.weekday() == 4 and ts.hour >= 20:
-                exit_reason = 'WeekEnd'
-                exit_price  = cp
-
-            if exit_reason is not None:
-                pnl = calc_pnl(d, pos['lot'], ep, exit_price, symbol)
-                trades.append({**pos, 'exit': exit_price, 'exit_ts': ts,
-                               'pnl': pnl, 'status': exit_reason})
-                risk.add_pnl(pnl, ts)
-                pos = None
-
-        # =========================
-        # ENTRY
-        # =========================
-        if pos is None and risk.can_trade():
-            sv = int(signals['signal'].iloc[i])
-            if sv != 0:
-                sl_pips = float(signals['sl_pips'].iloc[i])
-                tp_pips = float(signals['tp_pips'].iloc[i])
-
-                if sl_pips <= 0 or tp_pips <= 0:
-                    continue
-                if tp_pips / sl_pips < Config.min_rr:
-                    continue
-
-                lot = lot_size_calc(risk.equity, sl_pips)
-                spread = Config.spread_eur_pips if symbol == 'EUR' else Config.spread_gbp_pips
-                entry = cp + sv * spread * Config.pip / 2
-
-                pos = dict(
-                    strategy=name,
-                    symbol=symbol,
-                    dir=sv,
-                    lot=lot,
-                    entry=entry,
-                    sl=entry - sv * sl_pips * Config.pip,
-                    tp=entry + sv * tp_pips * Config.pip,
-                    entry_ts=ts,
-                )
-
-    # close remaining
-    if pos is not None:
-        last_p = df[cc].iloc[-1]
-        last_ts = df.index[-1]
-        pnl = calc_pnl(pos['dir'], pos['lot'], pos['entry'], last_p, symbol)
-        trades.append({**pos, 'exit': last_p, 'exit_ts': last_ts,
-                       'pnl': pnl, 'status': 'eod_close'})
-        risk.add_pnl(pnl, last_ts)
-
-    return trades, risk
-
-
-# ============================================================
-# 5) BACKTEST COMBINED - همان منطق single
-#    مهم: اگر فقط یک استراتژی باشد، باید با single برابر شود
-# ============================================================
-def run_combined_clean(df, strategy_map):
-    """
-    strategy_map:
-    {
-      'CorrArb': {
-          'signals': sig_corr,
-          'symbol': 'EUR',
-          'zscore': z_corr,
-          'time_stop_h': 96,
-          'trailing': False,
-      },
-      'RSI_Div': {
-          'signals': sig_rsi,
-          'symbol': 'EUR',
-          'zscore': None,
-          'time_stop_h': 48,
-          'trailing': True,
-      }
-    }
-    """
-    risk     = RiskManager("Combined")
-    trades   = []
-    open_pos = {}
-    warmup   = 300
-    max_open = len(strategy_map)
-
-    atr_eur = calc_atr(df['h_eur'], df['l_eur'], df['c_eur'], 14)
-    atr_gbp = calc_atr(df['h_gbp'], df['l_gbp'], df['c_gbp'], 14)
-
-    for i in range(warmup, len(df)):
-        ts = df.index[i]
-        risk.new_bar(ts)
-
-        if risk.halted:
-            for key in list(open_pos.keys()):
-                p = open_pos.pop(key)
-                s_ = p['symbol'].lower()
-                cp = df[f'c_{s_}'].iloc[i]
-                pnl = calc_pnl(p['dir'], p['lot'], p['entry'], cp, p['symbol'])
-                trades.append({**p, 'exit': cp, 'exit_ts': ts,
-                               'pnl': pnl, 'status': 'halt_close'})
-                risk.add_pnl(pnl, ts)
-            continue
-
-        # =========================
-        # EXIT
-        # =========================
-        for key in list(open_pos.keys()):
-            p    = open_pos[key]
-            meta = strategy_map[p['strategy']]
-
-            s_ = p['symbol'].lower()
-            hi = df[f'h_{s_}'].iloc[i]
-            lo = df[f'l_{s_}'].iloc[i]
-            cp = df[f'c_{s_}'].iloc[i]
-            d  = p['dir']
-            ep = p['entry']
-
-            atr_series = atr_eur if p['symbol'] == 'EUR' else atr_gbp
-
-            if meta['trailing']:
-                atr_v = atr_series.iloc[i]
-                if pd.notna(atr_v) and atr_v > 0:
-                    move = d * (cp - ep)
-                    if move > atr_v * 1.2:
-                        be = ep + d * atr_v * 0.3
-                        if d == 1:
-                            p['sl'] = max(p['sl'], be)
-                        else:
-                            p['sl'] = min(p['sl'], be)
-
-                    if move > atr_v * 2.0:
-                        lock = ep + d * atr_v * 1.0
-                        if d == 1:
-                            p['sl'] = max(p['sl'], lock)
-                        else:
-                            p['sl'] = min(p['sl'], lock)
-
-            sl = p['sl']
-            tp = p['tp']
-
-            hit_sl = (d == 1 and lo <= sl) or (d == -1 and hi >= sl)
-            hit_tp = (d == 1 and hi >= tp) or (d == -1 and lo <= tp)
-
-            exit_reason = None
-            exit_price  = None
-
-            if hit_sl and hit_tp:
-                exit_reason = 'SL'
-                exit_price  = sl
-            elif hit_sl:
-                exit_reason = 'SL'
-                exit_price  = sl
-            elif hit_tp:
-                exit_reason = 'TP'
-                exit_price  = tp
-
-            if exit_reason is None and p['strategy'] == 'CorrArb' and meta['zscore'] is not None:
-                z_now = meta['zscore'].iloc[i]
-                if pd.notna(z_now) and abs(z_now) < 0.3:
-                    exit_reason = 'ZExit'
-                    exit_price  = cp
-
-            if exit_reason is None:
-                elapsed_h = (ts - p['entry_ts']).total_seconds() / 3600
-                if elapsed_h >= meta['time_stop_h']:
-                    exit_reason = 'TimeStop'
-                    exit_price  = cp
-
-            if exit_reason is None and ts.weekday() == 4 and ts.hour >= 20:
-                exit_reason = 'WeekEnd'
-                exit_price  = cp
-
-            if exit_reason is not None:
-                pnl = calc_pnl(d, p['lot'], ep, exit_price, p['symbol'])
-                trades.append({**p, 'exit': exit_price, 'exit_ts': ts,
-                               'pnl': pnl, 'status': exit_reason})
-                risk.add_pnl(pnl, ts)
-                del open_pos[key]
-
-        # =========================
-        # ENTRY
-        # =========================
-        if not risk.can_trade():
-            continue
-
-        if len(open_pos) >= max_open:
-            continue
-
-        for strat_name, meta in strategy_map.items():
-            if strat_name in open_pos:
-                continue
-
-            sigs = meta['signals']
-            sym  = meta['symbol']
-            sv   = int(sigs['signal'].iloc[i])
-
-            if sv == 0:
-                continue
-
-            sl_pips = float(sigs['sl_pips'].iloc[i])
-            tp_pips = float(sigs['tp_pips'].iloc[i])
-
-            if sl_pips <= 0 or tp_pips <= 0:
-                continue
-            if tp_pips / sl_pips < Config.min_rr:
-                continue
-
-            cp = df[f'c_{sym.lower()}'].iloc[i]
-            lot = lot_size_calc(risk.equity, sl_pips)
-            spread = Config.spread_eur_pips if sym == 'EUR' else Config.spread_gbp_pips
-            entry = cp + sv * spread * Config.pip / 2
-
-            open_pos[strat_name] = dict(
-                strategy=strat_name,
-                symbol=sym,
-                dir=sv,
-                lot=lot,
-                entry=entry,
-                sl=entry - sv * sl_pips * Config.pip,
-                tp=entry + sv * tp_pips * Config.pip,
-                entry_ts=ts,
-            )
-
-    # close remaining
-    for key, p in open_pos.items():
-        cp = df[f"c_{p['symbol'].lower()}"].iloc[-1]
-        last_ts = df.index[-1]
-        pnl = calc_pnl(p['dir'], p['lot'], p['entry'], cp, p['symbol'])
-        trades.append({**p, 'exit': cp, 'exit_ts': last_ts,
-                       'pnl': pnl, 'status': 'eod_close'})
-        risk.add_pnl(pnl, last_ts)
-
-    return trades, risk
-
-
-# ============================================================
-# 6) REPORT FOCUSED - دقیق روی ماهانه و DD
-# ============================================================
-def report_focus(name, trades, risk, start_ts, end_ts):
-    monthly = build_precise_monthly_returns(risk, start_ts, end_ts)
-
-    if len(monthly) == 0:
-        print(f"\n❌ {name}: no monthly data")
-        return None
-
-    avg_m  = monthly['ret_pct'].mean()
-    med_m  = monthly['ret_pct'].median()
-    best_m = monthly['ret_pct'].max()
-    worst_m= monthly['ret_pct'].min()
-    pos_m  = (monthly['ret_pct'] > 0).sum()
-    total_m= len(monthly)
-
-    total_pnl = risk.equity - Config.initial_balance
-    total_ret = total_pnl / Config.initial_balance * 100
-
-    t = pd.DataFrame(trades) if len(trades) else pd.DataFrame(columns=['pnl'])
-    win_rate = (t['pnl'] > 0).mean() * 100 if len(t) else 0
-    pf = (
-        t.loc[t['pnl'] > 0, 'pnl'].sum() /
-        abs(t.loc[t['pnl'] < 0, 'pnl'].sum())
-    ) if len(t) and abs(t.loc[t['pnl'] < 0, 'pnl'].sum()) > 0 else np.nan
-
-    print("\n" + "=" * 72)
-    print(f"{name}")
-    print("=" * 72)
-    print(f"Final Equity        : ${risk.equity:,.2f}")
-    print(f"Total PnL           : ${total_pnl:,.2f}")
-    print(f"Total Return        : {total_ret:.2f}%")
-    print(f"Max Drawdown        : {risk.max_dd:.2f}%")
-    print(f"Max DD $            : ${risk.max_dd_abs:,.2f}")
-    print(f"Trades              : {len(t)}")
-    print(f"Win Rate            : {win_rate:.1f}%")
-    print(f"Profit Factor       : {pf:.2f}" if pd.notna(pf) else "Profit Factor       : N/A")
-    print("-" * 72)
-    print(f"Avg Monthly Return  : {avg_m:.2f}%")
-    print(f"Median Monthly Ret  : {med_m:.2f}%")
-    print(f"Best Month          : {best_m:.2f}%")
-    print(f"Worst Month         : {worst_m:.2f}%")
-    print(f"Positive Months     : {pos_m}/{total_m} ({pos_m/total_m*100:.1f}%)")
-    print("-" * 72)
-    print(monthly.to_string())
-    print("=" * 72)
-
-    monthly.to_csv(f"monthly_{name}.csv", encoding="utf-8-sig")
-
-    return {
-        'name': name,
-        'equity': risk.equity,
-        'total_pnl': total_pnl,
-        'total_ret': total_ret,
-        'max_dd': risk.max_dd,
-        'max_dd_abs': risk.max_dd_abs,
-        'avg_monthly': avg_m,
-        'median_monthly': med_m,
-        'best_month': best_m,
-        'worst_month': worst_m,
-        'positive_months': pos_m,
-        'total_months': total_m,
-        'monthly_df': monthly,
-        'trades': len(t),
-        'win_rate': win_rate,
-        'pf': pf,
-    }
-
-
-# ============================================================
-# 7) MAIN - فقط CorrArb + RSI_Div
-# ============================================================
 if __name__ == "__main__":
-    print("=" * 72)
-    print("  CLEAN TEST: CorrArb + RSI_Div")
-    print("=" * 72)
-
-    df = load_data()
-
-    print("\n⚙️ Building CorrArb original...")
-    sig_corr, z_corr = strategy_corr_arb_original(df)
-    print(f"   → {(sig_corr['signal'] != 0).sum()} signals")
-
-    print("⚙️ Building RSI_Div proven...")
-    sig_rsi = strategy_rsi_div_proven(df)
-    print(f"   → {(sig_rsi['signal'] != 0).sum()} signals")
-
-    # =========================
-    # Single: CorrArb
-    # =========================
-    tr_corr, rk_corr = run_single_clean(
-        df=df,
-        name='CorrArb',
-        signals=sig_corr,
-        symbol='EUR',
-        zscore=z_corr,
-        time_stop_h=96,
-        trailing=False
-    )
-    rep_corr = report_focus("CorrArb", tr_corr, rk_corr, df.index[0], df.index[-1])
-
-    # =========================
-    # Single: RSI_Div
-    # =========================
-    tr_rsi, rk_rsi = run_single_clean(
-        df=df,
-        name='RSI_Div',
-        signals=sig_rsi,
-        symbol='EUR',
-        zscore=None,
-        time_stop_h=48,
-        trailing=True
-    )
-    rep_rsi = report_focus("RSI_Div", tr_rsi, rk_rsi, df.index[0], df.index[-1])
-
-    # =========================
-    # Combined: CorrArb + RSI_Div
-    # =========================
-    strategy_map = {
-        'CorrArb': {
-            'signals': sig_corr,
-            'symbol': 'EUR',
-            'zscore': z_corr,
-            'time_stop_h': 96,
-            'trailing': False,
-        },
-        'RSI_Div': {
-            'signals': sig_rsi,
-            'symbol': 'EUR',
-            'zscore': None,
-            'time_stop_h': 48,
-            'trailing': True,
-        }
-    }
-
-    tr_comb, rk_comb = run_combined_clean(df, strategy_map)
-    rep_comb = report_focus("Combined_CorrArb_RSI", tr_comb, rk_comb, df.index[0], df.index[-1])
-
-    print("\n" + "=" * 72)
-    print("SUMMARY")
-    print("=" * 72)
-
-    for rep in [rep_corr, rep_rsi, rep_comb]:
-        if rep is None:
-            continue
-        print(
-            f"{rep['name']:<24} | "
-            f"AvgMo={rep['avg_monthly']:>6.2f}% | "
-            f"MedMo={rep['median_monthly']:>6.2f}% | "
-            f"Best={rep['best_month']:>6.2f}% | "
-            f"Worst={rep['worst_month']:>6.2f}% | "
-            f"DD={rep['max_dd']:>6.2f}% | "
-            f"PF={rep['pf'] if pd.notna(rep['pf']) else np.nan:>5.2f}"
-        )
-
-    print("\n✅ Saved monthly CSVs:")
-    print("   monthly_CorrArb.csv")
-    print("   monthly_RSI_Div.csv")
-    print("   monthly_Combined_CorrArb_RSI.csv")
+    print("="*60 + "\n 🚀 MULTI-TIMEFRAME PROP BACKTEST (5 YEARS)\n" + "="*60)
+    for tf in ['5min', '15min', '1h']:
+        print(f"\n⏳ Loading & processing {tf} timeframe...")
+        try: df = load_data(tf)
+        except Exception as e: print(f" Error loading data: {e}"); continue
+        if df.empty: print(f" ❌ No data found for {tf}. Check data folder."); continue
+        
+        sigs = {'RSI_Div': strat_rsi_div(df), 'CorrArb_v3': strat_corr_arb_v3(df)}
+        trds, eq = run_combo(df, sigs)
+        t = pd.DataFrame(trds)
+        
+        if not t.empty:
+            t['pnl'] = pd.to_numeric(t['pnl'])
+            max_dd = abs(((t['pnl'].cumsum() + Config.init_bal) / (t['pnl'].cumsum() + Config.init_bal).cummax() - 1) * 100).max()
+            wr = len(t[t['pnl']>0]) / len(t) * 100
+            pf = t[t['pnl']>0]['pnl'].sum() / abs(t[t['pnl']<0]['pnl'].sum()) if len(t[t['pnl']<0])>0 else float('inf')
+            ret = ((eq - Config.init_bal) / Config.init_bal) * 100
+            mo_ret = ret / max(((t['ts'].max() - t['ts'].min()).days / 30.44), 1)
+            
+            print(f" ► TIMEFRAME: {tf.upper()}")
+            print(f" 💼 Trades: {len(t):<5} | 🎯 WR: {wr:.1f}% | ⚖️ PF: {pf:.2f}")
+            print(f" 💰 Profit: ${eq-Config.init_bal:,.2f} ({ret:+.1f}%) | 📅 Mo: {mo_ret:+.2f}% | 📉 Max DD: {max_dd:.2f}%")
+            if max_dd < 8.0 and mo_ret > 4.0: print(" ✅ VERDICT: PROP READY")
+            else: print(" ⚠️ VERDICT: NEEDS TWEAKING")
+        else:
+            print(f" ► TIMEFRAME: {tf.upper()} - ❌ No trades generated.")
+    print("\n" + "="*60 + "\n ✅ DONE\n" + "="*60)
