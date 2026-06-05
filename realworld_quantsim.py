@@ -507,17 +507,16 @@ def report(trades: list, risk: RiskManager, df: pd.DataFrame):
     t['pnl'] = pd.to_numeric(t['pnl'], errors='coerce').fillna(0)
 
     # ---- آمار کلی ----
-    final_eq    = risk.equity
-    total_ret   = (final_eq - Config.initial_balance) / Config.initial_balance * 100
-    win_rate    = (t['pnl'] > 0).mean() * 100
-    avg_win     = t.loc[t['pnl'] > 0, 'pnl'].mean()
-    avg_loss    = t.loc[t['pnl'] < 0, 'pnl'].mean()
-    gross_win   = t.loc[t['pnl'] > 0, 'pnl'].sum()
-    gross_loss  = t.loc[t['pnl'] < 0, 'pnl'].sum().abs()
-    pf          = gross_win / gross_loss if gross_loss > 0 else float('inf')
-    expectancy  = t['pnl'].mean()
-
-    rr_actual = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    final_eq   = risk.equity
+    total_ret  = (final_eq - Config.initial_balance) / Config.initial_balance * 100
+    win_rate   = (t['pnl'] > 0).mean() * 100
+    avg_win    = t.loc[t['pnl'] > 0, 'pnl'].mean()
+    avg_loss   = t.loc[t['pnl'] < 0, 'pnl'].mean()
+    gross_win  = t.loc[t['pnl'] > 0, 'pnl'].sum()
+    gross_loss = abs(t.loc[t['pnl'] < 0, 'pnl'].sum())   # ← اصلاح شد
+    pf         = gross_win / gross_loss if gross_loss > 0 else float('inf')
+    expectancy = t['pnl'].mean()
+    rr_actual  = abs(avg_win / avg_loss) if (avg_loss != 0 and pd.notna(avg_loss)) else 0
 
     print("\n" + "=" * 60)
     print("       📊 گزارش نهایی Backtest  (2020 → 2025)")
@@ -546,7 +545,7 @@ def report(trades: list, risk: RiskManager, df: pd.DataFrame):
         sub  = t[t['strategy'] == name]
         wr   = (sub['pnl'] > 0).mean() * 100
         gw   = sub.loc[sub['pnl'] > 0, 'pnl'].sum()
-        gl   = sub.loc[sub['pnl'] < 0, 'pnl'].sum().abs()
+        gl   = abs(sub.loc[sub['pnl'] < 0, 'pnl'].sum())   # ← اصلاح شد
         spf  = gw / gl if gl > 0 else float('inf')
         aw   = sub.loc[sub['pnl'] > 0, 'pnl'].mean()
         al   = sub.loc[sub['pnl'] < 0, 'pnl'].mean()
@@ -559,12 +558,10 @@ def report(trades: list, risk: RiskManager, df: pd.DataFrame):
     # ---- ذخیره ----
     t.to_csv("trades_report.csv", index=False)
 
-    eq_df = pd.DataFrame({
-        'equity': risk.curve
-    })
+    eq_df = pd.DataFrame({'equity': risk.curve})
     eq_df.to_csv("equity_curve.csv", index=False)
 
-    # ---- خلاصه دیباگ ----
+    # ---- توزیع خروج ----
     print(f"\n  📋 توزیع وضعیت خروج:")
     print(t['status'].value_counts().to_string())
 
