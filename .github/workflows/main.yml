@@ -1,12 +1,12 @@
-name: HistData Quant Backtest
+name: 5-Years Ultimate Quant Backtest
 
 on:
-  workflow_dispatch: # فقط با دکمه دستی استارت می‌شود
+  workflow_dispatch:
 
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 # زمان کافی برای پردازش ۵ سال دیتا
+    timeout-minutes: 30 
 
     steps:
       - name: Checkout Repository
@@ -18,23 +18,17 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Requirements
+      - name: Install Quant Libraries
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy
+          pip install pandas numpy numba
 
-      - name: Verify Data Directory
-        run: |
-          echo "=== بررسی فایل‌های موجود در پوشه دیتا ==="
-          ls -lah ./data/ || echo "❌ هشدار: پوشه data پیدا نشد!"
-          echo "========================================="
-
-      - name: Run MTF Optimizer
+      - name: Run Advanced MTF Optimizer
         run: python dukascopy_mtf_optimizer.py
 
-      - name: Upload Final Report
+      - name: Upload Final 5-Years Report
         uses: actions/upload-artifact@v4
         with:
-          name: HistData-MTF-Report
-          path: ultimate_histdata_mtf_report.csv
-          retention-days: 30 # فایل خروجی تا یک ماه در گیت‌هاب باقی می‌ماند
+          name: 5Years-Advanced-MTF-Report
+          path: ultimate_5years_advanced_report.csv
+          retention-days: 30
