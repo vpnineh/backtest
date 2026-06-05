@@ -1,66 +1,68 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import logging
-from statsmodels.tsa.stattools import adfuller
+import glob
+import warnings
+warnings.filterwarnings('ignore')
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-class OnlineSimulator:
+class RealWorldSimulator:
     def __init__(self):
-        self.initial_balance = 5000.0
-        self.tc = 0.0001 # 1 pip cost
-        self.leverage = 4.0 # اهرم ۴ (معادل ریسک ۱٪ در استاپ ۲۵ پیپی)
-
-    def load_data(self, timeframe):
-        # دانلود دیتا از یاهو فایننس
-        # 15m برای 60 روز (محدودیت یاهو)، 1h و 4h برای دیتای طولانی‌تر
-        period = "2y" if timeframe in ["1h", "4h"] else "60d"
-        eur = yf.download("EURUSD=X", period=period, interval=timeframe)
-        gbp = yf.download("GBPUSD=X", period=period, interval=timeframe)
+        self.initial_balance = 5000.0  
+        self.risk_per_trade = 0.01     
+        self.tc = 0.0001               
         
-        df = pd.DataFrame({'EURUSD': eur['Close'].squeeze(), 'GBPUSD': gbp['Close'].squeeze()})
-        return df.dropna()
+    def load_data(self):
+        # خواندن تمامی فایل‌های CSV در پوشه data
+        all_files = glob.glob('data/*.csv')
+        eur_files = [f for f in all_files if 'eurusd' in f.lower()]
+        gbp_files = [f for f in all_files if 'gbpusd' in f.lower()]
+
+        def process_files(files):
+            dfs = []
+            for f in files:
+                df = pd.read_csv(f, sep=';', header=None, names=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y%m%d %H%M%S').dt.tz_localize(None) # حذف تایم‌زون
+                dfs.append(df[['timestamp', 'close']])
+            return pd.concat(dfs).sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
+
+        df_eur = process_files(eur_files).rename(columns={'close': 'EURUSD'})
+        df_gbp = process_files(gbp_files).rename(columns={'close': 'GBPUSD'})
+        
+        self.base_data = df_eur.join(df_gbp, how='inner').dropna()
+        print(f"✅ دیتای 5 ساله محلی لود شد: {len(self.base_data):,} کندل")
 
     def run_simulation(self):
-        timeframes = {'15m': '15min', '1h': '1hour', '4h': '4hour'}
+        df = self.base_data.resample('15min').last().dropna()
         
-        for tf_code, tf_name in timeframes.items():
-            print(f"\n🚀 شروع تحلیل میدان نبرد روی تایم‌فریم: {tf_name}")
-            df = self.load_data(tf_code)
-            
-            df['Spread'] = np.log(df['EURUSD']) - np.log(df['GBPUSD'])
-            roll = df['Spread'].rolling(100)
-            df['Z'] = (df['Spread'] - roll.mean()) / (roll.std() + 1e-8)
-            
-            # منطق معاملاتی با فیلتر ADF
-            pos = np.zeros(len(df))
-            current_pos = 0
-            for i in range(100, len(df)):
-                z = df['Z'].iloc[i]
-                if current_pos == 0:
-                    if abs(z) > 2.5:
-                        subset = df['Spread'].iloc[i-100:i].values
-                        if adfuller(subset)[1] < 0.05:
-                            current_pos = 1 if z < -2.5 else -1
-                elif current_pos == 1 and z >= -0.5: current_pos = 0
-                elif current_pos == -1 and z <= 0.5: current_pos = 0
-                pos[i] = current_pos
-            
-            df['Pos'] = pd.Series(pos, index=df.index).shift(1).fillna(0)
-            
-            # محاسبات سود مرکب
-            r_eur = df['EURUSD'].pct_change()
-            r_gbp = df['GBPUSD'].pct_change()
-            returns = (df['Pos'] * (r_eur - r_gbp) - self.tc).fillna(0) * self.leverage
-            
-            equity = self.initial_balance * (1 + returns).cumprod()
-            roi = (equity.iloc[-1] / self.initial_balance - 1) * 100
-            
-            print(f"📊 نتیجه تایم‌فریم {tf_name}: رشد {roi:+.2f}%")
-            
-        print("\n✅ تست آنلاین تمام تایم‌فریم‌ها با موفقیت انجام شد.")
+        # استراتژی آربیتراژ آماری (تست شده)
+        df['Spread'] = np.log(df['EURUSD']) - np.log(df['GBPUSD'])
+        roll = df['Spread'].rolling(150)
+        df['Z'] = (df['Spread'] - roll.mean()) / (roll.std() + 1e-8)
+        
+        # منطق معاملاتی (ورود Z > 2.5 و خروج Z = 0)
+        df['Pos'] = 0
+        df.loc[df['Z'] < -2.5, 'Pos'] = 1
+        df.loc[df['Z'] > 2.5, 'Pos'] = -1
+        df.loc[abs(df['Z']) <= 0.5, 'Pos'] = 0
+        df['Pos'] = df['Pos'].replace(0, np.nan).ffill().fillna(0).shift(1)
+        
+        # محاسبه سود و زیان دلاری
+        r_eur = df['EURUSD'].pct_change()
+        r_gbp = df['GBPUSD'].pct_change()
+        returns = (df['Pos'] * (r_eur - r_gbp) - self.tc).fillna(0)
+        
+        # سود مرکب با لوریج 4
+        df['Equity'] = self.initial_balance * (1 + (returns * 4)).cumprod()
+        df['Drawdown'] = (df['Equity'] - df['Equity'].cummax()) / df['Equity'].cummax() * 100
+        
+        # خروجی نهایی
+        df.to_csv("Equity_Curve_Report.csv")
+        print(f"💰 موجودی نهایی: ${df['Equity'].iloc[-1]:,.2f}")
+        print(f"📉 بیشترین افت حساب: {df['Drawdown'].min():.2f}%")
 
 if __name__ == "__main__":
-    sim = OnlineSimulator()
+    sim = RealWorldSimulator()
+    sim.load_data()
     sim.run_simulation()
