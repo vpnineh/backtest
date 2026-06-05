@@ -2,9 +2,6 @@ name: 5-Years MVP Backtest (M15, M5, M2, M1)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   download-data:
@@ -28,7 +25,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2021-2026-v1
+          # ⚠️ v2 = کش قدیمی را نادیده بگیر
+          key: dukascopy-eurusd-gbpusd-2021-2026-v2
 
       - name: Download Market Data
         if: steps.cache-data.outputs.cache-hit != 'true'
@@ -36,23 +34,57 @@ jobs:
 
       - name: Verify Data
         run: |
+          echo "=== فایل‌ها ==="
           ls -lah ./data/
+
           for f in ./data/*.csv; do
             lines=$(wc -l < "$f")
             size=$(du -sh "$f" | cut -f1)
             echo "$f | $lines خط | $size"
+            if [ "$lines" -lt 100000 ]; then
+              echo "❌ فایل کوچک است!"
+              exit 1
+            fi
           done
+
+          python - <<'EOF'
+          import pandas as pd
+
+          for symbol in ['EURUSD', 'GBPUSD']:
+              import glob
+              files = glob.glob(f'data/{symbol}*.csv')
+              if not files:
+                  print(f"❌ {symbol} یافت نشد!")
+                  exit(1)
+              
+              df = pd.read_csv(files[0], nrows=2000)
+              df['timestamp'] = pd.to_datetime(df['timestamp'])
+              
+              hours  = df['timestamp'].dt.hour.nunique()
+              mins   = df['timestamp'].dt.minute.nunique()
+              
+              print(f"\n{symbol}:")
+              print(f"  ساعت‌های یکتا: {hours}")
+              print(f"  دقیقه‌های یکتا: {mins}")
+              print(f"  نمونه: {df['timestamp'].iloc[0]} → {df['timestamp'].iloc[-1]}")
+              
+              if hours < 5:
+                  print(f"❌ timestamp هنوز اشتباه است!")
+                  exit(1)
+              
+              print(f"  ✅ timestamp سالم")
+          EOF
 
       - name: Save Cache
         if: steps.cache-data.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2021-2026-v1
+          key: dukascopy-eurusd-gbpusd-2021-2026-v2
 
-  debug-csv:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     needs: download-data
 
     steps:
@@ -63,42 +95,33 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Requirements
         run: pip install pandas numpy
 
-      - name: Restore Cache
+      - name: Restore Data Cache
+        id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2021-2026-v1
+          key: dukascopy-eurusd-gbpusd-2021-2026-v2
 
-      - name: Debug Raw CSV Content
+      - name: Verify Cache
         run: |
-          python - <<'EOF'
-          import pandas as pd
-          import os
+          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
+          ls -lah ./data/
+          if [ -z "$(ls ./data/*.csv 2>/dev/null)" ]; then
+            echo "❌ کش restore نشد!"
+            exit 1
+          fi
 
-          path = 'data/EURUSD_M1_20210101_20260101.csv'
+      - name: Run Backtest
+        run: python dukascopy_mtf_optimizer.py
 
-          print(f"حجم فایل: {os.path.getsize(path)/1024/1024:.1f} MB")
-          print()
-          print("=== 20 خط اول خام ===")
-          with open(path, 'r') as f:
-              for i, line in enumerate(f):
-                  print(repr(line.strip()))
-                  if i >= 20:
-                      break
-
-          print()
-          print("=== pandas read ===")
-          df = pd.read_csv(path, nrows=20)
-          print(df.to_string())
-          print()
-          print(f"نوع ستون timestamp: {df['timestamp'].dtype}")
-
-          df['timestamp'] = pd.to_datetime(df['timestamp'])
-          print(f"ساعت‌های یکتا در 20 ردیف: {df['timestamp'].dt.hour.unique().tolist()}")
-          print(f"دقیقه‌های یکتا در 20 ردیف: {df['timestamp'].dt.minute.unique().tolist()}")
-          print(f"نمونه timestamp پارس شده: {df['timestamp'].iloc[0]}")
-          EOF
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: MVP-5Years-MTF-Report
+          path: ultimate_5years_mtf_report.csv
+          retention-days: 30
