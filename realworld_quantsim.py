@@ -1,667 +1,579 @@
 import pandas as pd
 import numpy as np
 import glob
-from dataclasses import dataclass, field
-from typing import List, Dict
 import warnings
 warnings.filterwarnings('ignore')
 
 # ================================================================== #
-#                        CONFIG مرکزی                                #
+#                         CONFIG                                     #
 # ================================================================== #
-@dataclass
-class PropConfig:
-    initial_balance: float = 5000.0
-    
-    # محدودیت‌های پراپ (استاندارد FTMO/MyForexFunds)
-    max_daily_loss_pct: float = 0.05      # 5% ضرر روزانه
-    max_total_dd_pct:   float = 0.10      # 10% دراودان کل
-    profit_target_pct:  float = 0.10      # 10% هدف سود
-    
-    # مدیریت پوزیشن
-    risk_per_trade_pct: float = 0.01      # 1% ریسک هر معامله
-    max_lot_per_trade:  float = 0.5
-    spread_eur:         float = 0.00012   # 1.2 پیپ
-    spread_gbp:         float = 0.00015   # 1.5 پیپ
-    commission_per_lot: float = 7.0       # دلار per lot (round trip)
+class Config:
+    initial_balance     = 5_000.0
+    risk_per_trade_pct  = 0.005      # 0.5% ریسک هر معامله (محافظه‌کارانه)
+    max_daily_loss_pct  = 0.04       # 4%
+    max_total_dd_pct    = 0.08       # 8%
+    profit_target_pct   = 0.10       # 10%
+    spread_eur_pips     = 1.2        # پیپ
+    spread_gbp_pips     = 1.5
+    commission_per_lot  = 7.0        # دلار round-trip
+    pip                 = 0.0001
+    lot_size            = 100_000
 
 
 # ================================================================== #
-#                      کلاس Trade                                    #
+#                      ابزارهای کمکی                                #
 # ================================================================== #
-@dataclass
-class Trade:
-    strategy:   str
-    symbol:     str
-    direction:  int        # +1 خرید / -1 فروش
-    lot:        float
-    entry_price: float
-    entry_time:  pd.Timestamp
-    sl:         float
-    tp:         float
-    exit_price: float  = 0.0
-    exit_time:  pd.Timestamp = None
-    pnl:        float  = 0.0
-    status:     str    = 'open'   # open / closed
+def load_data() -> pd.DataFrame:
+    files_eur = sorted(glob.glob('data/*EURUSD*.csv'))
+    files_gbp = sorted(glob.glob('data/*GBPUSD*.csv'))
+
+    if not files_eur or not files_gbp:
+        raise FileNotFoundError("فایل CSV پیدا نشد در data/")
+
+    def read(paths, suffix):
+        frames = []
+        for p in paths:
+            df = pd.read_csv(p, sep=';', header=None,
+                             names=['ts','o','h','l','c','v'])
+            df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
+            df = df.set_index('ts')
+            df = df[~df.index.duplicated(keep='last')]
+            df.columns = [f'{c}_{suffix}' for c in df.columns]
+            frames.append(df)
+        return pd.concat(frames).sort_index()
+
+    eur = read(files_eur, 'eur')
+    gbp = read(files_gbp, 'gbp')
+
+    raw = eur.join(gbp, how='inner').dropna()
+
+    df = pd.DataFrame({
+        'o_eur': raw['o_eur'].resample('15min').first(),
+        'h_eur': raw['h_eur'].resample('15min').max(),
+        'l_eur': raw['l_eur'].resample('15min').min(),
+        'c_eur': raw['c_eur'].resample('15min').last(),
+        'o_gbp': raw['o_gbp'].resample('15min').first(),
+        'h_gbp': raw['h_gbp'].resample('15min').max(),
+        'l_gbp': raw['l_gbp'].resample('15min').min(),
+        'c_gbp': raw['c_gbp'].resample('15min').last(),
+    }).dropna()
+
+    print(f"✅ {len(df):,} کندل | {df.index[0].date()} → {df.index[-1].date()}")
+    return df
+
+
+def calc_atr(high, low, close, period=14) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def calc_rsi(close, period=14) -> pd.Series:
+    d     = close.diff()
+    gain  = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss  = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def trade_cost(lot: float, symbol: str) -> float:
+    """هزینه کل یک معامله: اسپرد + کمیسیون"""
+    spread_pips = (Config.spread_eur_pips 
+                   if symbol == 'EUR' 
+                   else Config.spread_gbp_pips)
+    spread_cost = spread_pips * Config.pip * lot * Config.lot_size
+    commission  = Config.commission_per_lot * lot
+    return spread_cost + commission
+
+
+def pnl(direction, lot, entry, exit_p, symbol) -> float:
+    raw = direction * (exit_p - entry) * lot * Config.lot_size
+    return raw - trade_cost(lot, symbol)
+
+
+def lot_size(equity, sl_pips) -> float:
+    """حجم بر اساس ریسک ثابت"""
+    if sl_pips <= 0:
+        return 0.01
+    risk_usd = equity * Config.risk_per_trade_pct
+    lot = risk_usd / (sl_pips * Config.pip * Config.lot_size)
+    return round(np.clip(lot, 0.01, 1.0), 2)
 
 
 # ================================================================== #
-#              کلاس مدیریت ریسک مرکزی                               #
+#                   کلاس مرکزی Risk Manager                         #
 # ================================================================== #
 class RiskManager:
-    def __init__(self, config: PropConfig):
-        self.cfg          = config
-        self.equity       = config.initial_balance
-        self.peak_equity  = config.initial_balance
-        self.daily_start_equity = config.initial_balance
-        self.current_date = None
-        self.trading_halted = False
-        self.halt_reason    = ""
-        self.equity_curve   = [config.initial_balance]
-        self.daily_pnl_log  = {}
+    def __init__(self):
+        self.equity       = Config.initial_balance
+        self.peak         = Config.initial_balance
+        self.day_start_eq = Config.initial_balance
+        self.cur_day      = None
+        self.halted       = False
+        self.halt_reason  = "در حال اجرا"
+        self.curve        = [Config.initial_balance]
 
-    def update_daily(self, date: pd.Timestamp):
-        """در شروع روز جدید ریست می‌شود"""
-        day = date.date()
-        if self.current_date != day:
-            self.current_date       = day
-            self.daily_start_equity = self.equity
-            self.trading_halted     = False   # روز جدید → ریست
+    def new_bar(self, ts: pd.Timestamp):
+        day = ts.date()
+        if day != self.cur_day:
+            self.cur_day      = day
+            self.day_start_eq = self.equity
+            # فقط daily halt را ریست می‌کنیم
+            if "Daily" in self.halt_reason:
+                self.halted      = False
+                self.halt_reason = "در حال اجرا"
 
-    def calculate_lot(self, sl_pips: float, pip_value: float = 10.0) -> float:
-        """محاسبه حجم بر اساس ریسک ثابت"""
-        if sl_pips <= 0:
-            return 0.01
-        risk_amount = self.equity * self.cfg.risk_per_trade_pct
-        lot = risk_amount / (sl_pips * pip_value)
-        lot = round(min(lot, self.cfg.max_lot_per_trade), 2)
-        return max(lot, 0.01)
+    def add_pnl(self, amount: float, ts: pd.Timestamp) -> bool:
+        self.equity += amount
+        self.peak    = max(self.peak, self.equity)
+        self.curve.append(round(self.equity, 4))
 
-    def register_pnl(self, pnl: float, date: pd.Timestamp) -> bool:
-        """
-        ثبت P&L و بررسی محدودیت‌های پراپ
-        Returns: False اگر معامله باید متوقف شود
-        """
-        self.equity += pnl
-        self.equity_curve.append(self.equity)
-        self.peak_equity = max(self.peak_equity, self.equity)
-
-        day = date.date()
-        self.daily_pnl_log[day] = self.daily_pnl_log.get(day, 0) + pnl
-
-        # چک ۱: ضرر روزانه
-        daily_dd = (self.equity - self.daily_start_equity) / self.daily_start_equity
-        if daily_dd <= -self.cfg.max_daily_loss_pct:
-            self.trading_halted = True
-            self.halt_reason    = f"Daily Loss {daily_dd*100:.1f}%"
+        # چک روزانه
+        daily_dd = (self.equity - self.day_start_eq) / self.day_start_eq
+        if daily_dd <= -Config.max_daily_loss_pct:
+            self.halted      = True
+            self.halt_reason = f"Daily Loss {daily_dd*100:.1f}%"
             return False
 
-        # چک ۲: دراودان کل
-        total_dd = (self.equity - self.peak_equity) / self.peak_equity
-        if total_dd <= -self.cfg.max_total_dd_pct:
-            self.trading_halted = True
-            self.halt_reason    = f"Max DD {total_dd*100:.1f}%"
+        # چک کل
+        total_dd = (self.equity - self.peak) / self.peak
+        if total_dd <= -Config.max_total_dd_pct:
+            self.halted      = True
+            self.halt_reason = f"Max DD {total_dd*100:.1f}%"
             return False
 
-        # چک ۳: هدف سود رسیده؟
-        total_profit = (self.equity - self.cfg.initial_balance) / self.cfg.initial_balance
-        if total_profit >= self.cfg.profit_target_pct:
-            self.trading_halted = True
-            self.halt_reason    = f"✅ Profit Target {total_profit*100:.1f}%"
+        # هدف سود
+        profit_pct = (self.equity - Config.initial_balance) / Config.initial_balance
+        if profit_pct >= Config.profit_target_pct:
+            self.halted      = True
+            self.halt_reason = f"✅ Profit Target {profit_pct*100:.1f}%"
             return False
 
         return True
 
     @property
-    def max_drawdown(self) -> float:
-        curve = pd.Series(self.equity_curve)
-        roll_max = curve.cummax()
-        dd = (curve - roll_max) / roll_max
-        return dd.min() * 100
+    def max_dd(self):
+        s       = pd.Series(self.curve)
+        roll_mx = s.cummax()
+        return ((s - roll_mx) / roll_mx).min() * 100
 
     @property
-    def sharpe_ratio(self) -> float:
-        returns = pd.Series(self.equity_curve).pct_change().dropna()
-        if returns.std() == 0:
-            return 0
-        return (returns.mean() / returns.std()) * np.sqrt(252 * 96)  # 96 کندل ۱۵ دقیقه‌ای در روز
+    def sharpe(self):
+        r = pd.Series(self.curve).pct_change().dropna()
+        return (r.mean() / r.std() * np.sqrt(252 * 96)) if r.std() > 0 else 0
 
 
 # ================================================================== #
-#            Strategy 1: Correlation Arbitrage                       #
+#           Strategy A: Correlation Pair Trading                     #
+#                                                                    #
+#  منطق واقعی:                                                       #
+#  EUR و GBP معمولاً با هم حرکت می‌کنند.                            #
+#  وقتی EUR/GBP (کراس) از میانگین انحراف پیدا کرد                  #
+#  → معامله در جهت بازگشت                                           #
 # ================================================================== #
-class CorrelationArbitrageStrategy:
-    """
-    منطق: EURUSD و GBPUSD معمولاً correlation بالایی دارند (>0.85)
-    وقتی correlation موقتاً کاهش می‌یابد → divergence → mean reversion
-    
-    سیگنال:
-    - Spread = EUR_normalized - GBP_normalized
-    - وقتی spread > 2σ → EUR گران است → EUR بفروش، GBP بخر
-    - وقتی spread < -2σ → GBP گران است → GBP بفروش، EUR بخر
-    """
-    def __init__(self, config: PropConfig):
-        self.cfg        = config
-        self.name       = "Correlation_Arb"
-        self.lookback   = 96        # ۲۴ ساعت (۹۶ کندل ۱۵ دقیقه‌ای)
-        self.z_entry    = 2.0       # ورود در ۲ انحراف معیار
-        self.z_exit     = 0.5       # خروج در بازگشت به میانه
-        self.min_corr   = 0.70      # حداقل correlation برای فعال بودن
-        self.trades: List[Trade] = []
+def build_corr_arb_signals(df: pd.DataFrame) -> pd.Series:
+    # نسبت EUR به GBP ≈ قیمت EURGBP
+    eurgbp = df['c_eur'] / df['c_gbp']
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        
-        # نرمال‌سازی قیمت‌ها (Z-score rolling)
-        eur_mean = df['c_eur'].rolling(self.lookback).mean()
-        eur_std  = df['c_eur'].rolling(self.lookback).std()
-        gbp_mean = df['c_gbp'].rolling(self.lookback).mean()
-        gbp_std  = df['c_gbp'].rolling(self.lookback).std()
+    period = 96          # ۲۴ ساعت
+    mean   = eurgbp.rolling(period).mean()
+    std    = eurgbp.rolling(period).std()
+    z      = (eurgbp - mean) / std.replace(0, np.nan)
 
-        df['eur_z'] = (df['c_eur'] - eur_mean) / eur_std
-        df['gbp_z'] = (df['c_gbp'] - gbp_mean) / gbp_std
+    # فیلتر: فقط وقتی std به اندازه کافی بزرگ است (بازار فعال)
+    std_filter = std > std.rolling(period * 5).mean() * 0.5
 
-        # Spread بین دو جفت‌ارز نرمال‌شده
-        df['spread_z'] = df['eur_z'] - df['gbp_z']
+    sig = pd.Series(0, index=df.index)
 
-        # میانگین و انحراف معیار spread
-        df['spread_mean'] = df['spread_z'].rolling(self.lookback).mean()
-        df['spread_std']  = df['spread_z'].rolling(self.lookback).std()
-        df['z_score']     = (df['spread_z'] - df['spread_mean']) / df['spread_std'].replace(0, np.nan)
+    # Z > +2 → EUR نسبت به GBP گران است → EURUSD بفروش
+    sig[(z >  2.0) & std_filter] = -1
+    # Z < -2 → EUR نسبت به GBP ارزان است → EURUSD بخر
+    sig[(z < -2.0) & std_filter] =  1
 
-        # Correlation rolling
-        df['correlation'] = df['c_eur'].rolling(self.lookback).corr(df['c_gbp'])
+    # فیلتر: سیگنال تکراری نگیر (فقط اولین کندل تغییر)
+    sig = sig.where(sig != sig.shift(), 0)
 
-        # سیگنال‌ها
-        df['arb_signal'] = 0
-        
-        valid = (
-            df['correlation'].abs() >= self.min_corr
-        ) & df['z_score'].notna()
-
-        # EUR گران → فروش EUR، خرید GBP
-        df.loc[valid & (df['z_score'] >  self.z_entry), 'arb_signal'] = -1
-        # GBP گران → فروش GBP، خرید EUR
-        df.loc[valid & (df['z_score'] < -self.z_entry), 'arb_signal'] =  1
-
-        return df
+    return sig, z
 
 
 # ================================================================== #
-#         Strategy 2: London/NY Session Breakout                     #
+#        Strategy B: London Open Breakout (بهینه‌شده)               #
+#                                                                    #
+#  منطق:                                                             #
+#  Range ساعت ۵ و ۶ صبح GMT را بساز                                 #
+#  در ساعت ۷ (شروع لندن) منتظر شکست باش                            #
+#  فیلتر ADR: اگر روز قبل حرکت کمی داشت → رد کن                    #
 # ================================================================== #
-class SessionBreakoutStrategy:
-    """
-    منطق: در اول Session لندن (08:00 GMT) و نیویورک (13:00 GMT)
-    بیشترین نوسان اتفاق می‌افتد.
-    
-    سیگنال:
-    - Range ساعت ۰۶:۰۰-۰۸:۰۰ GMT را محاسبه کن (Pre-London Range)
-    - شکست بالای range → Buy
-    - شکست پایین range → Sell
-    - ATR Filter برای جلوگیری از سیگنال کاذب در بازار آرام
-    """
-    def __init__(self, config: PropConfig):
-        self.cfg      = config
-        self.name     = "Session_Breakout"
-        self.atr_mult = 1.5         # ضریب ATR برای SL
-        self.trades: List[Trade] = []
+def build_breakout_signals(df: pd.DataFrame) -> pd.Series:
+    df  = df.copy()
+    df['hour'] = df.index.hour
+    df['date'] = df.index.date
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df['hour'] = df.index.hour
-        df['date'] = df.index.date
+    atr = calc_atr(df['h_eur'], df['l_eur'], df['c_eur'], 14)
 
-        # ATR
-        df['tr']  = np.maximum(
-            df['h_eur'] - df['l_eur'],
-            np.maximum(
-                abs(df['h_eur'] - df['c_eur'].shift(1)),
-                abs(df['l_eur'] - df['c_eur'].shift(1))
-            )
-        )
-        df['atr'] = df['tr'].rolling(14).mean()
+    # Range پیش از لندن: ساعت ۵ و ۶ GMT
+    pre = df[df['hour'].isin([5, 6])]
+    rng = pre.groupby('date').agg(
+        rh=('h_eur', 'max'),
+        rl=('l_eur', 'min')
+    )
+    rng['rng_size'] = rng['rh'] - rng['rl']
 
-        # Pre-London Range: کندل‌های ۰۶:۰۰ تا ۰۷:۴۵ GMT
-        pre_london = df[df['hour'].isin([6, 7])].copy()
-        daily_range = pre_london.groupby('date').agg(
-            range_high=('h_eur', 'max'),
-            range_low=('l_eur', 'min')
-        )
+    df = df.join(rng, on='date')
 
-        df = df.join(daily_range, on='date')
+    # فیلتر: range باید منطقی باشد (نه خیلی کوچک، نه خیلی بزرگ)
+    atr_avg       = atr.rolling(20).mean()
+    valid_range   = (
+        (df['rng_size'] > atr_avg * 0.3) &   # حداقل ۳۰٪ ATR
+        (df['rng_size'] < atr_avg * 2.0)      # حداکثر ۲۰۰٪ ATR
+    )
 
-        # سیگنال فقط در ساعات ۰۸:۰۰ تا ۱۶:۰۰
-        df['breakout_signal'] = 0
-        trading_hours = df['hour'].between(8, 16)
+    sig = pd.Series(0, index=df.index)
 
-        # شکست صعودی
-        df.loc[
-            trading_hours &
-            (df['c_eur'] > df['range_high']) &
-            (df['atr'] > df['atr'].rolling(20).mean() * 0.8),   # بازار فعال
-            'breakout_signal'
-        ] = 1
+    # فقط ساعت ۷ تا ۱۱ GMT (لندن)
+    london_hours = df['hour'].between(7, 11)
 
-        # شکست نزولی
-        df.loc[
-            trading_hours &
-            (df['c_eur'] < df['range_low']) &
-            (df['atr'] > df['atr'].rolling(20).mean() * 0.8),
-            'breakout_signal'
-        ] = -1
+    # شکست بالا
+    sig[
+        london_hours &
+        valid_range &
+        (df['c_eur'] > df['rh']) &
+        (df['o_eur'] < df['rh'])    # شکست در همین کندل اتفاق افتاده
+    ] = 1
 
-        return df
+    # شکست پایین
+    sig[
+        london_hours &
+        valid_range &
+        (df['c_eur'] < df['rl']) &
+        (df['o_eur'] > df['rl'])
+    ] = -1
+
+    # فقط اولین سیگنال هر روز
+    daily_first = sig[sig != 0].groupby(sig[sig != 0].index.date).head(1).index
+    final_sig   = pd.Series(0, index=df.index)
+    final_sig[daily_first] = sig[daily_first]
+
+    return final_sig, df['rh'], df['rl'], atr
 
 
 # ================================================================== #
-#         Strategy 3: ATR-Based Mean Reversion                       #
+#        Strategy C: EMA Trend + RSI Pullback                        #
+#                                                                    #
+#  منطق (جایگزین Mean Reversion که شکست خورد):                      #
+#  ترند را با EMA200 تشخیص بده                                       #
+#  منتظر پولبک به EMA50 باش (RSI بین ۴۰-۶۰)                        #
+#  در جهت ترند اصلی وارد شو                                          #
+#  این استراتژی با ترند کار می‌کند نه ضد آن                          #
 # ================================================================== #
-class ATRMeanReversionStrategy:
-    """
-    منطق: بازار بعد از حرکات شارپ (بیشتر از N×ATR) 
-    تمایل به بازگشت به میانگین دارد.
-    
-    سیگنال:
-    - اگر قیمت بیش از ۲×ATR از EMA(50) فاصله گرفت → Mean Reversion
-    - فقط در زمان‌هایی که RSI اشباع خرید/فروش نشان می‌دهد
-    - SL پشت آخرین swing high/low
-    """
-    def __init__(self, config: PropConfig):
-        self.cfg        = config
-        self.name       = "ATR_Mean_Rev"
-        self.ema_period = 50
-        self.atr_mult   = 2.0       # فاصله از EMA برای ورود
-        self.rsi_period = 14
-        self.rsi_ob     = 65        # اشباع خرید (محافظه‌کارانه)
-        self.rsi_os     = 35        # اشباع فروش
-        self.trades: List[Trade] = []
+def build_trend_pullback_signals(df: pd.DataFrame) -> pd.Series:
+    c = df['c_eur']
 
-    def _rsi(self, series: pd.Series, period: int) -> pd.Series:
-        delta  = series.diff()
-        gain   = delta.clip(lower=0).rolling(period).mean()
-        loss   = (-delta.clip(upper=0)).rolling(period).mean()
-        rs     = gain / loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+    ema50  = c.ewm(span=50,  adjust=False).mean()
+    ema200 = c.ewm(span=200, adjust=False).mean()
+    rsi    = calc_rsi(c, 14)
+    atr    = calc_atr(df['h_eur'], df['l_eur'], c, 14)
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
+    # ترند: EMA50 بالای EMA200 → uptrend
+    uptrend   = ema50 > ema200
+    downtrend = ema50 < ema200
 
-        # EMA
-        df['ema50'] = df['c_eur'].ewm(span=self.ema_period, adjust=False).mean()
+    # فاصله قیمت از EMA50 (نسبت به ATR)
+    dist = (c - ema50) / atr.replace(0, np.nan)
 
-        # ATR
-        df['tr']  = np.maximum(
-            df['h_eur'] - df['l_eur'],
-            np.maximum(
-                abs(df['h_eur'] - df['c_eur'].shift(1)),
-                abs(df['l_eur'] - df['c_eur'].shift(1))
-            )
-        )
-        df['atr'] = df['tr'].rolling(14).mean()
+    sig = pd.Series(0, index=df.index)
 
-        # RSI
-        df['rsi'] = self._rsi(df['c_eur'], self.rsi_period)
+    # خرید: uptrend + قیمت نزدیک به EMA50 (پولبک) + RSI در ناحیه خنثی
+    sig[
+        uptrend &
+        (dist > -1.0) & (dist < 0.3) &    # نزدیک EMA50 از پایین
+        (rsi > 40) & (rsi < 60)
+    ] = 1
 
-        # فاصله از EMA نسبت به ATR
-        df['dist_from_ema'] = (df['c_eur'] - df['ema50']) / df['atr'].replace(0, np.nan)
+    # فروش: downtrend + قیمت نزدیک به EMA50 (پولبک) + RSI خنثی
+    sig[
+        downtrend &
+        (dist < 1.0) & (dist > -0.3) &
+        (rsi > 40) & (rsi < 60)
+    ] = -1
 
-        df['mr_signal'] = 0
+    # فیلتر: سیگنال تکراری نگیر
+    sig = sig.where(sig != sig.shift(), 0)
 
-        # قیمت خیلی بالای EMA + RSI اشباع خرید → فروش (انتظار بازگشت)
-        df.loc[
-            (df['dist_from_ema'] >  self.atr_mult) &
-            (df['rsi'] > self.rsi_ob),
-            'mr_signal'
-        ] = -1
-
-        # قیمت خیلی زیر EMA + RSI اشباع فروش → خرید
-        df.loc[
-            (df['dist_from_ema'] < -self.atr_mult) &
-            (df['rsi'] < self.rsi_os),
-            'mr_signal'
-        ] =  1
-
-        return df
+    return sig, ema50, atr
 
 
 # ================================================================== #
-#                      موتور اصلی Backtest                          #
+#                      موتور Backtest                                #
 # ================================================================== #
-class PropBacktestEngine:
-    def __init__(self):
-        self.config = PropConfig()
-        self.risk   = RiskManager(self.config)
-        self.strategies = {
-            'corr_arb':    CorrelationArbitrageStrategy(self.config),
-            'breakout':    SessionBreakoutStrategy(self.config),
-            'mean_rev':    ATRMeanReversionStrategy(self.config),
-        }
-        self.all_trades: List[Trade] = []
+def run_backtest(df: pd.DataFrame):
 
-    # ---------------------------------------------------------------- #
-    def load_data(self):
-        files_eur = sorted(glob.glob('data/*EURUSD*.csv'))
-        files_gbp = sorted(glob.glob('data/*GBPUSD*.csv'))
+    print("\n⚙️  محاسبه اندیکاتورها...")
 
-        if not files_eur or not files_gbp:
-            raise FileNotFoundError("فایل‌های CSV پیدا نشدند در پوشه data/")
+    # سیگنال‌ها
+    sig_arb, z_score           = build_corr_arb_signals(df)
+    sig_brk, rh, rl, atr_brk  = build_breakout_signals(df)
+    sig_tp,  ema50, atr_tp     = build_trend_pullback_signals(df)
 
-        def read_df(path, suffix):
-            df = pd.read_csv(
-                path, sep=';', header=None,
-                names=['ts', 'o', 'h', 'l', 'c', 'v']
-            )
-            df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
-            df = df.set_index('ts')
-            df = df[~df.index.duplicated(keep='last')]
-            df.columns = [f'{col}_{suffix}' for col in df.columns]
-            return df
+    atr_main = calc_atr(df['h_eur'], df['l_eur'], df['c_eur'], 14)
 
-        eur = pd.concat([read_df(f, 'eur') for f in files_eur]).sort_index()
-        gbp = pd.concat([read_df(f, 'gbp') for f in files_gbp]).sort_index()
+    risk = RiskManager()
 
-        df = eur.join(gbp, how='inner').dropna()
+    # ساختار هر پوزیشن باز
+    # { key: {dir, lot, entry, sl, tp, symbol, strategy, entry_ts} }
+    open_pos = {}
 
-        # ریسمپل به ۱۵ دقیقه
-        df_15 = pd.DataFrame({
-            'o_eur': df['o_eur'].resample('15min').first(),
-            'h_eur': df['h_eur'].resample('15min').max(),
-            'l_eur': df['l_eur'].resample('15min').min(),
-            'c_eur': df['c_eur'].resample('15min').last(),
-            'o_gbp': df['o_gbp'].resample('15min').first(),
-            'h_gbp': df['h_gbp'].resample('15min').max(),
-            'l_gbp': df['l_gbp'].resample('15min').min(),
-            'c_gbp': df['c_gbp'].resample('15min').last(),
-        }).dropna()
+    trades = []   # لیست معاملات بسته‌شده
 
-        self.df = df_15
-        print(f"✅ دیتا لود شد | {len(self.df):,} کندل ۱۵ دقیقه‌ای")
-        print(f"   از: {self.df.index[0]}  تا: {self.df.index[-1]}")
+    warmup = 250  # کندل warmup برای اندیکاتورها
 
-    # ---------------------------------------------------------------- #
-    def _apply_spread(self, price: float, direction: int, spread: float) -> float:
-        """اعمال اسپرد واقعی روی قیمت ورود"""
-        return price + (spread / 2 * direction)
+    print("⚙️  شروع شبیه‌سازی کندل به کندل...\n")
 
-    def _calculate_pnl(self, trade: Trade, exit_price: float) -> float:
-        """محاسبه P&L با کمیسیون"""
-        spread = (self.config.spread_eur 
-                  if trade.symbol == 'EURUSD' 
-                  else self.config.spread_gbp)
-        
-        price_diff   = (exit_price - trade.entry_price) * trade.direction
-        gross_pnl    = price_diff * trade.lot * 100_000
-        commission   = self.config.commission_per_lot * trade.lot
-        spread_cost  = spread * trade.lot * 100_000
-        return gross_pnl - commission - spread_cost
+    for i in range(warmup, len(df)):
+        ts  = df.index[i]
+        row = df.iloc[i]
 
-    # ---------------------------------------------------------------- #
-    def run(self):
-        print("\n⚙️  در حال محاسبه سیگنال‌ها...")
+        c_eur = row['c_eur']
+        c_gbp = row['c_gbp']
+        h_eur = row['h_eur']
+        l_eur = row['l_eur']
+        atr   = atr_main.iloc[i]
 
-        # تولید سیگنال توسط هر استراتژی
-        df_arb = self.strategies['corr_arb'].generate_signals(self.df)
-        df_brk = self.strategies['breakout'].generate_signals(self.df)
-        df_mr  = self.strategies['mean_rev'].generate_signals(self.df)
+        if np.isnan(atr) or atr <= 0:
+            continue
 
-        # ادغام سیگنال‌ها
-        df = self.df.copy()
-        df['sig_arb'] = df_arb['arb_signal'].fillna(0).astype(int)
-        df['sig_brk'] = df_brk['breakout_signal'].fillna(0).astype(int)
-        df['sig_mr']  = df_mr['mr_signal'].fillna(0).astype(int)
-        df['atr']     = df_mr['atr']
-        df['z_score'] = df_arb.get('z_score', pd.Series(0, index=df.index))
+        risk.new_bar(ts)
 
-        # پوزیشن‌های باز هر استراتژی
-        open_trades: Dict[str, Trade] = {}
+        # ---- اگر trading متوقف شده: فقط پوزیشن‌های باز را ببند ----
+        if risk.halted:
+            for key in list(open_pos.keys()):
+                p       = open_pos.pop(key)
+                sym     = p['symbol']
+                ep      = c_eur if sym == 'EUR' else c_gbp
+                p_pnl   = pnl(p['dir'], p['lot'], p['entry'], ep, sym)
+                trades.append({**p, 'exit': ep, 'exit_ts': ts,
+                               'pnl': p_pnl, 'status': 'halt_close'})
+                risk.add_pnl(p_pnl, ts)
+            continue
 
-        print("⚙️  در حال اجرای شبیه‌سازی...\n")
+        # ================================================================
+        #  مرحله ۱: بررسی SL/TP پوزیشن‌های باز
+        # ================================================================
+        for key in list(open_pos.keys()):
+            p   = open_pos[key]
+            sym = p['symbol']
 
-        for i in range(100, len(df)):    # از ۱۰۰ام به بعد (warmup اندیکاتورها)
-            row      = df.iloc[i]
-            curr_ts  = df.index[i]
-            curr_eur = row['c_eur']
-            curr_gbp = row['c_gbp']
-            atr      = row['atr'] if pd.notna(row['atr']) else 0.0010
-
-            # ---- به‌روزرسانی روزانه ----
-            self.risk.update_daily(curr_ts)
-
-            if self.risk.trading_halted:
-                # بستن همه پوزیشن‌های باز
-                for key, tr in list(open_trades.items()):
-                    price = curr_eur if tr.symbol == 'EURUSD' else curr_gbp
-                    tr.pnl    = self._calculate_pnl(tr, price)
-                    tr.status = 'closed_halt'
-                    self.all_trades.append(tr)
-                    self.risk.register_pnl(tr.pnl, curr_ts)
-                open_trades.clear()
-                continue
-
-            # ================================================================
-            # Strategy 1: Correlation Arbitrage
-            # ================================================================
-            key_arb_eur = 'arb_eur'
-            key_arb_gbp = 'arb_gbp'
-
-            if key_arb_eur not in open_trades and key_arb_gbp not in open_trades:
-                sig = int(row['sig_arb'])
-                if sig != 0:
-                    sl_pips = atr * 10_000 * 1.5
-                    lot     = self.risk.calculate_lot(sl_pips)
-
-                    # EUR position
-                    tr_eur = Trade(
-                        strategy    = self.strategies['corr_arb'].name,
-                        symbol      = 'EURUSD',
-                        direction   = sig,
-                        lot         = lot,
-                        entry_price = self._apply_spread(curr_eur, sig, self.config.spread_eur),
-                        entry_time  = curr_ts,
-                        sl          = curr_eur - sig * atr * 1.5,
-                        tp          = curr_eur + sig * atr * 2.5,
-                    )
-                    # GBP position (معکوس)
-                    tr_gbp = Trade(
-                        strategy    = self.strategies['corr_arb'].name,
-                        symbol      = 'GBPUSD',
-                        direction   = -sig,
-                        lot         = lot,
-                        entry_price = self._apply_spread(curr_gbp, -sig, self.config.spread_gbp),
-                        entry_time  = curr_ts,
-                        sl          = curr_gbp + sig * atr * 1.5,
-                        tp          = curr_gbp - sig * atr * 2.5,
-                    )
-                    open_trades[key_arb_eur] = tr_eur
-                    open_trades[key_arb_gbp] = tr_gbp
-
+            if sym == 'EUR':
+                hi, lo, cp = h_eur, l_eur, c_eur
             else:
-                # بررسی SL/TP/خروج برای Arb
-                for key in [key_arb_eur, key_arb_gbp]:
-                    if key not in open_trades:
-                        continue
-                    tr    = open_trades[key]
-                    price = curr_eur if tr.symbol == 'EURUSD' else curr_gbp
-                    z     = row.get('z_score', 0)
+                hi = row['h_gbp']
+                lo = row['l_gbp']
+                cp = c_gbp
 
-                    hit_sl = (tr.direction ==  1 and price <= tr.sl) or \
-                             (tr.direction == -1 and price >= tr.sl)
-                    hit_tp = (tr.direction ==  1 and price >= tr.tp) or \
-                             (tr.direction == -1 and price <= tr.tp)
-                    # خروج وقتی spread به میانه برگشت
-                    z_exit = abs(z) < self.strategies['corr_arb'].z_exit \
-                             if pd.notna(z) else False
+            d     = p['dir']
+            entry = p['entry']
+            sl    = p['sl']
+            tp    = p['tp']
 
-                    if hit_sl or hit_tp or z_exit:
-                        tr.exit_price = price
-                        tr.exit_time  = curr_ts
-                        tr.pnl        = self._calculate_pnl(tr, price)
-                        tr.status     = 'sl' if hit_sl else ('tp' if hit_tp else 'z_exit')
-                        self.all_trades.append(tr)
-                        self.risk.register_pnl(tr.pnl, curr_ts)
-                        del open_trades[key]
+            hit_sl = (d ==  1 and lo <= sl) or (d == -1 and hi >= sl)
+            hit_tp = (d ==  1 and hi >= tp) or (d == -1 and lo <= tp)
 
-            # ================================================================
-            # Strategy 2: Session Breakout
-            # ================================================================
-            key_brk = 'breakout'
-            if key_brk not in open_trades:
-                sig = int(row['sig_brk'])
-                if sig != 0:
-                    sl_pips = atr * 10_000 * self.strategies['breakout'].atr_mult
-                    lot     = self.risk.calculate_lot(sl_pips)
-                    tr = Trade(
-                        strategy    = self.strategies['breakout'].name,
-                        symbol      = 'EURUSD',
-                        direction   = sig,
-                        lot         = lot,
-                        entry_price = self._apply_spread(curr_eur, sig, self.config.spread_eur),
-                        entry_time  = curr_ts,
-                        sl          = curr_eur - sig * atr * self.strategies['breakout'].atr_mult,
-                        tp          = curr_eur + sig * atr * 3.0,   # RR = 2:1
-                    )
-                    open_trades[key_brk] = tr
-            else:
-                tr    = open_trades[key_brk]
-                price = curr_eur
-                hit_sl = (tr.direction ==  1 and price <= tr.sl) or \
-                         (tr.direction == -1 and price >= tr.sl)
-                hit_tp = (tr.direction ==  1 and price >= tr.tp) or \
-                         (tr.direction == -1 and price <= tr.tp)
+            # Trailing Stop برای Breakout (بعد از ۱ ATR سود)
+            if p['strategy'] == 'Breakout':
+                if d == 1 and cp > entry + atr:
+                    p['sl'] = max(p['sl'], entry + atr * 0.3)
+                elif d == -1 and cp < entry - atr:
+                    p['sl'] = min(p['sl'], entry - atr * 0.3)
 
-                # Trailing Stop: اگر سود > 1ATR، SL را به BE ببر
-                if tr.direction == 1 and price > tr.entry_price + atr:
-                    tr.sl = max(tr.sl, tr.entry_price)
-                elif tr.direction == -1 and price < tr.entry_price - atr:
-                    tr.sl = min(tr.sl, tr.entry_price)
+            # خروج Correlation Arb: وقتی Z به صفر برگشت
+            if p['strategy'] == 'CorrArb':
+                z_now = z_score.iloc[i]
+                if pd.notna(z_now) and abs(z_now) < 0.5:
+                    hit_tp = True
 
-                if hit_sl or hit_tp:
-                    tr.exit_price = price
-                    tr.exit_time  = curr_ts
-                    tr.pnl        = self._calculate_pnl(tr, price)
-                    tr.status     = 'sl' if hit_sl else 'tp'
-                    self.all_trades.append(tr)
-                    self.risk.register_pnl(tr.pnl, curr_ts)
-                    del open_trades[key_brk]
+            exit_reason = None
+            exit_price  = None
 
-            # ================================================================
-            # Strategy 3: ATR Mean Reversion
-            # ================================================================
-            key_mr = 'mean_rev'
-            if key_mr not in open_trades:
-                sig = int(row['sig_mr'])
-                if sig != 0:
-                    sl_pips = atr * 10_000 * 2.0
-                    lot     = self.risk.calculate_lot(sl_pips)
-                    tr = Trade(
-                        strategy    = self.strategies['mean_rev'].name,
-                        symbol      = 'EURUSD',
-                        direction   = sig,
-                        lot         = lot,
-                        entry_price = self._apply_spread(curr_eur, sig, self.config.spread_eur),
-                        entry_time  = curr_ts,
-                        sl          = curr_eur - sig * atr * 2.0,
-                        tp          = curr_eur + sig * atr * 1.5,   # هدف: برگشت به EMA
-                    )
-                    open_trades[key_mr] = tr
-            else:
-                tr    = open_trades[key_mr]
-                price = curr_eur
-                hit_sl = (tr.direction ==  1 and price <= tr.sl) or \
-                         (tr.direction == -1 and price >= tr.sl)
-                hit_tp = (tr.direction ==  1 and price >= tr.tp) or \
-                         (tr.direction == -1 and price <= tr.tp)
+            if hit_sl:
+                exit_reason = 'SL'
+                exit_price  = sl    # بدبینانه: در قیمت SL بسته می‌شود
+            elif hit_tp:
+                exit_reason = 'TP'
+                exit_price  = tp
 
-                if hit_sl or hit_tp:
-                    tr.exit_price = price
-                    tr.exit_time  = curr_ts
-                    tr.pnl        = self._calculate_pnl(tr, price)
-                    tr.status     = 'sl' if hit_sl else 'tp'
-                    self.all_trades.append(tr)
-                    self.risk.register_pnl(tr.pnl, curr_ts)
-                    del open_trades[key_mr]
+            if exit_reason:
+                p_pnl = pnl(d, p['lot'], entry, exit_price, sym)
+                trades.append({
+                    **p,
+                    'exit':      exit_price,
+                    'exit_ts':   ts,
+                    'pnl':       p_pnl,
+                    'status':    exit_reason
+                })
+                risk.add_pnl(p_pnl, ts)
+                del open_pos[key]
 
-        # بستن پوزیشن‌های باز در پایان
-        last_ts  = df.index[-1]
-        last_eur = df['c_eur'].iloc[-1]
-        last_gbp = df['c_gbp'].iloc[-1]
-        for key, tr in open_trades.items():
-            price     = last_eur if tr.symbol == 'EURUSD' else last_gbp
-            tr.pnl    = self._calculate_pnl(tr, price)
-            tr.status = 'closed_eod'
-            self.all_trades.append(tr)
-            self.risk.register_pnl(tr.pnl, last_ts)
+        # ================================================================
+        #  مرحله ۲: باز کردن پوزیشن جدید
+        # ================================================================
 
-    # ---------------------------------------------------------------- #
-    def report(self):
-        if not self.all_trades:
-            print("❌ هیچ معامله‌ای انجام نشد!")
-            return
+        # ---- A: Correlation Arbitrage ----
+        if 'CorrArb' not in open_pos:
+            sig = sig_arb.iloc[i]
+            if sig != 0:
+                sl_pips = 20          # SL ثابت ۲۰ پیپ
+                tp_pips = 30          # TP ثابت ۳۰ پیپ  (RR=1.5)
+                lot     = lot_size(risk.equity, sl_pips)
+                ep      = c_eur + sig * Config.spread_eur_pips * Config.pip / 2
 
-        trades_df = pd.DataFrame([{
-            'strategy':    t.strategy,
-            'symbol':      t.symbol,
-            'direction':   t.direction,
-            'lot':         t.lot,
-            'entry_time':  t.entry_time,
-            'exit_time':   t.exit_time,
-            'entry_price': t.entry_price,
-            'exit_price':  t.exit_price,
-            'pnl':         t.pnl,
-            'status':      t.status,
-        } for t in self.all_trades])
+                open_pos['CorrArb'] = {
+                    'strategy':  'CorrArb',
+                    'symbol':    'EUR',
+                    'dir':       sig,
+                    'lot':       lot,
+                    'entry':     ep,
+                    'sl':        ep - sig * sl_pips * Config.pip,
+                    'tp':        ep + sig * tp_pips * Config.pip,
+                    'entry_ts':  ts,
+                }
 
-        equity_curve = pd.Series(self.risk.equity_curve)
-        final_equity = self.risk.equity
-        total_return = (final_equity - self.config.initial_balance) / self.config.initial_balance * 100
-        win_rate     = (trades_df['pnl'] > 0).mean() * 100
-        avg_win      = trades_df.loc[trades_df['pnl'] > 0, 'pnl'].mean()
-        avg_loss     = trades_df.loc[trades_df['pnl'] < 0, 'pnl'].mean()
-        profit_factor = (
-            trades_df.loc[trades_df['pnl'] > 0, 'pnl'].sum() /
-            abs(trades_df.loc[trades_df['pnl'] < 0, 'pnl'].sum())
-            if trades_df['pnl'].lt(0).any() else float('inf')
-        )
+        # ---- B: London Breakout ----
+        if 'Breakout' not in open_pos:
+            sig = sig_brk.iloc[i]
+            if sig != 0:
+                sl_pips = max(12, (rh.iloc[i] - rl.iloc[i]) / Config.pip)
+                tp_pips = sl_pips * 2.0     # RR = 2:1
+                lot     = lot_size(risk.equity, sl_pips)
+                ep      = c_eur + sig * Config.spread_eur_pips * Config.pip / 2
 
-        print("\n" + "=" * 55)
-        print("         📊 گزارش کامل Backtest (2020-2025)")
-        print("=" * 55)
-        print(f"  موجودی اولیه     : ${self.config.initial_balance:>10,.2f}")
-        print(f"  موجودی نهایی     : ${final_equity:>10,.2f}")
-        print(f"  بازده کل         : {total_return:>+10.2f}%")
-        print(f"  Max Drawdown     : {self.risk.max_drawdown:>10.2f}%")
-        print(f"  Sharpe Ratio     : {self.risk.sharpe_ratio:>10.2f}")
-        print(f"  Profit Factor    : {profit_factor:>10.2f}")
-        print(f"  Win Rate         : {win_rate:>10.1f}%")
-        print(f"  Avg Win          : ${avg_win:>10.2f}")
-        print(f"  Avg Loss         : ${avg_loss:>10.2f}")
-        print(f"  تعداد کل معاملات : {len(trades_df):>10,}")
-        print(f"  توقف به دلیل     : {self.risk.halt_reason}")
-        print("-" * 55)
+                open_pos['Breakout'] = {
+                    'strategy': 'Breakout',
+                    'symbol':   'EUR',
+                    'dir':      sig,
+                    'lot':      lot,
+                    'entry':    ep,
+                    'sl':       ep - sig * sl_pips * Config.pip,
+                    'tp':       ep + sig * tp_pips * Config.pip,
+                    'entry_ts': ts,
+                }
 
-        # گزارش هر استراتژی
-        print("\n  📈 عملکرد هر استراتژی:")
-        print(f"  {'استراتژی':<25} {'معاملات':>8} {'Win%':>7} {'PnL':>10}")
-        print("  " + "-" * 52)
-        for strat_name in trades_df['strategy'].unique():
-            sub   = trades_df[trades_df['strategy'] == strat_name]
-            wr    = (sub['pnl'] > 0).mean() * 100
-            total = sub['pnl'].sum()
-            print(f"  {strat_name:<25} {len(sub):>8,} {wr:>6.1f}% ${total:>10,.2f}")
-        print("=" * 55)
+        # ---- C: Trend Pullback ----
+        if 'TrendPB' not in open_pos:
+            sig = sig_tp.iloc[i]
+            if sig != 0:
+                sl_pips = max(15, atr / Config.pip * 1.2)
+                tp_pips = sl_pips * 2.0     # RR = 2:1
+                lot     = lot_size(risk.equity, sl_pips)
+                ep      = c_eur + sig * Config.spread_eur_pips * Config.pip / 2
 
-        # ذخیره فایل‌ها
-        trades_df.to_csv("trades_report.csv", index=False)
-        equity_curve.to_csv("equity_curve.csv", index=False)
-        print("\n✅ فایل‌های خروجی:")
-        print("   → trades_report.csv")
-        print("   → equity_curve.csv")
+                open_pos['TrendPB'] = {
+                    'strategy': 'TrendPB',
+                    'symbol':   'EUR',
+                    'dir':      sig,
+                    'lot':      lot,
+                    'entry':    ep,
+                    'sl':       ep - sig * sl_pips * Config.pip,
+                    'tp':       ep + sig * tp_pips * Config.pip,
+                    'entry_ts': ts,
+                }
+
+    # ---- بستن پوزیشن‌های باقی‌مانده در پایان ----
+    last_ts  = df.index[-1]
+    last_eur = df['c_eur'].iloc[-1]
+    last_gbp = df['c_gbp'].iloc[-1]
+
+    for key, p in open_pos.items():
+        ep    = last_eur if p['symbol'] == 'EUR' else last_gbp
+        p_pnl = pnl(p['dir'], p['lot'], p['entry'], ep, p['symbol'])
+        trades.append({**p, 'exit': ep, 'exit_ts': last_ts,
+                       'pnl': p_pnl, 'status': 'eod_close'})
+        risk.add_pnl(p_pnl, last_ts)
+
+    return trades, risk
+
+
+# ================================================================== #
+#                          گزارش                                     #
+# ================================================================== #
+def report(trades: list, risk: RiskManager, df: pd.DataFrame):
+    if not trades:
+        print("❌ هیچ معامله‌ای ثبت نشد!")
+        return
+
+    t = pd.DataFrame(trades)
+    t['pnl'] = pd.to_numeric(t['pnl'], errors='coerce').fillna(0)
+
+    # ---- آمار کلی ----
+    final_eq    = risk.equity
+    total_ret   = (final_eq - Config.initial_balance) / Config.initial_balance * 100
+    win_rate    = (t['pnl'] > 0).mean() * 100
+    avg_win     = t.loc[t['pnl'] > 0, 'pnl'].mean()
+    avg_loss    = t.loc[t['pnl'] < 0, 'pnl'].mean()
+    gross_win   = t.loc[t['pnl'] > 0, 'pnl'].sum()
+    gross_loss  = t.loc[t['pnl'] < 0, 'pnl'].sum().abs()
+    pf          = gross_win / gross_loss if gross_loss > 0 else float('inf')
+    expectancy  = t['pnl'].mean()
+
+    rr_actual = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+    print("\n" + "=" * 60)
+    print("       📊 گزارش نهایی Backtest  (2020 → 2025)")
+    print("=" * 60)
+    print(f"  {'موجودی اولیه':<22}: ${Config.initial_balance:>10,.2f}")
+    print(f"  {'موجودی نهایی':<22}: ${final_eq:>10,.2f}")
+    print(f"  {'بازده کل':<22}: {total_ret:>+10.2f}%")
+    print(f"  {'Max Drawdown':<22}: {risk.max_dd:>10.2f}%")
+    print(f"  {'Sharpe Ratio':<22}: {risk.sharpe:>10.2f}")
+    print(f"  {'Profit Factor':<22}: {pf:>10.2f}")
+    print(f"  {'Win Rate':<22}: {win_rate:>10.1f}%")
+    print(f"  {'Avg Win':<22}: ${avg_win:>10.2f}")
+    print(f"  {'Avg Loss':<22}: ${avg_loss:>10.2f}")
+    print(f"  {'RR واقعی':<22}: {rr_actual:>10.2f}")
+    print(f"  {'Expectancy / trade':<22}: ${expectancy:>10.2f}")
+    print(f"  {'تعداد معاملات':<22}: {len(t):>10,}")
+    print(f"  {'توقف به دلیل':<22}: {risk.halt_reason}")
+    print("-" * 60)
+
+    # ---- آمار هر استراتژی ----
+    print(f"\n  {'استراتژی':<15} {'#':>5} {'Win%':>6} {'PF':>6} "
+          f"{'AvgWin':>8} {'AvgLoss':>9} {'PnL':>10}")
+    print("  " + "-" * 60)
+
+    for name in t['strategy'].unique():
+        sub  = t[t['strategy'] == name]
+        wr   = (sub['pnl'] > 0).mean() * 100
+        gw   = sub.loc[sub['pnl'] > 0, 'pnl'].sum()
+        gl   = sub.loc[sub['pnl'] < 0, 'pnl'].sum().abs()
+        spf  = gw / gl if gl > 0 else float('inf')
+        aw   = sub.loc[sub['pnl'] > 0, 'pnl'].mean()
+        al   = sub.loc[sub['pnl'] < 0, 'pnl'].mean()
+        tot  = sub['pnl'].sum()
+        print(f"  {name:<15} {len(sub):>5,} {wr:>5.1f}% {spf:>6.2f} "
+              f"${aw:>7.2f} ${al:>8.2f} ${tot:>10.2f}")
+
+    print("=" * 60)
+
+    # ---- ذخیره ----
+    t.to_csv("trades_report.csv", index=False)
+
+    eq_df = pd.DataFrame({
+        'equity': risk.curve
+    })
+    eq_df.to_csv("equity_curve.csv", index=False)
+
+    # ---- خلاصه دیباگ ----
+    print(f"\n  📋 توزیع وضعیت خروج:")
+    print(t['status'].value_counts().to_string())
+
+    print(f"\n✅ trades_report.csv  ({len(t)} ردیف)")
+    print(f"✅ equity_curve.csv   ({len(eq_df)} نقطه)")
 
 
 # ================================================================== #
 if __name__ == "__main__":
-    engine = PropBacktestEngine()
-    engine.load_data()
-    engine.run()
-    engine.report()
+    df              = load_data()
+    trades, risk    = run_backtest(df)
+    report(trades, risk, df)
