@@ -10,17 +10,17 @@ warnings.filterwarnings('ignore')
 # ================================================================== #
 class Config:
     initial_balance    = 5_000.0
-    risk_per_trade_pct = 0.008      # 0.8% per trade
-    max_daily_loss_pct = 0.04       # 4% daily → پراپ استاندارد
-    max_total_dd_pct   = 0.08       # 8% max DD → پراپ استاندارد
-    monthly_target_pct = 0.10       # 10% هدف ماهانه
+    risk_per_trade_pct = 0.010      # 1% per trade
+    max_daily_loss_pct = 0.04       # 4% daily
+    max_total_dd_pct   = 0.08       # 8% max DD ماهانه
+    monthly_target_pct = 0.10       # هدف 10% ماهانه
     spread_eur_pips    = 1.0
     spread_gbp_pips    = 1.2
     commission_per_lot = 6.0
     pip                = 0.0001
     lot_size           = 100_000
-    max_lot            = 1.5
-    warmup             = 300        # کندل‌های warmup
+    max_lot            = 2.0
+    warmup             = 300
 
 
 # ================================================================== #
@@ -62,70 +62,110 @@ def load_data() -> pd.DataFrame:
     }).dropna()
 
     df = df[df.index.weekday < 5]
-    print(f"✅ {len(df):,} کندل | {df.index[0].date()} → {df.index[-1].date()}")
+    print(f"✅ {len(df):,} کندل | "
+          f"{df.index[0].date()} → {df.index[-1].date()}")
     return df
 
 
-def calc_atr(high, low, close, period=14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def calc_atr(h, l, c, p=14):
+    tr = pd.concat([(h-l), (h-c.shift()).abs(),
+                    (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(p).mean()
 
-def calc_rsi(close, period=14) -> pd.Series:
-    d    = close.diff()
-    gain = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs   = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+def calc_rsi(c, p=14):
+    d = c.diff()
+    g = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(alpha=1/p, adjust=False).mean()
+    return 100 - 100/(1 + g/l.replace(0, np.nan))
 
-def calc_adx(high, low, close, period=14) -> pd.Series:
-    up    = high.diff()
-    down  = -low.diff()
-    dm_p  = up.where((up > down) & (up > 0), 0.0)
-    dm_n  = down.where((down > up) & (down > 0), 0.0)
-    tr    = calc_atr(high, low, close, 1)
-    atr_s = tr.rolling(period).sum()
-    di_p  = 100 * dm_p.rolling(period).sum() / atr_s.replace(0, np.nan)
-    di_n  = 100 * dm_n.rolling(period).sum() / atr_s.replace(0, np.nan)
-    dx    = (abs(di_p - di_n) / (di_p + di_n).replace(0, np.nan)) * 100
-    return dx.rolling(period).mean()
+def calc_adx(h, l, c, p=14):
+    up  = h.diff(); dn = -l.diff()
+    dmp = up.where((up>dn)&(up>0), 0.0)
+    dmn = dn.where((dn>up)&(dn>0), 0.0)
+    tr  = calc_atr(h, l, c, 1)
+    s   = tr.rolling(p).sum()
+    dip = 100*dmp.rolling(p).sum()/s.replace(0,np.nan)
+    din = 100*dmn.rolling(p).sum()/s.replace(0,np.nan)
+    dx  = (abs(dip-din)/(dip+din).replace(0,np.nan))*100
+    return dx.rolling(p).mean()
 
-def calc_macd(close, fast=12, slow=26, signal=9):
-    ef = close.ewm(span=fast,   adjust=False).mean()
-    es = close.ewm(span=slow,   adjust=False).mean()
-    m  = ef - es
-    s  = m.ewm(span=signal,     adjust=False).mean()
-    return m, s, m - s
+def calc_macd(c, f=12, s=26, sig=9):
+    m = c.ewm(span=f,adjust=False).mean() - c.ewm(span=s,adjust=False).mean()
+    return m, m.ewm(span=sig,adjust=False).mean(), m-m.ewm(span=sig,adjust=False).mean()
 
-def lot_size_calc(equity: float, sl_pips: float) -> float:
-    if sl_pips <= 0:
-        return 0.01
-    risk_usd = equity * Config.risk_per_trade_pct
-    lot = risk_usd / (sl_pips * Config.pip * Config.lot_size)
+def lot_size_calc(equity, sl_pips):
+    if sl_pips <= 0: return 0.01
+    lot = equity*Config.risk_per_trade_pct / (sl_pips*Config.pip*Config.lot_size)
     return round(float(np.clip(lot, 0.01, Config.max_lot)), 2)
 
 
 # ================================================================== #
-#   محاسبه همه سیگنال‌ها روی کل دیتا (یک‌بار - سریع)              #
+#   REGIME DETECTOR                                                  #
+#   ────────────────────────────────────────────────────────────── #
+#   رژیم بازار را تشخیص می‌دهد:                                     #
+#   RANGE  → CorrArb فعال                                           #
+#   TREND  → TrendFollow فعال                                       #
+#   MIXED  → هر دو با نصف ریسک                                      #
+# ================================================================== #
+def compute_regime(df: pd.DataFrame) -> pd.Series:
+    """
+    ترکیب چند شاخص برای تشخیص رژیم:
+    1. ADX (200 کندل = ~2 روز): روند یا رنج؟
+    2. Bollinger Width: نوسان رژیم
+    3. EMA slope: جهت روند
+
+    خروجی:
+    +1 = TREND (ترند)
+     0 = MIXED
+    -1 = RANGE (رنج)
+    """
+    c   = df['c_eur']
+    h   = df['h_eur']
+    l   = df['l_eur']
+
+    # ADX بلند‌مدت (بازه 200 کندل ≈ 2 روز)
+    adx_slow  = calc_adx(h, l, c, 50)
+    adx_fast  = calc_adx(h, l, c, 14)
+
+    # Bollinger Band Width (نرمال‌شده)
+    bb_mid    = c.rolling(96).mean()    # 1 روز
+    bb_std    = c.rolling(96).std()
+    bb_width  = (bb_std / bb_mid.replace(0, np.nan)) * 100
+    bb_wm     = bb_width.rolling(480).mean()   # 5 روز میانگین
+
+    # EMA slope (شیب EMA50)
+    ema50     = c.ewm(span=50, adjust=False).mean()
+    ema200    = c.ewm(span=200, adjust=False).mean()
+    slope50   = (ema50 - ema50.shift(48)) / ema50.shift(48) * 100  # تغییر در 12 ساعت
+
+    # ─── تعریف رژیم ───
+    # RANGE: ADX پایین + BB فشرده
+    is_range = (adx_slow < 22) & (adx_fast < 25) & (bb_width < bb_wm * 0.9)
+
+    # TREND: ADX بالا + BB گشاد + slope قوی
+    is_trend = (adx_slow > 28) & (adx_fast > 25) & \
+               (bb_width > bb_wm * 1.1) & (slope50.abs() > 0.05)
+
+    regime = pd.Series(0, index=df.index)
+    regime[is_range] = -1   # RANGE
+    regime[is_trend] =  1   # TREND
+
+    # smooth: از جهش ناگهانی جلوگیری کن
+    regime = regime.rolling(8).median().fillna(0)
+    regime = regime.apply(lambda x: -1 if x <= -0.5 else (1 if x >= 0.5 else 0))
+
+    return regime
+
+
+# ================================================================== #
+#   محاسبه همه سیگنال‌ها (یک‌بار)                                  #
 # ================================================================== #
 def compute_all_signals(df: pd.DataFrame) -> dict:
-    """
-    همه اندیکاتورها و سیگنال‌ها را یک‌بار روی کل دیتا حساب می‌کنیم.
-    این مهم است چون:
-    1. EMA200 برای محاسبه درست نیاز به تاریخچه کامل دارد
-    2. سریع‌تر است
-    """
     print("  محاسبه اندیکاتورها...", end="", flush=True)
 
-    c_e = df['c_eur']
-    h_e = df['h_eur']
-    l_e = df['l_eur']
-    c_g = df['c_gbp']
+    c_e = df['c_eur']; h_e = df['h_eur']
+    l_e = df['l_eur']; c_g = df['c_gbp']
 
-    # ── اندیکاتورهای مشترک ──
     atr    = calc_atr(h_e, l_e, c_e, 14)
     rsi    = calc_rsi(c_e, 14)
     adx    = calc_adx(h_e, l_e, c_e, 14)
@@ -133,137 +173,177 @@ def compute_all_signals(df: pd.DataFrame) -> dict:
     ema21  = c_e.ewm(span=21,  adjust=False).mean()
     ema50  = c_e.ewm(span=50,  adjust=False).mean()
     ema200 = c_e.ewm(span=200, adjust=False).mean()
-    _, _, macd_hist = calc_macd(c_e)
+    _, _, macd_h = calc_macd(c_e)
 
     hour    = pd.Series(df.index.hour,    index=df.index)
     weekday = pd.Series(df.index.weekday, index=df.index)
-    date_s  = pd.Series(df.index.date,    index=df.index)
+
+    # ── Regime ──
+    regime = compute_regime(df)
 
     # ════════════════════════════════════════════
-    #  SIGNAL 1: CorrArb
+    #  S1: CorrArb — فقط در رژیم RANGE
     # ════════════════════════════════════════════
     eurgbp  = c_e / c_g
-    period  = 96
-    z_mean  = eurgbp.rolling(period).mean()
-    z_std   = eurgbp.rolling(period).std()
+    z_mean  = eurgbp.rolling(96).mean()
+    z_std   = eurgbp.rolling(96).std()
     z_score = (eurgbp - z_mean) / z_std.replace(0, np.nan)
-    std_ok  = z_std > z_std.rolling(period * 5).mean() * 0.3
-    adx_ok  = adx < 25
-    time_ok = hour.between(7, 19)
-    rsi_ok_s = rsi > 55
-    rsi_ok_l = rsi < 45
 
-    sig_arb = pd.Series(0, index=df.index)
-    sig_arb[(z_score >  2.3) & std_ok & adx_ok & time_ok & rsi_ok_s] = -1
-    sig_arb[(z_score < -2.3) & std_ok & adx_ok & time_ok & rsi_ok_l] =  1
-    sig_arb = sig_arb.where(sig_arb != sig_arb.shift(), 0)
+    std_ok   = z_std > z_std.rolling(480).mean() * 0.3
+    time_ok  = hour.between(7, 19)
+    # فقط در رژیم RANGE فعال
+    range_ok = (regime == -1)
 
-    # SL/TP ثابت برای CorrArb
-    sl_arb = np.where(sig_arb != 0, 20.0, 0.0)
-    tp_arb = np.where(sig_arb != 0, 40.0, 0.0)
+    sig1 = pd.Series(0, index=df.index)
+    sig1[(z_score >  2.2) & std_ok & time_ok & range_ok & (rsi>53)] = -1
+    sig1[(z_score < -2.2) & std_ok & time_ok & range_ok & (rsi<47)] =  1
+    sig1 = sig1.where(sig1 != sig1.shift(), 0)
+
+    sl1 = np.where(sig1 != 0, 20.0, 0.0)
+    tp1 = np.where(sig1 != 0, 38.0, 0.0)
 
     # ════════════════════════════════════════════
-    #  SIGNAL 2: Asian Breakout
+    #  S2: Trend Follow EMA — فقط در رژیم TREND
     # ════════════════════════════════════════════
-    asian_mask = hour.between(2, 6)
-    asian_df   = df[asian_mask].copy()
-    asian_df['date'] = asian_df.index.date
-    rng_day = asian_df.groupby('date').agg(
-        ah=('h_eur','max'), al=('l_eur','min'))
-    rng_day['rng_pips'] = (rng_day['ah'] - rng_day['al']) / Config.pip
+    # ساده و مستقیم: EMA21 crossover با تایید EMA50 و EMA200
+    # در جهت روند قوی
+    trend_ok = (regime == 1)
+    active   = hour.between(7, 18)
 
-    d_temp = df.copy()
+    cross_up   = (ema21 > ema50) & (ema21.shift(1) <= ema50.shift(1))
+    cross_dn   = (ema21 < ema50) & (ema21.shift(1) >= ema50.shift(1))
+
+    sig2 = pd.Series(0, index=df.index)
+    sig2[active & trend_ok & cross_up &
+         (c_e > ema200) & (adx > 22) &
+         rsi.between(48, 72) & (macd_h > 0)] =  1
+    sig2[active & trend_ok & cross_dn &
+         (c_e < ema200) & (adx > 22) &
+         rsi.between(28, 52) & (macd_h < 0)] = -1
+
+    nz2 = sig2[sig2 != 0]
+    fi2 = nz2.groupby(nz2.index.date).head(1).index
+    s2  = pd.Series(0, index=df.index); s2[fi2] = sig2[fi2]
+
+    dist21   = (c_e - ema21).abs().values / Config.pip
+    sl2      = np.where(s2 != 0,
+                        np.maximum(18, dist21 + atr.values/Config.pip*0.8), 0.0)
+    tp2      = np.where(s2 != 0, sl2 * 2.5, 0.0)
+
+    # ════════════════════════════════════════════
+    #  S3: Asian Breakout — در هر رژیم (با فیلتر)
+    # ════════════════════════════════════════════
+    # در رژیم RANGE: شکست کوتاه‌مدت
+    # در رژیم TREND: شکست در جهت ترند
+    d_temp        = df.copy()
     d_temp['date'] = d_temp.index.date
+    asian_df      = d_temp[hour.between(2, 6)]
+    rng_day       = asian_df.groupby('date').agg(
+        ah=('h_eur','max'), al=('l_eur','min'))
+    rng_day['rng_pips'] = (rng_day['ah']-rng_day['al'])/Config.pip
     d_temp = d_temp.join(rng_day, on='date')
 
     london   = hour.between(8, 10)
-    rng_ok   = d_temp['rng_pips'].between(12, 40)
+    rng_ok   = d_temp['rng_pips'].between(12, 45)
     day_ok   = weekday.between(0, 3)
-    trend_up = c_e > ema200
-    trend_dn = c_e < ema200
 
-    above = (c_e > d_temp['ah']).astype(int)
-    below = (c_e < d_temp['al']).astype(int)
-    above2 = (above + above.shift(1)) >= 2
-    below2 = (below + below.shift(1)) >= 2
+    above2 = ((c_e > d_temp['ah']).astype(int) +
+              (c_e.shift(1) > d_temp['ah'].shift(1)).astype(int)) >= 2
+    below2 = ((c_e < d_temp['al']).astype(int) +
+              (c_e.shift(1) < d_temp['al'].shift(1)).astype(int)) >= 2
 
-    raw_ab = pd.Series(0, index=df.index)
-    raw_ab[london & rng_ok & day_ok & (adx>18) & above2 & trend_up] =  1
-    raw_ab[london & rng_ok & day_ok & (adx>18) & below2 & trend_dn] = -1
+    # در ترند: فقط در جهت ترند
+    trend_up = c_e > ema200; trend_dn = c_e < ema200
+    # در رنج: هر دو جهت
+    any_dir  = pd.Series(True, index=df.index)
 
-    nz_ab = raw_ab[raw_ab != 0]
-    fi_ab = nz_ab.groupby(nz_ab.index.date).head(1).index
-    sig_ab = pd.Series(0, index=df.index)
-    sig_ab[fi_ab] = raw_ab[fi_ab]
+    long_ok  = (above2 & (adx > 18) & london & rng_ok & day_ok &
+                ((trend_ok & trend_up) | (~trend_ok)))
+    short_ok = (below2 & (adx > 18) & london & rng_ok & day_ok &
+                ((trend_ok & trend_dn) | (~trend_ok)))
 
-    rng_pips_arr = d_temp['rng_pips'].fillna(20).values
-    sl_ab = np.where(sig_ab != 0,
-                     np.maximum(15, rng_pips_arr + 3), 0.0)
-    tp_ab = np.where(sig_ab != 0,
-                     np.maximum(sl_ab * 2, rng_pips_arr * 3.0), 0.0)
+    sig3 = pd.Series(0, index=df.index)
+    sig3[long_ok]  =  1
+    sig3[short_ok] = -1
+
+    nz3 = sig3[sig3 != 0]
+    fi3 = nz3.groupby(nz3.index.date).head(1).index
+    s3  = pd.Series(0, index=df.index); s3[fi3] = sig3[fi3]
+
+    rp3 = d_temp['rng_pips'].fillna(20).values
+    sl3 = np.where(s3!=0, np.maximum(15, rp3+3), 0.0)
+    tp3 = np.where(s3!=0, np.maximum(sl3*2, rp3*3.0), 0.0)
 
     # ════════════════════════════════════════════
-    #  SIGNAL 3: EMA Crossover
+    #  S4: Mean Reversion RSI — رژیم RANGE
     # ════════════════════════════════════════════
-    cross_up   = (ema9 > ema21) & (ema9.shift(1) <= ema21.shift(1))
-    cross_down = (ema9 < ema21) & (ema9.shift(1) >= ema21.shift(1))
-    active     = hour.between(8, 16)
+    # در رنج عمیق: RSI extreme + Bollinger extreme
+    bb_mid2 = c_e.rolling(20).mean()
+    bb_std2 = c_e.rolling(20).std()
+    bb_up   = bb_mid2 + 2.2 * bb_std2
+    bb_lo   = bb_mid2 - 2.2 * bb_std2
 
-    raw_ec = pd.Series(0, index=df.index)
-    raw_ec[active & cross_up   & (ema21>ema50) & (c_e>ema200)
-           & (adx>20) & rsi.between(45,70) & (macd_hist>0)] =  1
-    raw_ec[active & cross_down & (ema21<ema50) & (c_e<ema200)
-           & (adx>20) & rsi.between(30,55) & (macd_hist<0)] = -1
+    # فاصله از BB میانه نرمال‌شده
+    bb_pos  = (c_e - bb_mid2) / (2.2 * bb_std2.replace(0, np.nan))
 
-    nz_ec = raw_ec[raw_ec != 0]
-    fi_ec = nz_ec.groupby(nz_ec.index.date).head(1).index
-    sig_ec = pd.Series(0, index=df.index)
-    sig_ec[fi_ec] = raw_ec[fi_ec]
+    active4 = hour.between(8, 18) & weekday.between(0, 3)
 
-    dist_ema21 = (c_e - ema21).abs() / Config.pip
-    sl_ec = np.where(sig_ec != 0,
-                     np.maximum(15, dist_ema21.values +
-                                atr.values / Config.pip * 0.5), 0.0)
-    tp_ec = np.where(sig_ec != 0, sl_ec * 2.5, 0.0)
+    sig4 = pd.Series(0, index=df.index)
+    # خرید: RSI < 30 + پایین BB + رژیم رنج
+    sig4[active4 & range_ok &
+         (rsi < 30) & (c_e < bb_lo) &
+         (macd_h > macd_h.shift(1)) &
+         (adx < 28)] =  1
+    # فروش: RSI > 70 + بالای BB + رژیم رنج
+    sig4[active4 & range_ok &
+         (rsi > 70) & (c_e > bb_up) &
+         (macd_h < macd_h.shift(1)) &
+         (adx < 28)] = -1
+
+    nz4 = sig4[sig4 != 0]
+    fi4 = nz4.groupby(nz4.index.date).head(1).index
+    s4  = pd.Series(0, index=df.index); s4[fi4] = sig4[fi4]
+
+    sl4 = np.where(s4!=0, np.maximum(15, atr.values/Config.pip*1.5), 0.0)
+    tp4 = np.where(s4!=0, sl4*1.8, 0.0)  # RR کمتر ولی WR بالاتر
 
     print(" ✓")
+    print(f"  سیگنال‌ها: CorrArb={int((sig1!=0).sum())} | "
+          f"TrendEMA={int((s2!=0).sum())} | "
+          f"AsianBreak={int((s3!=0).sum())} | "
+          f"MeanRev={int((s4!=0).sum())}")
+
+    # آمار رژیم
+    r_range = (regime == -1).sum()
+    r_trend = (regime ==  1).sum()
+    r_mixed = (regime ==  0).sum()
+    total   = len(regime)
+    print(f"  رژیم بازار: Range={r_range/total*100:.0f}% | "
+          f"Trend={r_trend/total*100:.0f}% | "
+          f"Mixed={r_mixed/total*100:.0f}%")
 
     return {
-        'CorrArb':    (sig_arb, sl_arb, tp_arb, z_score),
-        'AsianBreak': (sig_ab,  sl_ab,  tp_ab,  None),
-        'EMACross':   (sig_ec,  sl_ec,  tp_ec,  None),
-        'ema21':      ema21,
+        'CorrArb':    (sig1,  sl1,  tp1,  z_score),
+        'TrendEMA':   (s2,    sl2,  tp2,  None),
+        'AsianBreak': (s3,    sl3,  tp3,  None),
+        'MeanRev':    (s4,    sl4,  tp4,  None),
+        'regime':     regime,
         'atr':        atr,
+        'ema21':      ema21,
     }
 
 
 # ================================================================== #
-#   موتور بک‌تست ماهانه                                             #
-#   ─────────────────────────────────────────────────────────────── #
-#   منطق کار:                                                        #
-#   1. کل دیتا را به ماه‌ها تقسیم می‌کنیم                           #
-#   2. هر ماه با موجودی پایان ماه قبل شروع می‌شه                    #
-#   3. DD و Daily Loss نسبت به شروع همان ماه حساب می‌شه             #
-#   4. اگر ماهی به DD 8% رسید → اون ماه بسته می‌شه                 #
-#      ماه بعد با همان موجودی (کاهش یافته) شروع می‌شه              #
-#   5. اگر ماهی به 10% سود رسید → همچنان ادامه می‌ده               #
-#      (فقط DD را reset می‌کنه، چون پول واقعی سودت است)            #
+#   موتور بک‌تست ماهانه (بهینه‌شده)                                 #
 # ================================================================== #
 def run_monthly_backtest(
     df: pd.DataFrame,
-    signals: dict,
     strategy_name: str,
     sig_series: pd.Series,
     sl_arr: np.ndarray,
     tp_arr: np.ndarray,
-    z_series=None,          # فقط برای CorrArb
+    z_series=None,
 ) -> tuple:
-    """
-    بک‌تست ماهانه واقعی‌محور:
-    - هر ماه مستقل است از نظر DD tracking
-    - موجودی از ماه قبل منتقل می‌شود
-    - معاملات باز از ماه قبل به ماه بعد منتقل می‌شوند
-    """
     pip  = Config.pip
     ls   = Config.lot_size
     sp   = Config.spread_eur_pips
@@ -276,219 +356,173 @@ def run_monthly_backtest(
     ts_a    = df.index
     z_a     = z_series.values if z_series is not None else None
 
-    # ── شناسایی ماه‌ها ──
-    months = pd.Series(ts_a).dt.to_period('M').unique()
+    # ماه‌ها
+    periods   = pd.Series(ts_a).dt.to_period('M')
+    months    = periods.unique()
 
-    # ── وضعیت کلی ──
     equity       = Config.initial_balance
     all_trades   = []
-    monthly_log  = []   # یک dict برای هر ماه
-
-    # ── پوزیشن باز (بین ماه‌ها منتقل می‌شود) ──
-    open_pos = None   # dict یا None
-
-    # ── برای equity curve ──
-    eq_curve    = [equity]
-    eq_curve_ts = [None]
+    monthly_log  = []
+    eq_curve     = [equity]
+    eq_curve_ts  = [None]
+    open_pos     = None
 
     for month_period in months:
-        # ── بازه این ماه ──
-        month_mask = (pd.Series(ts_a).dt.to_period('M') == month_period).values
-        month_bars = np.where(month_mask)[0]
+        mask      = (periods == month_period).values
+        m_bars    = np.where(mask)[0]
+        if len(m_bars) == 0: continue
+        bar_start = m_bars[0]
+        bar_end   = m_bars[-1]
+        if bar_end < Config.warmup: continue
 
-        if len(month_bars) == 0:
-            continue
+        month_start_eq = equity
+        month_peak     = equity
+        month_day_eq   = equity
+        month_halted   = False
+        month_halt_r   = ""
+        month_trades   = []
+        cur_day        = None
 
-        bar_start = month_bars[0]
-        bar_end   = month_bars[-1]
-
-        # ── اگر warmup هنوز تمام نشده این ماه را رد کن ──
-        if bar_end < Config.warmup:
-            continue
-
-        # ── شروع ماه: ثبت موجودی ──
-        month_start_eq  = equity
-        month_peak      = equity        # peak این ماه
-        month_day_eq    = equity        # برای daily loss
-        month_halted    = False
-        month_halt_r    = "ادامه"
-        month_trades    = []
-        cur_day         = None
-
-        # ── سیگنال‌های این ماه ──
-        sig_set = {
-            x for x in np.where(sig_a != 0)[0]
-            if bar_start <= x <= bar_end and x >= Config.warmup
-        }
+        sig_set = {x for x in np.where(sig_a != 0)[0]
+                   if bar_start <= x <= bar_end
+                   and x >= Config.warmup}
 
         for bar in range(max(bar_start, Config.warmup), bar_end + 1):
             day = ts_a[bar].date()
-
-            # ── تغییر روز ──
             if day != cur_day:
-                cur_day      = day
-                month_day_eq = equity
-                # ریست daily halt (اگر daily بود)
+                cur_day = day; month_day_eq = equity
                 if month_halted and "Daily" in month_halt_r:
-                    month_halted = False
-                    month_halt_r = "ادامه"
+                    month_halted = False; month_halt_r = ""
 
-            # ── اگر این ماه متوقف شده ──
+            # ── Halt: ببند پوزیشن و از ماه خارج شو ──
             if month_halted:
-                # پوزیشن باز را ببند
                 if open_pos is not None:
-                    cp   = close_a[bar]
-                    raw  = open_pos['dir'] * (cp - open_pos['entry']) * open_pos['lot'] * ls
-                    cost = sp * pip * open_pos['lot'] * ls + comm * open_pos['lot']
-                    pnl  = raw - cost
+                    cp  = close_a[bar]
+                    raw = open_pos['dir']*(cp-open_pos['entry'])*open_pos['lot']*ls
+                    pnl = raw - (sp*pip*open_pos['lot']*ls+comm*open_pos['lot'])
                     equity += pnl
                     month_peak = max(month_peak, equity)
-                    eq_curve.append(round(equity, 4))
+                    eq_curve.append(round(equity,4))
                     eq_curve_ts.append(ts_a[bar])
-                    rec = {**open_pos, 'exit': cp, 'exit_ts': ts_a[bar],
-                           'pnl': pnl, 'status': 'month_halt'}
-                    month_trades.append(rec)
-                    all_trades.append(rec)
+                    rec = {**open_pos,'exit':cp,'exit_ts':ts_a[bar],
+                           'pnl':pnl,'status':'month_halt'}
+                    month_trades.append(rec); all_trades.append(rec)
                     open_pos = None
-                break  # از این ماه خارج شو
+                break
 
-            # ── بررسی پوزیشن باز ──
+            # ── مدیریت پوزیشن باز ──
             if open_pos is not None:
-                hi = high_a[bar]
-                lo = low_a[bar]
-                cp = close_a[bar]
-                d  = open_pos['dir']
-                ep = open_pos['entry']
-                sl = open_pos['sl']
-                tp = open_pos['tp']
+                hi=high_a[bar]; lo=low_a[bar]; cp=close_a[bar]
+                d=open_pos['dir']; ep=open_pos['entry']
+                sl=open_pos['sl']; tp=open_pos['tp']
 
-                hit_sl = (d ==  1 and lo <= sl) or (d == -1 and hi >= sl)
-                hit_tp = (d ==  1 and hi >= tp) or (d == -1 and lo <= tp)
+                hit_sl = (d==1 and lo<=sl) or (d==-1 and hi>=sl)
+                hit_tp = (d==1 and hi>=tp) or (d==-1 and lo<=tp)
 
-                # Z-exit برای CorrArb
+                # Z-exit
                 if z_a is not None:
-                    z_now = z_a[bar]
-                    if not np.isnan(z_now) and abs(z_now) < 0.25:
+                    zn = z_a[bar]
+                    if not np.isnan(zn) and abs(zn) < 0.25:
                         hit_tp = True
 
-                # Trailing SL
-                move    = d * (cp - ep)
-                tp_dist = abs(tp - ep)
+                # Trailing SL (دو مرحله)
+                move    = d*(cp-ep)
+                tp_dist = abs(tp-ep)
                 if tp_dist > 0:
-                    if move > tp_dist * 0.6:
-                        be = ep + d * tp_dist * 0.15
-                        if d == 1:
-                            open_pos['sl'] = max(open_pos['sl'], be)
-                        else:
-                            open_pos['sl'] = min(open_pos['sl'], be)
-                    if move > tp_dist * 0.85:
-                        lock = ep + d * tp_dist * 0.5
-                        if d == 1:
-                            open_pos['sl'] = max(open_pos['sl'], lock)
-                        else:
-                            open_pos['sl'] = min(open_pos['sl'], lock)
+                    pct = move/tp_dist
+                    if pct > 0.55:
+                        be = ep + d*tp_dist*0.12
+                        open_pos['sl'] = (max(sl,be) if d==1 else min(sl,be))
+                    if pct > 0.80:
+                        lock = ep + d*tp_dist*0.45
+                        open_pos['sl'] = (max(open_pos['sl'],lock)
+                                          if d==1 else min(open_pos['sl'],lock))
 
-                # Time stop: ۴ روز
-                elapsed_bars = bar - open_pos['entry_bar']
-                if elapsed_bars >= 384 and not hit_tp:  # 96×4
-                    raw  = d * (cp - ep) * open_pos['lot'] * ls
-                    cost = sp * pip * open_pos['lot'] * ls + comm * open_pos['lot']
-                    pnl  = raw - cost
-                    equity += pnl
-                    month_peak = max(month_peak, equity)
-                    eq_curve.append(round(equity, 4))
+                # Time stop (4 روز = 384 کندل)
+                if (bar-open_pos['entry_bar']) >= 384 and not hit_tp:
+                    raw = d*(cp-ep)*open_pos['lot']*ls
+                    pnl = raw-(sp*pip*open_pos['lot']*ls+comm*open_pos['lot'])
+                    equity+=pnl; month_peak=max(month_peak,equity)
+                    eq_curve.append(round(equity,4))
                     eq_curve_ts.append(ts_a[bar])
-                    rec = {**open_pos, 'exit': cp, 'exit_ts': ts_a[bar],
-                           'pnl': pnl, 'status': 'TimeStop'}
-                    month_trades.append(rec)
-                    all_trades.append(rec)
-                    open_pos = None
-
+                    rec={**open_pos,'exit':cp,'exit_ts':ts_a[bar],
+                         'pnl':pnl,'status':'TimeStop'}
+                    month_trades.append(rec); all_trades.append(rec)
+                    open_pos=None
                     # بررسی DD
-                    dd_d = (equity - month_day_eq) / month_day_eq
-                    dd_m = (equity - month_start_eq) / month_start_eq
-                    dd_pk = (equity - month_peak) / month_peak
-                    if dd_d <= -Config.max_daily_loss_pct:
-                        month_halted = True
-                        month_halt_r = f"Daily {dd_d*100:.1f}%"
-                    elif dd_pk <= -Config.max_total_dd_pct:
-                        month_halted = True
-                        month_halt_r = f"MaxDD {dd_pk*100:.1f}%"
+                    dd_d=(equity-month_day_eq)/month_day_eq
+                    dd_p=(equity-month_peak)/month_peak
+                    if dd_d<=-Config.max_daily_loss_pct:
+                        month_halted=True; month_halt_r=f"Daily {dd_d*100:.1f}%"
+                    elif dd_p<=-Config.max_total_dd_pct:
+                        month_halted=True; month_halt_r=f"MaxDD {dd_p*100:.1f}%"
                     continue
 
-                exit_r = exit_p = None
-                if hit_sl: exit_r, exit_p = 'SL', open_pos['sl']
-                elif hit_tp: exit_r, exit_p = 'TP', open_pos['tp']
-
-                if exit_r:
-                    raw  = d * (exit_p - ep) * open_pos['lot'] * ls
-                    cost = sp * pip * open_pos['lot'] * ls + comm * open_pos['lot']
-                    pnl  = raw - cost
-                    equity += pnl
-                    month_peak = max(month_peak, equity)
-                    eq_curve.append(round(equity, 4))
+                ep2=exit_p=None
+                if hit_sl: ep2,exit_p='SL',open_pos['sl']
+                elif hit_tp: ep2,exit_p='TP',open_pos['tp']
+                if ep2:
+                    raw=d*(exit_p-ep)*open_pos['lot']*ls
+                    pnl=raw-(sp*pip*open_pos['lot']*ls+comm*open_pos['lot'])
+                    equity+=pnl; month_peak=max(month_peak,equity)
+                    eq_curve.append(round(equity,4))
                     eq_curve_ts.append(ts_a[bar])
-                    rec = {**open_pos, 'exit': exit_p, 'exit_ts': ts_a[bar],
-                           'pnl': pnl, 'status': exit_r}
-                    month_trades.append(rec)
-                    all_trades.append(rec)
-                    open_pos = None
-
-                    # بررسی DD
-                    dd_d  = (equity - month_day_eq)   / month_day_eq
-                    dd_pk = (equity - month_peak)      / month_peak
-                    if dd_d <= -Config.max_daily_loss_pct:
-                        month_halted = True
-                        month_halt_r = f"Daily {dd_d*100:.1f}%"
-                    elif dd_pk <= -Config.max_total_dd_pct:
-                        month_halted = True
-                        month_halt_r = f"MaxDD {dd_pk*100:.1f}%"
+                    rec={**open_pos,'exit':exit_p,'exit_ts':ts_a[bar],
+                         'pnl':pnl,'status':ep2}
+                    month_trades.append(rec); all_trades.append(rec)
+                    open_pos=None
+                    dd_d=(equity-month_day_eq)/month_day_eq
+                    dd_p=(equity-month_peak)/month_peak
+                    if dd_d<=-Config.max_daily_loss_pct:
+                        month_halted=True; month_halt_r=f"Daily {dd_d*100:.1f}%"
+                    elif dd_p<=-Config.max_total_dd_pct:
+                        month_halted=True; month_halt_r=f"MaxDD {dd_p*100:.1f}%"
 
             # ── ورود ──
             if open_pos is None and not month_halted and bar in sig_set:
-                sv   = int(sig_a[bar])
-                slp  = float(sl_arr[bar])
-                tpp  = float(tp_arr[bar])
-                if slp > 0 and tpp > 0 and not np.isnan(slp) and not np.isnan(tpp):
-                    lot         = lot_size_calc(equity, slp)
-                    half_sp     = sp * pip / 2
-                    entry_price = close_a[bar] + sv * half_sp
-                    open_pos = dict(
+                sv=int(sig_a[bar])
+                slp=float(sl_arr[bar]); tpp=float(tp_arr[bar])
+                if slp>0 and tpp>0 and not np.isnan(slp) and not np.isnan(tpp):
+                    lot=lot_size_calc(equity, slp)
+                    ep=close_a[bar]+sv*sp*pip/2
+                    open_pos=dict(
                         strategy=strategy_name, symbol='EUR',
-                        dir=sv, lot=lot,
-                        entry=entry_price,
-                        sl=entry_price - sv * slp * pip,
-                        tp=entry_price + sv * tpp * pip,
-                        entry_ts=ts_a[bar],
-                        entry_bar=bar,
+                        dir=sv, lot=lot, entry=ep,
+                        sl=ep-sv*slp*pip, tp=ep+sv*tpp*pip,
+                        entry_ts=ts_a[bar], entry_bar=bar,
                     )
 
-        # ── پایان ماه: ثبت آمار ──
+        # ── ثبت ماه ──
         month_pnl = equity - month_start_eq
         month_ret = month_pnl / month_start_eq * 100
+        wins      = sum(1 for t in month_trades if t.get('pnl',0)>0)
+        wr        = wins/len(month_trades)*100 if month_trades else 0
 
-        # وضعیت ماه
         if month_halted:
-            status = f"HALTED ({month_halt_r})"
-        elif month_ret >= Config.monthly_target_pct * 100:
-            status = f"TARGET ✅ ({month_ret:>+.1f}%)"
+            st = f"🛑 HALTED ({month_halt_r})"
+        elif month_ret >= Config.monthly_target_pct*100:
+            st = f"🎯 TARGET ({month_ret:>+.1f}%)"
+        elif month_ret > 0:
+            st = f"✅ +{month_ret:.1f}%"
+        elif month_ret == 0 and len(month_trades)==0:
+            st = "⏸  بدون معامله"
         else:
-            status = f"Normal ({month_ret:>+.1f}%)"
+            st = f"❌ {month_ret:.1f}%"
 
-        monthly_log.append({
-            'period':     str(month_period),
-            'start_eq':   round(month_start_eq, 2),
-            'end_eq':     round(equity, 2),
-            'pnl':        round(month_pnl, 2),
-            'ret_pct':    round(month_ret, 2),
-            'trades':     len(month_trades),
-            'wins':       sum(1 for t in month_trades if t.get('pnl',0) > 0),
-            'status':     status,
-            'halted':     month_halted,
-            'halt_r':     month_halt_r if month_halted else '',
-            'max_dd_month': round(
-                min((equity - month_peak) / month_peak * 100, 0), 2),
-        })
+        dd_m = min(0, (equity-month_peak)/month_peak*100)
+
+        monthly_log.append(dict(
+            period=str(month_period),
+            start_eq=round(month_start_eq,2),
+            end_eq=round(equity,2),
+            pnl=round(month_pnl,2),
+            ret_pct=round(month_ret,2),
+            trades=len(month_trades),
+            wins=wins, wr=round(wr,1),
+            max_dd=round(dd_m,2),
+            halted=month_halted,
+            status=st,
+        ))
 
     return all_trades, monthly_log, eq_curve, eq_curve_ts
 
@@ -496,402 +530,329 @@ def run_monthly_backtest(
 # ================================================================== #
 #               آمار کامل                                           #
 # ================================================================== #
-def compute_full_stats(
-    all_trades: list,
-    monthly_log: list,
-    eq_curve: list,
-    eq_curve_ts: list,
-    strategy_name: str,
-) -> dict:
+def compute_stats(trades, monthly_log, eq_curve, eq_curve_ts, name):
+    if not trades: return None
 
-    if not all_trades:
-        return None
-
-    t = pd.DataFrame(all_trades)
-    t['pnl']          = pd.to_numeric(t['pnl'], errors='coerce').fillna(0)
+    t = pd.DataFrame(trades)
+    t['pnl']          = pd.to_numeric(t['pnl'],errors='coerce').fillna(0)
     t['entry_ts']     = pd.to_datetime(t['entry_ts'])
     t['exit_ts']      = pd.to_datetime(t['exit_ts'])
     t['duration_min'] = (t['exit_ts']-t['entry_ts']).dt.total_seconds()/60
 
     ml = pd.DataFrame(monthly_log)
 
-    final_eq  = eq_curve[-1]
-    total_pnl = final_eq - Config.initial_balance
-    total_ret = total_pnl / Config.initial_balance * 100
-
-    start_d    = t['entry_ts'].min()
-    end_d      = t['exit_ts'].max()
-    total_days = max((end_d - start_d).days, 1)
+    final_eq   = eq_curve[-1]
+    total_pnl  = final_eq - Config.initial_balance
+    total_ret  = total_pnl/Config.initial_balance*100
+    start_d    = t['entry_ts'].min(); end_d = t['exit_ts'].max()
+    total_days = max((end_d-start_d).days,1)
     ann_ret    = ((final_eq/Config.initial_balance)**(365.25/total_days)-1)*100
 
-    win_t  = t[t['pnl'] > 0]
-    loss_t = t[t['pnl'] < 0]
-    win_r  = len(win_t)/len(t)*100 if len(t) > 0 else 0
-    avg_w  = win_t['pnl'].mean()  if len(win_t)  > 0 else 0
-    avg_l  = loss_t['pnl'].mean() if len(loss_t) > 0 else 0
-    gw     = win_t['pnl'].sum()
-    gl     = abs(loss_t['pnl'].sum())
-    pf     = gw / gl if gl > 0 else float('inf')
-    exp_v  = t['pnl'].mean()
-    rr     = abs(avg_w/avg_l) if avg_l != 0 else 0
+    win_t=t[t['pnl']>0]; loss_t=t[t['pnl']<0]
+    win_r=len(win_t)/len(t)*100 if len(t)>0 else 0
+    avg_w=win_t['pnl'].mean() if len(win_t)>0 else 0
+    avg_l=loss_t['pnl'].mean() if len(loss_t)>0 else 0
+    gw=win_t['pnl'].sum(); gl=abs(loss_t['pnl'].sum())
+    pf=gw/gl if gl>0 else float('inf')
+    exp_v=t['pnl'].mean()
+    rr=abs(avg_w/avg_l) if avg_l!=0 else 0
 
-    # equity curve stats
     eq_s   = pd.Series(eq_curve)
-    max_dd = ((eq_s - eq_s.cummax()) / eq_s.cummax() * 100).min()
+    max_dd = ((eq_s-eq_s.cummax())/eq_s.cummax()*100).min()
     r_ret  = eq_s.pct_change().dropna()
     sharpe = (r_ret.mean()/r_ret.std()*np.sqrt(252*96)) if r_ret.std()>0 else 0
     neg    = r_ret[r_ret<0]
     ds     = neg.std() if len(neg)>0 else 1e-10
-    sortino= (r_ret.mean()/ds*np.sqrt(252*96)) if ds>0 else 0
+    sortino= r_ret.mean()/ds*np.sqrt(252*96)
     calmar = (final_eq/Config.initial_balance-1)/abs(max_dd/100) if max_dd!=0 else 0
 
+    sign=t['pnl'].apply(lambda x:1 if x>0 else(-1 if x<0 else 0))
+    cw=cl=mcw=mcl=0
+    for s in sign:
+        if s>0: cw+=1;cl=0;mcw=max(mcw,cw)
+        elif s<0: cl+=1;cw=0;mcl=max(mcl,cl)
+        else: cw=cl=0
+
     # آمار ماهانه
-    profitable_m = (ml['pnl'] > 0).sum()
-    losing_m     = (ml['pnl'] <= 0).sum()
-    halted_m     = ml['halted'].sum()
-    target_m     = (ml['ret_pct'] >= Config.monthly_target_pct*100).sum()
-    avg_monthly_ret = ml['ret_pct'].mean()
-    best_month   = ml['pnl'].max()
-    worst_month  = ml['pnl'].min()
+    prof_m   = (ml['pnl']>0).sum()
+    loss_m   = (ml['pnl']<=0).sum()
+    halt_m   = ml['halted'].sum()
+    target_m = (ml['ret_pct']>=Config.monthly_target_pct*100).sum()
+    no_trade = (ml['trades']==0).sum()
+    avg_mret = ml[ml['trades']>0]['ret_pct'].mean()  # فقط ماه‌های با معامله
+    best_m   = ml['pnl'].max(); worst_m=ml['pnl'].min()
 
     return dict(
-        name=strategy_name,
-        trades=t, monthly=ml,
+        name=name, trades=t, monthly=ml,
         eq_curve=eq_curve, eq_curve_ts=eq_curve_ts,
         final_eq=final_eq, total_pnl=total_pnl,
-        total_ret=total_ret, ann_ret=ann_ret,
-        total_days=total_days,
-        win_r=win_r, avg_w=avg_w, avg_l=avg_l,
-        pf=pf, exp=exp_v, rr=rr,
+        total_ret=total_ret, ann_ret=ann_ret, total_days=total_days,
+        win_r=win_r, avg_w=avg_w, avg_l=avg_l, pf=pf,
+        exp=exp_v, rr=rr, mcw=mcw, mcl=mcl,
         max_dd=max_dd, sharpe=sharpe, sortino=sortino, calmar=calmar,
-        profitable_months=int(profitable_m),
-        losing_months=int(losing_m),
-        halted_months=int(halted_m),
-        target_months=int(target_m),
-        avg_monthly_ret=avg_monthly_ret,
-        best_month=best_month, worst_month=worst_month,
-        best_trade=t['pnl'].max(), worst_trade=t['pnl'].min(),
+        prof_m=int(prof_m), loss_m=int(loss_m),
+        halt_m=int(halt_m), target_m=int(target_m),
+        no_trade_m=int(no_trade),
+        avg_mret=round(avg_mret,2),
+        best_m=best_m, worst_m=worst_m,
+        best_t=t['pnl'].max(), worst_t=t['pnl'].min(),
         avg_dur=t['duration_min'].mean(),
     )
 
 
 # ================================================================== #
-#               گزارش‌ساز حرفه‌ای                                   #
+#               گزارش‌ساز                                           #
 # ================================================================== #
 def print_report(s: dict) -> str:
-    W   = 74
-    SEP = "═" * W
+    W=74; SEP="═"*W
 
-    def rw(label, value, ok=None):
-        lbl  = f"  {label}"
-        val  = str(value)
-        mark = ""
-        if ok is True:  mark = "  ✅"
-        if ok is False: mark = "  ❌"
-        dots = "·" * max(2, W-len(lbl)-len(val)-len(mark)-2)
-        return f"{lbl} {dots} {val}{mark}"
+    def rw(lbl, val, ok=None):
+        l=f"  {lbl}"; v=str(val)
+        mk="" if ok is None else("  ✅" if ok else"  ❌")
+        d="·"*max(2,W-len(l)-len(v)-len(mk)-2)
+        return f"{l} {d} {v}{mk}"
 
-    def box(title):
-        inner = f"─ {title} "
-        return "┌" + inner + "─"*(W-len(inner)-1) + "┐"
+    def box(t):
+        i=f"─ {t} "; return"┌"+i+"─"*(W-len(i)-1)+"┐"
+    bot="└"+"─"*(W-1)+"┘"
 
-    bot = "└" + "─"*(W-1) + "┘"
+    ppm     = s['avg_mret']
+    prop_ok = (s['total_ret']>0 and s['pf']>1.3
+               and abs(s['max_dd'])<8 and ppm>8
+               and s['prof_m']>s['loss_m'])
+    status  = "✅ PROP READY" if prop_ok else "⚠️  در حال بهینه‌سازی"
 
-    # آیا Prop Ready است؟
-    ppm_pct  = s['avg_monthly_ret']
-    prop_ok  = (
-        s['total_ret'] > 0 and
-        s['pf'] > 1.3 and
-        abs(s['max_dd']) < 8 and
-        ppm_pct > 8 and
-        s['profitable_months'] > s['losing_months']
-    )
-    status = "✅ PROP READY" if prop_ok else "⚠️  نیاز به بهبود"
+    lines=[
+        "",SEP,
+        f"  ▌  {s['name']}   {status}  ▐",
+        f"  ▌  {s['trades']['entry_ts'].min().date()} → "
+        f"{s['trades']['exit_ts'].max().date()}  ({s['total_days']} روز)  ▐",
+        SEP,"",
 
-    lines = [
-        "", SEP,
-        f"  ▌  Strategy: {s['name']}   {status}  ▐",
-        f"  ▌  دوره: {s['trades']['entry_ts'].min().date()} "
-        f"→ {s['trades']['exit_ts'].max().date()}  ({s['total_days']} روز)  ▐",
-        SEP, "",
+        box("نتایج مالی"),
+        rw("موجودی اولیه",   f"${Config.initial_balance:>12,.2f}"),
+        rw("موجودی نهایی",   f"${s['final_eq']:>12,.2f}"),
+        rw("سود کل",        f"${s['total_pnl']:>+12,.2f}"),
+        rw("بازده کل",      f"{s['total_ret']:>+.2f}%"),
+        rw("بازده سالانه",  f"{s['ann_ret']:>+.2f}%"),
+        rw("ماهانه avg*",   f"{ppm:>+.2f}%",ok=(ppm>8)),
+        rw("* فقط ماه‌های دارای معامله",""),
+        rw("بهترین ماه",    f"${s['best_m']:>+.2f}"),
+        rw("بدترین ماه",    f"${s['worst_m']:>+.2f}"),
+        bot,"",
 
-        box("نتایج مالی کل دوره"),
-        rw("موجودی اولیه",        f"${Config.initial_balance:>12,.2f}"),
-        rw("موجودی نهایی",        f"${s['final_eq']:>12,.2f}"),
-        rw("سود/زیان کل",        f"${s['total_pnl']:>+12,.2f}"),
-        rw("بازده کل",            f"{s['total_ret']:>+.2f}%"),
-        rw("بازده سالانه",        f"{s['ann_ret']:>+.2f}%"),
-        rw("میانگین سود ماهانه",  f"{s['avg_monthly_ret']:>+.2f}%",
-           ok=(s['avg_monthly_ret'] > 8)),
-        rw("بهترین ماه",          f"${s['best_month']:>+.2f}"),
-        rw("بدترین ماه",          f"${s['worst_month']:>+.2f}"),
-        bot, "",
-
-        box("معیارهای ریسک (پراپ)"),
-        rw("Max Drawdown",         f"{s['max_dd']:.2f}%",
-           ok=(abs(s['max_dd']) < 8)),
-        rw("Sharpe Ratio",         f"{s['sharpe']:.2f}"),
-        rw("Sortino Ratio",        f"{s['sortino']:.2f}"),
-        rw("Calmar Ratio",         f"{s['calmar']:.2f}"),
-        rw("Profit Factor",        f"{s['pf']:.2f}",
-           ok=(s['pf'] > 1.3)),
-        bot, "",
+        box("ریسک"),
+        rw("Max Drawdown",  f"{s['max_dd']:.2f}%",ok=(abs(s['max_dd'])<8)),
+        rw("Sharpe",        f"{s['sharpe']:.2f}"),
+        rw("Sortino",       f"{s['sortino']:.2f}"),
+        rw("Calmar",        f"{s['calmar']:.2f}"),
+        rw("Profit Factor", f"{s['pf']:.2f}",ok=(s['pf']>1.3)),
+        bot,"",
 
         box("معاملات"),
-        rw("تعداد کل",             f"{len(s['trades']):,}"),
-        rw("Win Rate",              f"{s['win_r']:.1f}%"),
-        rw("Avg Win",               f"${s['avg_w']:>+.2f}"),
-        rw("Avg Loss",              f"${s['avg_l']:>+.2f}"),
-        rw("RR واقعی",             f"{s['rr']:.2f}"),
-        rw("Expectancy/trade",      f"${s['exp']:>+.2f}"),
-        rw("بهترین معامله",        f"${s['best_trade']:>+.2f}"),
-        rw("بدترین معامله",        f"${s['worst_trade']:>+.2f}"),
-        rw("مدت میانگین",          f"{s['avg_dur']:.0f} min"),
-        bot, "",
+        rw("تعداد کل",      f"{len(s['trades']):,}"),
+        rw("Win Rate",       f"{s['win_r']:.1f}%"),
+        rw("Avg Win",        f"${s['avg_w']:>+.2f}"),
+        rw("Avg Loss",       f"${s['avg_l']:>+.2f}"),
+        rw("RR",             f"{s['rr']:.2f}"),
+        rw("Expectancy",     f"${s['exp']:>+.2f}"),
+        rw("Max Cons Win",   f"{s['mcw']}"),
+        rw("Max Cons Loss",  f"{s['mcl']}"),
+        rw("مدت میانگین",   f"{s['avg_dur']:.0f} min"),
+        bot,"",
 
         box("آمار ماهانه"),
-        rw("کل ماه‌ها",            f"{s['profitable_months']+s['losing_months']}"),
-        rw("ماه‌های سودده",        f"{s['profitable_months']}",
-           ok=(s['profitable_months'] > s['losing_months'])),
-        rw("ماه‌های ضررده",        f"{s['losing_months']}"),
-        rw("ماه‌های Halted (DD)",   f"{s['halted_months']}"),
-        rw("ماه‌های رسیده به ۱۰%", f"{s['target_months']}"),
-        bot, "",
+        rw("کل ماه‌ها",     f"{s['prof_m']+s['loss_m']+s['no_trade_m']}"),
+        rw("سودده",         f"{s['prof_m']}",ok=(s['prof_m']>s['loss_m'])),
+        rw("ضررده",         f"{s['loss_m']}"),
+        rw("بدون معامله",   f"{s['no_trade_m']}"),
+        rw("Halted (DD)",   f"{s['halt_m']}",ok=(s['halt_m']<3)),
+        rw("رسیده به ۱۰%", f"{s['target_m']}"),
+        bot,"",
     ]
 
-    # ── جدول ماهانه دقیق ──
-    lines.append(box("جدول ماه به ماه (سیمولاسیون واقعی)"))
+    # ── جدول ماه به ماه ──
+    lines.append(box("جدول ماه به ماه"))
     lines.append(
-        f"  {'ماه':>7}  {'موجودی شروع':>13}  {'PnL':>9}  "
-        f"{'Ret%':>6}  {'#T':>3}  {'Win%':>5}  "
-        f"{'MaxDD%':>7}  وضعیت")
-    lines.append("  " + "─"*(W-3))
+        f"  {'ماه':>7}  {'موجودی':>10}  {'PnL':>9}  "
+        f"{'Ret%':>6}  {'#':>3}  {'WR%':>5}  "
+        f"{'DD%':>6}  وضعیت")
+    lines.append("  "+"─"*(W-3))
 
+    cumret = 0
     for _, mr in s['monthly'].iterrows():
-        trades_m = len(s['trades'][
-            s['trades']['entry_ts'].dt.to_period('M').astype(str) == mr['period']
-        ])
-        wins_m   = mr['wins']
-        wr_m     = wins_m / mr['trades'] * 100 if mr['trades'] > 0 else 0
-        arrow    = "▲" if mr['pnl'] >= 0 else "▼"
-        # رنگ وضعیت
-        st = mr['status']
-        if 'TARGET' in st:    st_mark = "🎯"
-        elif 'HALTED' in st:  st_mark = "🛑"
-        elif mr['pnl'] >= 0:  st_mark = "✅"
-        else:                  st_mark = "❌"
-
+        cumret += mr['ret_pct']
         lines.append(
-            f"  {mr['period']:>7}  ${mr['start_eq']:>12,.2f}  "
+            f"  {mr['period']:>7}  ${mr['start_eq']:>9,.0f}  "
             f"${mr['pnl']:>+8,.2f}  {mr['ret_pct']:>+5.1f}%  "
-            f"{mr['trades']:>3}  {wr_m:>4.0f}%  "
-            f"{mr['max_dd_month']:>6.1f}%  "
-            f"{st_mark} {arrow}")
+            f"{mr['trades']:>3}  {mr['wr']:>4.0f}%  "
+            f"{mr['max_dd']:>5.1f}%  {mr['status']}")
+    lines+=[bot,""]
 
-    lines += [bot, ""]
-
-    # ── گزارش سالانه ──
+    # ── سالانه ──
     s['trades']['yr'] = s['trades']['entry_ts'].dt.year
-    yearly = (s['trades'].groupby('yr')
-              .agg(n=('pnl','count'), pnl=('pnl','sum'),
-                   wins=('pnl', lambda x: (x>0).sum()))
-              .reset_index())
-    yearly['wr']  = yearly['wins']/yearly['n']*100
-    yearly['ret'] = yearly['pnl']/Config.initial_balance*100
+    yr_g = (s['trades'].groupby('yr')
+            .agg(n=('pnl','count'),pnl=('pnl','sum'),
+                 wins=('pnl',lambda x:(x>0).sum()))
+            .reset_index())
+    yr_g['wr']  = yr_g['wins']/yr_g['n']*100
+    yr_g['ret'] = yr_g['pnl']/Config.initial_balance*100
+
+    # سود سالانه واقعی (بر اساس موجودی شروع سال)
+    eq_start_year = {}
+    prev_yr = None
+    for _, mr in s['monthly'].iterrows():
+        yr = int(mr['period'][:4])
+        if yr != prev_yr:
+            eq_start_year[yr] = mr['start_eq']
+            prev_yr = yr
 
     lines.append(box("گزارش سالانه"))
-    lines.append(
-        f"  {'سال':>5}  {'#':>5}  {'Win%':>6}  "
-        f"{'PnL':>10}  {'Ret%':>7}")
-    lines.append("  " + "─"*(W-3))
-    for _, yr in yearly.iterrows():
+    lines.append(f"  {'سال':>5}  {'#':>5}  {'WR%':>6}  "
+                 f"{'PnL':>10}  {'Ret%':>7}  {'واقعی%':>8}")
+    lines.append("  "+"─"*(W-3))
+    for _,yr in yr_g.iterrows():
+        y    = int(yr['yr'])
+        base = eq_start_year.get(y, Config.initial_balance)
+        real_ret = yr['pnl']/base*100
         lines.append(
-            f"  {int(yr['yr']):>5}  {int(yr['n']):>5}  "
-            f"{yr['wr']:>5.1f}%  ${yr['pnl']:>9.2f}  "
-            f"{yr['ret']:>+6.1f}%")
+            f"  {y:>5}  {int(yr['n']):>5}  {yr['wr']:>5.1f}%  "
+            f"${yr['pnl']:>9.2f}  {yr['ret']:>+6.1f}%  "
+            f"{real_ret:>+7.1f}%")
     lines.append(bot)
 
-    out = "\n".join(lines)
+    out="\n".join(lines)
     print(out)
     return out
 
 
-def print_comparison(results: list) -> str:
-    W   = 74
-    SEP = "═" * W
-
-    lines = [
-        "", SEP,
-        "  ▌  STRATEGY COMPARISON — Monthly Simulation  ▐",
-        SEP,
-        f"  {'نام':<16} {'Ann%':>8} {'AvgM%':>6} {'DD%':>7} "
-        f"{'PF':>5} {'Win%':>6} {'M+':>4} {'M-':>4} "
-        f"{'Halt':>5} {'10%+':>5}  وضعیت",
-        "  " + "─"*(W-3),
-    ]
+def print_comparison(results):
+    W=74; SEP="═"*W
+    lines=["",SEP,
+           "  ▌  COMPARISON — Monthly Regime-Aware Simulation  ▐",SEP,
+           f"  {'نام':<14} {'Ann%':>7} {'AvgM%':>6} {'DD%':>7} "
+           f"{'PF':>5} {'WR%':>5} {'M+':>4} {'M-':>4} "
+           f"{'Halt':>5} {'10%+':>5}  نتیجه",
+           "  "+"─"*(W-3)]
 
     for s in results:
-        ppm = s['avg_monthly_ret']
-        flag = "✅" if (s['total_ret']>0 and s['pf']>1.3
-                        and abs(s['max_dd'])<8 and ppm>8
-                        and s['profitable_months']>s['losing_months']) else "❌"
-        pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "  ∞"
+        ppm  = s['avg_mret']
+        ok   = (s['total_ret']>0 and s['pf']>1.3
+                and abs(s['max_dd'])<8 and ppm>8
+                and s['prof_m']>s['loss_m'])
+        flag = "✅ PASS" if ok else "❌ FAIL"
+        pf_s = f"{s['pf']:.2f}" if s['pf']!=float('inf') else "  ∞"
         lines.append(
-            f"  {s['name']:<16} {s['ann_ret']:>+7.1f}% {ppm:>+5.1f}% "
-            f"{s['max_dd']:>6.1f}% {pf_s:>5} {s['win_r']:>5.1f}% "
-            f"{s['profitable_months']:>4} {s['losing_months']:>4} "
-            f"{s['halted_months']:>5} {s['target_months']:>5}  {flag}")
+            f"  {s['name']:<14} {s['ann_ret']:>+6.1f}% {ppm:>+5.1f}% "
+            f"{s['max_dd']:>6.1f}% {pf_s:>5} {s['win_r']:>4.1f}% "
+            f"{s['prof_m']:>4} {s['loss_m']:>4} "
+            f"{s['halt_m']:>5} {s['target_m']:>5}  {flag}")
 
-    lines += ["  " + "─"*(W-3), ""]
-
-    good = [s for s in results
-            if s['total_ret']>0 and s['pf']>1.3
-            and abs(s['max_dd'])<8
-            and s['avg_monthly_ret']>8
-            and s['profitable_months']>s['losing_months']]
-
+    lines+=["  "+"─"*(W-3),""]
+    good=[s for s in results
+          if s['total_ret']>0 and s['pf']>1.3
+          and abs(s['max_dd'])<8 and s['avg_mret']>8
+          and s['prof_m']>s['loss_m']]
     if good:
         lines.append("  🏆 PROP READY:")
-        for s in sorted(good, key=lambda x: x['ann_ret'], reverse=True):
+        for s in sorted(good,key=lambda x:x['ann_ret'],reverse=True):
             lines.append(
-                f"     ✅ {s['name']:<16}  "
+                f"     ✅ {s['name']:<14}  "
                 f"سالانه={s['ann_ret']:>+.1f}%  "
-                f"ماهانه avg={s['avg_monthly_ret']:>+.1f}%  "
+                f"ماهانه={s['avg_mret']:>+.1f}%  "
                 f"DD={s['max_dd']:.1f}%  "
-                f"ماه‌های سودده={s['profitable_months']}")
+                f"ماه‌سودده={s['prof_m']}")
     else:
-        lines.append("  ⚠️  هنوز هیچ استراتژی کاملاً آماده پراپ نیست")
+        # بهترین کاندید
+        best = max(results, key=lambda x: x['ann_ret'])
+        lines.append("  ⚠️  هیچ استراتژی هنوز کاملاً PROP READY نیست")
+        lines.append(f"  📊 بهترین: {best['name']} "
+                     f"(Ann={best['ann_ret']:>+.1f}%, "
+                     f"AvgMonth={best['avg_mret']:>+.1f}%)")
+    lines+=["",SEP]
+    out="\n".join(lines); print(out); return out
 
-    lines += ["", SEP]
-    out = "\n".join(lines)
-    print(out)
-    return out
 
-
-def save_outputs(results: list):
-    # CSV اصلی
-    rows = [
-        ["MONTHLY SIMULATION BACKTEST"],
+def save_outputs(results):
+    rows=[
+        ["REGIME-AWARE MONTHLY SIMULATION"],
         [f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"],
-        [f"Risk/trade: {Config.risk_per_trade_pct*100}%  "
-         f"MaxDD: {Config.max_total_dd_pct*100}%  "
-         f"MaxLot: {Config.max_lot}"],
         [""],
-        ["Strategy","FinalEq","TotalPnL","TotalRet%","AnnRet%",
-         "MaxDD%","Sharpe","PF","WinRate%","RR","Exp$",
-         "Trades","AvgMonthly%","ProfMonths","LossMonths",
-         "HaltedMonths","TargetMonths","Status"],
+        ["Strategy","FinalEq","TotalRet%","AnnRet%","AvgMonth%",
+         "MaxDD%","PF","WinRate%","RR","Exp$","Trades",
+         "ProfMonths","LossMonths","HaltedM","TargetM","Status"],
     ]
     for s in results:
-        ppm  = s['avg_monthly_ret']
-        flag = ("PROP_READY"
-                if (s['total_ret']>0 and s['pf']>1.3
-                    and abs(s['max_dd'])<8 and ppm>8)
-                else "NEEDS_WORK")
-        pf_v = round(s['pf'],2) if s['pf']!=float('inf') else 999
-        rows.append([
-            s['name'], round(s['final_eq'],2), round(s['total_pnl'],2),
-            round(s['total_ret'],2), round(s['ann_ret'],2),
-            round(s['max_dd'],2), round(s['sharpe'],2), pf_v,
-            round(s['win_r'],1), round(s['rr'],2), round(s['exp'],2),
-            len(s['trades']), round(ppm,2),
-            s['profitable_months'], s['losing_months'],
-            s['halted_months'], s['target_months'], flag,
-        ])
+        ok=(s['total_ret']>0 and s['pf']>1.3
+            and abs(s['max_dd'])<8 and s['avg_mret']>8)
+        pf_v=round(s['pf'],2) if s['pf']!=float('inf') else 999
+        rows.append([s['name'],round(s['final_eq'],2),round(s['total_ret'],2),
+                     round(s['ann_ret'],2),round(s['avg_mret'],2),
+                     round(s['max_dd'],2),pf_v,round(s['win_r'],1),
+                     round(s['rr'],2),round(s['exp'],2),len(s['trades']),
+                     s['prof_m'],s['loss_m'],s['halt_m'],s['target_m'],
+                     "PASS" if ok else "FAIL"])
 
-    # جدول ماهانه هر استراتژی
     for s in results:
-        rows += [[""], [f"=== MONTHLY TABLE: {s['name']} ==="],
-                 ["Month","StartEq","EndEq","PnL","Ret%",
-                  "Trades","Wins","WinRate%","MaxDD%","Status"]]
-        for _, mr in s['monthly'].iterrows():
-            wr_m = mr['wins']/mr['trades']*100 if mr['trades']>0 else 0
-            rows.append([
-                mr['period'], round(mr['start_eq'],2),
-                round(mr['end_eq'],2), round(mr['pnl'],2),
-                round(mr['ret_pct'],2), mr['trades'],
-                mr['wins'], round(wr_m,1),
-                round(mr['max_dd_month'],2), mr['status'],
-            ])
+        rows+=[[""],
+               [f"=== MONTHLY: {s['name']} ==="],
+               ["Month","StartEq","EndEq","PnL","Ret%",
+                "Trades","WinRate%","MaxDD%","Status"]]
+        for _,mr in s['monthly'].iterrows():
+            rows.append([mr['period'],round(mr['start_eq'],2),
+                         round(mr['end_eq'],2),round(mr['pnl'],2),
+                         round(mr['ret_pct'],2),mr['trades'],
+                         round(mr['wr'],1),round(mr['max_dd'],2),
+                         mr['status']])
 
-    pd.DataFrame(rows).to_csv(
-        "Monthly_Simulation_Report.csv",
-        index=False, header=False, encoding="utf-8-sig")
+    pd.DataFrame(rows).to_csv("Report.csv",index=False,
+                               header=False,encoding="utf-8-sig")
 
-    # equity curve هر استراتژی
     for s in results:
-        eq_df = pd.DataFrame({
-            'ts':     s['eq_curve_ts'],
-            'equity': s['eq_curve'],
-        })
-        eq_df['dd_pct'] = (
-            (eq_df['equity'] - eq_df['equity'].cummax())
-            / eq_df['equity'].cummax() * 100
-        ).round(4)
+        eq_df=pd.DataFrame({'ts':s['eq_curve_ts'],'equity':s['eq_curve']})
+        eq_df['dd']=(
+            (eq_df['equity']-eq_df['equity'].cummax())
+            /eq_df['equity'].cummax()*100).round(4)
         eq_df.to_csv(f"equity_{s['name']}.csv",
-                     index=False, encoding="utf-8-sig")
+                     index=False,encoding="utf-8-sig")
 
     print(f"\n✅ فایل‌ها:")
-    print(f"   → Monthly_Simulation_Report.csv")
+    print(f"   → Report.csv")
     for s in results:
         print(f"   → equity_{s['name']}.csv")
 
 
 # ================================================================== #
-#                           MAIN                                     #
-# ================================================================== #
 if __name__ == "__main__":
     df = load_data()
-
-    print("\n" + "═"*74)
-    print("  MONTHLY SIMULATION BACKTEST")
-    print("  منطق: هر ماه مستقل | موجودی از ماه قبل منتقل می‌شه")
-    print("  DD و Daily Loss نسبت به شروع همان ماه حساب می‌شه")
+    print("\n"+"═"*74)
+    print("  REGIME-AWARE MONTHLY SIMULATION")
     print("═"*74)
 
-    # محاسبه یک‌باره سیگنال‌ها
     signals = compute_all_signals(df)
 
-    strategies = [
-        ('CorrArb',    signals['CorrArb'][0],    signals['CorrArb'][1],
-                       signals['CorrArb'][2],    signals['CorrArb'][3]),
-        ('AsianBreak', signals['AsianBreak'][0], signals['AsianBreak'][1],
-                       signals['AsianBreak'][2], None),
-        ('EMACross',   signals['EMACross'][0],   signals['EMACross'][1],
-                       signals['EMACross'][2],   None),
+    strats=[
+        ('CorrArb',    *signals['CorrArb']),
+        ('TrendEMA',   *signals['TrendEMA']),
+        ('AsianBreak', *signals['AsianBreak']),
+        ('MeanRev',    *signals['MeanRev']),
     ]
 
-    all_results = []
-    all_texts   = []
-
-    for name, sig, sl, tp, z in strategies:
-        t0 = datetime.now()
-        print(f"\n  ▶ {name} ...", end="", flush=True)
-
-        trades, monthly_log, eq_curve, eq_curve_ts = run_monthly_backtest(
-            df, signals, name, sig, sl, tp, z_series=z)
-
-        dt = (datetime.now()-t0).total_seconds()
-        print(f" {dt:.1f}s | {len(trades)} معامله | {len(monthly_log)} ماه")
-
-        if not trades:
-            print(f"     ❌ بدون معامله")
-            continue
-
-        stats = compute_full_stats(
-            trades, monthly_log, eq_curve, eq_curve_ts, name)
-        if stats:
-            all_results.append(stats)
-            txt = print_report(stats)
-            all_texts.append(txt)
+    all_results=[]; all_texts=[]
+    for name,sig,sl,tp,z in strats:
+        t0=datetime.now()
+        print(f"\n  ▶ {name}...",end="",flush=True)
+        trades,ml,eqc,eqts=run_monthly_backtest(df,name,sig,sl,tp,z)
+        dt=(datetime.now()-t0).total_seconds()
+        print(f" {dt:.1f}s | {len(trades)} معامله")
+        if not trades: continue
+        st=compute_stats(trades,ml,eqc,eqts,name)
+        if st:
+            all_results.append(st)
+            all_texts.append(print_report(st))
 
     if all_results:
-        comp = print_comparison(all_results)
-        all_texts.append(comp)
-
-        with open("Backtest_Report.txt","w",encoding="utf-8") as f:
-            f.write(f"MONTHLY SIMULATION — "
-                    f"{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        all_texts.append(print_comparison(all_results))
+        with open("Report.txt","w",encoding="utf-8") as f:
             f.write("\n".join(all_texts))
-
         save_outputs(all_results)
