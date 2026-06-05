@@ -1,127 +1,58 @@
-name: 5-Years MVP Backtest (M15, M5, M2, M1)
+name: 1-Year MVP Backtest
 
 on:
   workflow_dispatch:
 
 jobs:
-  download-data:
+  quant-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Requirements
-        run: pip install pandas numpy
-
-      - name: Restore Cache
-        id: cache-data
-        uses: actions/cache/restore@v4
-        with:
-          path: ./data
-          # ⚠️ v2 = کش قدیمی را نادیده بگیر
-          key: dukascopy-eurusd-gbpusd-2021-2026-v2
-
-      - name: Download Market Data
-        if: steps.cache-data.outputs.cache-hit != 'true'
-        run: python download_dukascopy.py
-
-      - name: Verify Data
-        run: |
-          echo "=== فایل‌ها ==="
-          ls -lah ./data/
-
-          for f in ./data/*.csv; do
-            lines=$(wc -l < "$f")
-            size=$(du -sh "$f" | cut -f1)
-            echo "$f | $lines خط | $size"
-            if [ "$lines" -lt 100000 ]; then
-              echo "❌ فایل کوچک است!"
-              exit 1
-            fi
-          done
-
-          python - <<'EOF'
-          import pandas as pd
-
-          for symbol in ['EURUSD', 'GBPUSD']:
-              import glob
-              files = glob.glob(f'data/{symbol}*.csv')
-              if not files:
-                  print(f"❌ {symbol} یافت نشد!")
-                  exit(1)
-              
-              df = pd.read_csv(files[0], nrows=2000)
-              df['timestamp'] = pd.to_datetime(df['timestamp'])
-              
-              hours  = df['timestamp'].dt.hour.nunique()
-              mins   = df['timestamp'].dt.minute.nunique()
-              
-              print(f"\n{symbol}:")
-              print(f"  ساعت‌های یکتا: {hours}")
-              print(f"  دقیقه‌های یکتا: {mins}")
-              print(f"  نمونه: {df['timestamp'].iloc[0]} → {df['timestamp'].iloc[-1]}")
-              
-              if hours < 5:
-                  print(f"❌ timestamp هنوز اشتباه است!")
-                  exit(1)
-              
-              print(f"  ✅ timestamp سالم")
-          EOF
-
-      - name: Save Cache
-        if: steps.cache-data.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./data
-          key: dukascopy-eurusd-gbpusd-2021-2026-v2
-
-  run-backtest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: download-data
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
       - name: Install Requirements
-        run: pip install pandas numpy
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
 
-      - name: Restore Data Cache
+      - name: Cache Market Data
         id: cache-data
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: ./data
-          key: dukascopy-eurusd-gbpusd-2021-2026-v2
+          key: dukascopy-eurusd-gbpusd-2023-2024-v1
 
-      - name: Verify Cache
+      - name: Download Market Data
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: python download_dukascopy.py
+
+      - name: Verify Downloaded Data
         run: |
-          echo "Cache hit: ${{ steps.cache-data.outputs.cache-hit }}"
+          echo "=== بررسی فایل‌های موجود ==="
           ls -lah ./data/
-          if [ -z "$(ls ./data/*.csv 2>/dev/null)" ]; then
-            echo "❌ کش restore نشد!"
-            exit 1
-          fi
+          for f in ./data/*.csv; do
+            lines=$(wc -l < "$f")
+            echo "$f | $lines خط"
+            if [ "$lines" -lt 100000 ]; then
+              echo "❌ فایل بسیار کوچک است! دانلود با خطا مواجه شده."
+              exit 1
+            fi
+          done
 
-      - name: Run Backtest
+      - name: Run Optimizer
         run: python dukascopy_mtf_optimizer.py
 
-      - name: Upload Results
+      - name: Upload Final Report
         uses: actions/upload-artifact@v4
         with:
-          name: MVP-5Years-MTF-Report
-          path: ultimate_5years_mtf_report.csv
-          retention-days: 30
+          name: MVP-1Year-Report
+          path: ultimate_1year_mtf_report.csv
+          retention-days: 14
