@@ -20,7 +20,7 @@ class RealWorldSimulator:
 
     def load_data(self):
         print(f"\n{'='*60}")
-        print(f"🏦 شبیه‌ساز کوانت پیشرفته (مجهز به فیلتر ADF)")
+        print(f"🏦 شبیه‌ساز کوانت پیشرفته (مجهز به فیلتر ADF - خروجی کامل)")
         print(f"💰 سرمایه اولیه: ${self.initial_balance:,}")
         print(f"⚠️ ریسک در معامله: {self.risk_per_trade*100}% | لوریج: {self.leverage:.2f}x")
         print(f"{'='*60}\n")
@@ -70,7 +70,6 @@ class RealWorldSimulator:
                     subset = spread_vals[i-150:i]
                     if np.var(subset) > 1e-10: 
                         try:
-                            # اگر p-value کمتر از 0.05 باشد یعنی جفت‌ارزها همگرا هستند
                             pval = adfuller(subset, maxlag=1)[1]
                             if pval < 0.05:
                                 current_pos = 1 if z < -2.5 else -1
@@ -78,22 +77,18 @@ class RealWorldSimulator:
                             pass
                             
             elif current_pos == 1:
-                # خروج با سود (Z >= -0.5) یا خروج اضطراری با ضرر (Z <= -4.0)
                 if z >= -0.5 or z <= -4.0:
                     current_pos = 0
                     
             elif current_pos == -1:
-                # خروج با سود (Z <= 0.5) یا خروج اضطراری با ضرر (Z >= 4.0)
                 if z <= 0.5 or z >= 4.0:
                     current_pos = 0
                     
             pos[i] = current_pos
             
-        # اعمال پوزیشن‌ها با یک کندل تاخیر (برای شبیه‌سازی ورود واقعی)
         df['Pos'] = pos
         df['Pos'] = df['Pos'].shift(1).fillna(0)
         
-        # محاسبه بازدهی درصدی
         r_eur = (df['EURUSD'] - df['EURUSD'].shift(1)) / df['EURUSD'].shift(1)
         r_gbp = (df['GBPUSD'] - df['GBPUSD'].shift(1)) / df['GBPUSD'].shift(1)
         
@@ -127,8 +122,10 @@ class RealWorldSimulator:
             print(f" سال {year} : {ret:+.2f}%")
         print(f"{'='*60}\n")
         
+        # ذخیره کامل تمامی ردیف‌ها (شامل تایم‌فریم، قیمت‌ها، پوزیشن و موجودی لحظه‌ای)
         export_df = df[['EURUSD', 'GBPUSD', 'Pos', 'Equity', 'Drawdown']].copy()
         export_df.to_csv("Equity_Curve_Report.csv")
+        print("✅ فایل کامل گزارش (Row by Row) با موفقیت ذخیره شد.")
 
 if __name__ == "__main__":
     sim = RealWorldSimulator()
