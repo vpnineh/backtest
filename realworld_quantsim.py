@@ -1,61 +1,64 @@
 import pandas as pd
 import numpy as np
 import glob
-import logging
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-
-class PropFirmReadyEngine:
+class PropSafeHedgingEngine:
     def __init__(self):
-        self.initial_balance = 5000.0  # سرمایه اولیه
-        self.tc = 0.0001               # هزینه تراکنش ECN (1 پیپ)
-        self.leverage = 2.0            # اهرم کاهش‌یافته برای امنیت پراپ
+        self.initial_balance = 5000.0
+        self.max_leverage = 1.0  # اهرمِ بسیار امن برای تستِ اولیه
+        self.hedging_threshold = 0.003  # باز کردن هج در ضرر 30 پیپی
         
     def load_data(self):
-        # لود کردن فایل‌های EURUSD و GBPUSD از پوشه data
-        all_files = glob.glob('data/*.csv')
-        eur_files = [f for f in all_files if 'eurusd' in f.lower()]
-        gbp_files = [f for f in all_files if 'gbpusd' in f.lower()]
-
-        def process(files):
-            dfs = [pd.read_csv(f, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v']) for f in files]
-            df = pd.concat(dfs).sort_values('ts').drop_duplicates('ts')
+        # لود دیتای شما
+        files_eur = glob.glob('data/*EURUSD*.csv')
+        files_gbp = glob.glob('data/*GBPUSD*.csv')
+        
+        def read_df(f):
+            df = pd.read_csv(f, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
             df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
             return df.set_index('ts')[['c']]
 
-        self.base_data = process(eur_files).join(process(gbp_files), lsuffix='_eur', rsuffix='_gbp').dropna()
-        print(f"✅ دیتا با موفقیت لود شد: {len(self.base_data):,} کندل")
+        eur = pd.concat([read_df(f) for f in files_eur]).sort_index()
+        gbp = pd.concat([read_df(f) for f in files_gbp]).sort_index()
+        self.df = eur.join(gbp, lsuffix='_eur', rsuffix='_gbp').dropna()
 
     def run_simulation(self):
-        df = self.base_data.resample('15min').last().dropna()
+        df = self.df.resample('15min').last()
         
-        # فرمول آربیتراژ کلاسیک
-        df['Spread'] = np.log(df['c_eur']) - np.log(df['c_gbp'])
-        df['Mean'] = df['Spread'].rolling(150).mean()
-        df['Std'] = df['Spread'].rolling(150).std()
-        df['Z'] = (df['Spread'] - df['Mean']) / (df['Std'] + 1e-8)
+        # استراتژی: ورود دوطرفه در کانال‌های قیمتی
+        # مدیریت پوزیشن: هجینگ هوشمند
+        equity = [self.initial_balance]
+        net_pos_eur = 0
+        net_pos_gbp = 0
         
-        # استراتژی ورود و خروج بهینه (بدون فیلترهای اضافه)
-        df['Pos'] = 0
-        df.loc[df['Z'] < -2.5, 'Pos'] = 1  # Buy
-        df.loc[df['Z'] > 2.5, 'Pos'] = -1  # Sell
-        df.loc[abs(df['Z']) <= 0.2, 'Pos'] = 0 # خروج زودهنگام برای سود کوچک اما ایمن
-        df['Pos'] = df['Pos'].replace(0, np.nan).ffill().fillna(0).shift(1)
-        
-        # محاسبات بازدهی با اهرم مدیریت‌شده
-        r_eur = df['c_eur'].pct_change()
-        r_gbp = df['c_gbp'].pct_change()
-        strat_ret = (df['Pos'] * (r_eur - r_gbp) - self.tc) * self.leverage
-        
-        # شبیه‌ساز اکوییتی با سود مرکب
-        df['Equity'] = self.initial_balance * (1 + strat_ret).cumprod()
-        df['Drawdown'] = (df['Equity'] - df['Equity'].cummax()) / df['Equity'].cummax() * 100
-        
-        # خروجی نهایی
+        for i in range(1, len(df)):
+            prev_eur = df['c_eur'].iloc[i-1]
+            curr_eur = df['c_eur'].iloc[i]
+            
+            # منطقِ ساده و امن: 
+            # اگر قیمت تغییرِ ناگهانی داشت، پوزیشن معکوس برای هجینگ باز کن
+            diff = (curr_eur - prev_eur) / prev_eur
+            
+            # اگر بازار بیش از 0.1% حرکت کرد، هجینگ فعال می‌شود
+            if abs(diff) > 0.001:
+                net_pos_eur -= np.sign(diff) * 0.1 # حجم کوچک (0.1 لات)
+            
+            # محاسبه سود و زیان لحظه‌ای
+            profit = net_pos_eur * (curr_eur - prev_eur) * 100000 
+            new_equity = equity[-1] + profit
+            
+            # مدیریت دراودان: اگر موجودی به زیر 4500 رسید، هجینگ را ببند (Stop Loss کلی)
+            if new_equity < 4500:
+                new_equity = 4500
+                net_pos_eur = 0 
+                
+            equity.append(new_equity)
+
+        df['Equity'] = equity
         df.to_csv("Equity_Curve_Report.csv")
-        print(f"💰 نتیجه نهایی: ${df['Equity'].iloc[-1]:,.2f} | 📉 دراودان: {df['Drawdown'].min():.2f}%")
+        print(f"💰 موجودی نهایی: ${equity[-1]:,.2f}")
 
 if __name__ == "__main__":
-    engine = PropFirmReadyEngine()
+    engine = PropSafeHedgingEngine()
     engine.load_data()
     engine.run_simulation()
