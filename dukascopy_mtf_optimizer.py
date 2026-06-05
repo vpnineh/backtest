@@ -6,224 +6,295 @@ import glob
 import warnings
 warnings.filterwarnings('ignore')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
 
 
 class DukascopyMultiTimeframeOptimizer:
     def __init__(self):
-        self.transaction_cost = 0.0002
+        self.transaction_cost = 0.0002  # 2 پیپ
         self.base_data = pd.DataFrame()
 
+    # ──────────────────────────────────────────
     def load_base_m1_data(self):
-        logging.info("بارگذاری دیتا...")
-        try:
-            all_files = glob.glob('data/*.csv')
-            logging.info(f"فایل‌های یافت شده: {all_files}")
+        logging.info("بارگذاری دیتای M1...")
 
-            eurusd_file = None
-            gbpusd_file = None
-            for f in all_files:
-                fl = f.lower()
-                if 'eurusd' in fl:
-                    eurusd_file = f
-                elif 'gbpusd' in fl:
-                    gbpusd_file = f
+        all_files = glob.glob('data/*.csv')
+        logging.info(f"فایل‌های یافت شده: {all_files}")
 
-            if not eurusd_file or not gbpusd_file:
-                raise FileNotFoundError(f"فایل‌ها یافت نشدند: {all_files}")
+        if not all_files:
+            raise FileNotFoundError("هیچ فایل CSV در پوشه data یافت نشد!")
 
-            logging.info(f"EURUSD: {eurusd_file}")
-            logging.info(f"GBPUSD: {gbpusd_file}")
+        eurusd_file = None
+        gbpusd_file = None
+        for f in all_files:
+            fl = f.lower()
+            if 'eurusd' in fl:
+                eurusd_file = f
+            elif 'gbpusd' in fl:
+                gbpusd_file = f
 
-            df_eur = pd.read_csv(eurusd_file)
-            df_gbp = pd.read_csv(gbpusd_file)
+        if not eurusd_file:
+            raise FileNotFoundError(f"فایل EURUSD یافت نشد | موجود: {all_files}")
+        if not gbpusd_file:
+            raise FileNotFoundError(f"فایل GBPUSD یافت نشد | موجود: {all_files}")
 
-            # ======= تبدیل timestamp =======
-            df_eur['timestamp'] = pd.to_datetime(df_eur['timestamp'])
-            df_gbp['timestamp'] = pd.to_datetime(df_gbp['timestamp'])
+        logging.info(f"EURUSD ← {eurusd_file}")
+        logging.info(f"GBPUSD ← {gbpusd_file}")
 
-            # ======= حذف duplicate ها =======
-            before = len(df_eur)
-            df_eur = df_eur.drop_duplicates(subset='timestamp', keep='last')
-            df_gbp = df_gbp.drop_duplicates(subset='timestamp', keep='last')
-            after = len(df_eur)
-            logging.info(f"حذف duplicate: {before:,} → {after:,} کندل")
+        df_eur = pd.read_csv(eurusd_file)
+        df_gbp = pd.read_csv(gbpusd_file)
 
-            # ======= حذف کندل‌های بی‌معنی (volume=0 و OHLC یکسان) =======
-            mask_eur = ~(
-                (df_eur['volume'] == 0) &
-                (df_eur['open'] == df_eur['close']) &
-                (df_eur['high'] == df_eur['low'])
-            )
-            mask_gbp = ~(
-                (df_gbp['volume'] == 0) &
-                (df_gbp['open'] == df_gbp['close']) &
-                (df_gbp['high'] == df_gbp['low'])
-            )
-            df_eur = df_eur[mask_eur]
-            df_gbp = df_gbp[mask_gbp]
-            logging.info(f"بعد از حذف کندل‌های بی‌معنی - EURUSD: {len(df_eur):,} | GBPUSD: {len(df_gbp):,}")
+        logging.info(f"ستون‌ها: {df_eur.columns.tolist()}")
+        logging.info(f"نمونه خام EURUSD:\n{df_eur.head(5).to_string()}")
+        logging.info(f"تعداد خام: EURUSD={len(df_eur):,} | GBPUSD={len(df_gbp):,}")
 
-            df_eur.set_index('timestamp', inplace=True)
-            df_gbp.set_index('timestamp', inplace=True)
+        # پارس timestamp
+        df_eur['timestamp'] = pd.to_datetime(df_eur['timestamp'])
+        df_gbp['timestamp'] = pd.to_datetime(df_gbp['timestamp'])
 
-            df_eur = df_eur[['close']].rename(columns={'close': 'EURUSD'})
-            df_gbp = df_gbp[['close']].rename(columns={'close': 'GBPUSD'})
+        # مرتب‌سازی
+        df_eur = df_eur.sort_values('timestamp')
+        df_gbp = df_gbp.sort_values('timestamp')
 
-            df_eur = df_eur.sort_index()
-            df_gbp = df_gbp.sort_index()
+        # حذف duplicate
+        before_eur = len(df_eur)
+        df_eur = df_eur.drop_duplicates(subset='timestamp', keep='last')
+        df_gbp = df_gbp.drop_duplicates(subset='timestamp', keep='last')
+        logging.info(f"حذف duplicate EURUSD: {before_eur:,} → {len(df_eur):,}")
 
-            self.base_data = df_eur.join(df_gbp, how='inner').dropna()
+        # حذف کندل‌های بی‌معنی (volume=0 و قیمت ثابت)
+        def remove_bad_candles(df, name):
+            bad = (df['volume'] == 0) & (df['open'] == df['close']) & (df['high'] == df['low'])
+            cleaned = df[~bad]
+            logging.info(f"حذف کندل بد {name}: {bad.sum():,} عدد | باقی: {len(cleaned):,}")
+            return cleaned
 
-            # ======= نمونه داده برای بررسی =======
-            logging.info(f"بازه زمانی: {self.base_data.index[0]} تا {self.base_data.index[-1]}")
-            logging.info(f"✅ تعداد کندل نهایی M1: {len(self.base_data):,}")
-            logging.info(f"نمونه:\n{self.base_data.head(5)}")
+        df_eur = remove_bad_candles(df_eur, 'EURUSD')
+        df_gbp = remove_bad_candles(df_gbp, 'GBPUSD')
 
-            # ======= چک منطقی =======
-            expected_min = 200_000
-            expected_max = 800_000
-            if len(self.base_data) < expected_min:
-                logging.warning(f"⚠️ تعداد کندل خیلی کم است: {len(self.base_data):,}")
-            elif len(self.base_data) > expected_max:
-                logging.warning(f"⚠️ تعداد کندل خیلی زیاد است: {len(self.base_data):,} - احتمال duplicate")
+        # ست کردن index
+        df_eur = df_eur.set_index('timestamp')[['close']].rename(columns={'close': 'EURUSD'})
+        df_gbp = df_gbp.set_index('timestamp')[['close']].rename(columns={'close': 'GBPUSD'})
 
-        except Exception as e:
-            logging.error(f"خطا: {e}")
-            raise
+        # join
+        self.base_data = df_eur.join(df_gbp, how='inner').dropna()
 
-    def resample_data(self, timeframe: str) -> pd.DataFrame:
-        """تبدیل M1 به تایم‌فریم بالاتر"""
-        if timeframe == '1min':
+        # اطلاعات نهایی
+        n = len(self.base_data)
+        t_start = self.base_data.index[0]
+        t_end = self.base_data.index[-1]
+        days = (t_end - t_start).days
+
+        logging.info(f"{'='*50}")
+        logging.info(f"✅ دیتای M1 آماده:")
+        logging.info(f"   کندل‌ها: {n:,}")
+        logging.info(f"   از: {t_start}")
+        logging.info(f"   تا: {t_end}")
+        logging.info(f"   روزها: {days}")
+        logging.info(f"   میانگین کندل/روز: {n/days:.0f}")
+        logging.info(f"{'='*50}")
+
+        # چک منطقی
+        if n < 100_000:
+            logging.warning(f"⚠️ کندل خیلی کم: {n:,} (انتظار ~500K برای ۲ سال)")
+        elif n > 1_500_000:
+            logging.warning(f"⚠️ کندل خیلی زیاد: {n:,} - احتمال duplicate باقیمانده")
+
+    # ──────────────────────────────────────────
+    def resample_to_timeframe(self, timeframe: str) -> pd.DataFrame:
+        if timeframe == '1T':
             return self.base_data.copy()
 
-        logging.info(f"ساخت چارت {timeframe}...")
+        resampled = self.base_data.resample(timeframe).agg(
+            EURUSD=('EURUSD', 'last'),
+            GBPUSD=('GBPUSD', 'last'),
+        ).dropna()
 
-        resampled = self.base_data.resample(timeframe).agg({
-            'EURUSD': 'last',
-            'GBPUSD': 'last',
-        }).dropna()
-
-        logging.info(f"تعداد کندل {timeframe}: {len(resampled):,}")
+        logging.info(f"Resample {timeframe}: {len(resampled):,} کندل")
         return resampled
 
-    def backtest(self, data: pd.DataFrame, window: int, z_entry: float, z_exit: float) -> dict | None:
-        df = data.copy()
+    # ──────────────────────────────────────────
+    def backtest_single(
+        self,
+        data: pd.DataFrame,
+        window: int,
+        z_entry: float,
+        z_exit: float,
+    ) -> dict | None:
 
-        if len(df) < window + 10:
+        df = data.copy()
+        if len(df) < window + 50:
             return None
 
+        # محاسبه spread و z-score
         df['Spread'] = np.log(df['EURUSD']) - np.log(df['GBPUSD'])
-        df['Spread_Mean'] = df['Spread'].rolling(window=window).mean()
-        df['Spread_Std'] = df['Spread'].rolling(window=window).std()
-
-        # جلوگیری از تقسیم بر صفر
-        df = df[df['Spread_Std'] > 1e-10]
-        df['Z_Score'] = (df['Spread'] - df['Spread_Mean']) / df['Spread_Std']
-
-        df['Signal'] = 0
-        df.loc[df['Z_Score'] < -z_entry, 'Signal'] = 1
-        df.loc[df['Z_Score'] > z_entry, 'Signal'] = -1
-        df.loc[abs(df['Z_Score']) <= z_exit, 'Signal'] = 0
-
-        # جایگزین روش deprecated
-        df['Position'] = df['Signal'].replace(0, np.nan).ffill().fillna(0).shift(1)
+        roll = df['Spread'].rolling(window=window)
+        df['Mean'] = roll.mean()
+        df['Std']  = roll.std()
+        df = df[df['Std'] > 1e-8].copy()
+        df['Z'] = (df['Spread'] - df['Mean']) / df['Std']
         df.dropna(inplace=True)
 
-        if df.empty or len(df) < 10:
+        if len(df) < 50:
             return None
 
-        ret1 = np.log(df['EURUSD'] / df['EURUSD'].shift(1))
-        ret2 = np.log(df['GBPUSD'] / df['GBPUSD'].shift(1))
+        # سیگنال
+        signal = np.zeros(len(df))
+        signal[df['Z'].values < -z_entry] =  1   # خرید spread
+        signal[df['Z'].values >  z_entry] = -1   # فروش spread
+        signal[np.abs(df['Z'].values) <= z_exit] = 0
 
-        position_changes = df['Position'].diff().abs()
-        costs = position_changes * self.transaction_cost
+        # تبدیل سیگنال به پوزیشن (hold تا خروج)
+        position = pd.Series(signal, index=df.index)
+        position = position.replace(0, np.nan).ffill().fillna(0)
+        position = position.shift(1).fillna(0)
 
-        strategy_returns = df['Position'] * (ret1 - ret2) - costs
-        strategy_returns = strategy_returns.dropna()
+        # بازده
+        r_eur = np.log(df['EURUSD'] / df['EURUSD'].shift(1))
+        r_gbp = np.log(df['GBPUSD'] / df['GBPUSD'].shift(1))
 
-        if strategy_returns.empty:
+        pos_change = position.diff().abs()
+        cost = pos_change * self.transaction_cost
+        strat_ret = position * (r_eur - r_gbp) - cost
+        strat_ret = strat_ret.dropna()
+
+        if strat_ret.empty:
             return None
 
-        # ======= چک overflow =======
-        cumsum = strategy_returns.cumsum()
-        if cumsum.abs().max() > 500:
-            logging.warning(f"⚠️ overflow در window={window}, z_entry={z_entry}")
+        total_trades = int(pos_change.sum() / 2)
+        if total_trades < 20:
             return None
 
-        cumulative_return = np.exp(cumsum.iloc[-1]) - 1
-        total_trades = int(position_changes.sum() / 2)
+        # چک overflow
+        cumsum = strat_ret.cumsum()
+        if cumsum.abs().max() > 300:
+            return None
 
-        cum_ret_series = np.exp(cumsum)
-        rolling_max = cum_ret_series.cummax()
-        drawdown = (cum_ret_series - rolling_max) / rolling_max
-        max_drawdown = drawdown.min()
+        cum_series = np.exp(cumsum)
+        total_return = cum_series.iloc[-1] - 1
 
-        # Sharpe Ratio
-        if strategy_returns.std() > 0:
-            sharpe = (strategy_returns.mean() / strategy_returns.std()) * np.sqrt(252 * 1440)
+        # Max Drawdown
+        rolling_max = cum_series.cummax()
+        drawdown = (cum_series - rolling_max) / rolling_max
+        max_dd = drawdown.min()
+
+        # Sharpe (annualized)
+        periods_per_year = {
+            '1T':   252 * 1440,
+            '2T':   252 * 720,
+            '5T':   252 * 288,
+            '15T':  252 * 96,
+        }
+        # پیدا کردن timeframe از فاصله زمانی
+        if len(df) > 1:
+            avg_minutes = (df.index[-1] - df.index[0]).total_seconds() / 60 / len(df)
+            ann_factor = 252 * 1440 / max(avg_minutes, 1)
         else:
-            sharpe = 0.0
+            ann_factor = 252 * 1440
+
+        std = strat_ret.std()
+        sharpe = (strat_ret.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
+
+        # Win Rate
+        wins = (strat_ret > 0).sum()
+        win_rate = wins / len(strat_ret) * 100
 
         return {
-            'Window': window,
-            'Z_Entry': z_entry,
-            'Z_Exit': z_exit,
-            'Total_Return_%': round(cumulative_return * 100, 4),
-            'Max_Drawdown_%': round(max_drawdown * 100, 4),
-            'Total_Trades': total_trades,
-            'Sharpe': round(sharpe, 3),
+            'Window':          window,
+            'Z_Entry':         z_entry,
+            'Z_Exit':          z_exit,
+            'Total_Return_%':  round(total_return * 100, 4),
+            'Max_Drawdown_%':  round(max_dd * 100, 4),
+            'Sharpe':          round(sharpe, 3),
+            'Win_Rate_%':      round(win_rate, 2),
+            'Total_Trades':    total_trades,
         }
 
-    def run_all_timeframes(self):
-        timeframes = ['15min', '5min', '2min', '1min']
-        windows = [50, 100, 150, 200]
-        z_entries = [2.0, 2.5, 3.0]
-        z_exits = [0.0, 0.5]
+    # ──────────────────────────────────────────
+    def run_optimization(self):
+        # تایم‌فریم‌ها با فرمت pandas
+        timeframes = {
+            '15T': '15 دقیقه',
+            '5T':  '5 دقیقه',
+            '2T':  '2 دقیقه',
+            '1T':  '1 دقیقه',
+        }
+
+        windows   = [50, 100, 150, 200]
+        z_entries = [1.5, 2.0, 2.5, 3.0]
+        z_exits   = [0.0, 0.5, 1.0]
+
         combinations = list(itertools.product(windows, z_entries, z_exits))
+        logging.info(f"تعداد ترکیب برای هر تایم‌فریم: {len(combinations)}")
 
-        all_results = pd.DataFrame()
+        all_results = []
 
-        for tf in timeframes:
-            tf_data = self.resample_data(tf)
-            logging.info(f"Grid Search روی {tf} ({len(tf_data):,} کندل) - {len(combinations)} ترکیب...")
+        for tf_code, tf_name in timeframes.items():
+            tf_data = self.resample_to_timeframe(tf_code)
+            n_candles = len(tf_data)
 
-            results = []
+            logging.info(f"\n{'─'*50}")
+            logging.info(f"تایم‌فریم {tf_name} ({tf_code}) | {n_candles:,} کندل")
+
+            if n_candles < 500:
+                logging.warning(f"⚠️ کندل خیلی کم برای {tf_code}، رد شد")
+                continue
+
+            tf_results = []
             for window, z_entry, z_exit in combinations:
-                res = self.backtest(tf_data, window, z_entry, z_exit)
-                if res and res['Total_Trades'] > 20:
-                    res['Timeframe'] = tf
-                    results.append(res)
+                res = self.backtest_single(tf_data, window, z_entry, z_exit)
+                if res:
+                    res['Timeframe'] = tf_name
+                    res['TF_Code']   = tf_code
+                    tf_results.append(res)
 
-            if results:
-                df_res = pd.DataFrame(results)
-                df_res = df_res.sort_values(by='Total_Return_%', ascending=False)
-                logging.info(f"✅ {tf}: {len(df_res)} نتیجه معتبر یافت شد")
-                all_results = pd.concat([all_results, df_res.head(5)], ignore_index=True)
+            if tf_results:
+                df_tf = pd.DataFrame(tf_results)
+                df_tf = df_tf.sort_values('Total_Return_%', ascending=False)
+                top5 = df_tf.head(5)
+                all_results.append(top5)
+                logging.info(f"✅ {tf_name}: {len(tf_results)} نتیجه معتبر | بهترین بازده: {top5.iloc[0]['Total_Return_%']:.2f}%")
             else:
-                logging.warning(f"⚠️ {tf}: هیچ نتیجه معتبری یافت نشد")
+                logging.warning(f"⚠️ {tf_name}: هیچ نتیجه معتبری یافت نشد")
 
-        return all_results
+        if not all_results:
+            return pd.DataFrame()
+
+        return pd.concat(all_results, ignore_index=True)
 
 
+# ══════════════════════════════════════════════════
 if __name__ == "__main__":
     optimizer = DukascopyMultiTimeframeOptimizer()
+
+    # بارگذاری دیتا
     optimizer.load_base_m1_data()
 
-    final_report = optimizer.run_all_timeframes()
+    # اجرای بهینه‌سازی
+    logging.info("\nشروع Grid Search روی همه تایم‌فریم‌ها...")
+    report = optimizer.run_optimization()
 
-    if final_report.empty:
+    if report.empty:
         logging.error("❌ هیچ نتیجه‌ای تولید نشد!")
-    else:
-        cols = ['Timeframe', 'Window', 'Z_Entry', 'Z_Exit',
-                'Total_Return_%', 'Max_Drawdown_%', 'Sharpe', 'Total_Trades']
-        final_report = final_report[cols]
-        final_report = final_report.sort_values('Total_Return_%', ascending=False)
+        exit(1)
 
-        output_file = "ultimate_5years_mtf_report.csv"
-        final_report.to_csv(output_file, index=False)
+    # مرتب‌سازی نهایی
+    cols = [
+        'Timeframe', 'Window', 'Z_Entry', 'Z_Exit',
+        'Total_Return_%', 'Max_Drawdown_%',
+        'Sharpe', 'Win_Rate_%', 'Total_Trades'
+    ]
+    report = report[cols].sort_values('Total_Return_%', ascending=False)
 
-        print(f"\n{'='*60}")
-        print(f"✅ بک‌تست پایان یافت | نتایج: {output_file}")
-        print(f"{'='*60}")
-        print(final_report.to_string(index=False))
+    # ذخیره
+    output_file = "ultimate_5years_mtf_report.csv"
+    report.to_csv(output_file, index=False)
+
+    print(f"\n{'='*60}")
+    print(f"✅ بک‌تست کامل شد")
+    print(f"📄 فایل: {output_file}")
+    print(f"{'='*60}")
+    print(report.to_string(index=False))
