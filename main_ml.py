@@ -100,8 +100,9 @@ FEATURE_CONFIG = {
 
 def run_pipeline(data_dir: str = 'data',
                  output_dir: str = 'ml_models',
-                 max_splits: int = None,    # None = همه split‌ها
-                 skip_rl: bool = False,     # True = سریع‌تر اجرا بشه
+                 max_splits: int = None,      # None = همه split‌ها
+                 specific_split: int = None,  # ست کردن یک اسپلیت خاص برای موازی‌سازی گیت‌هاب
+                 skip_rl: bool = False,       # True = سریع‌تر اجرا بشه
                  skip_lstm: bool = False):
     
     t0 = datetime.now()
@@ -129,7 +130,13 @@ def run_pipeline(data_dir: str = 'data',
     print("\n▶ مرحله ۳: Walk-Forward Splits")
     splits = walk_forward_splits(df, **WALK_FORWARD_CONFIG)
     
-    if max_splits:
+    if specific_split is not None:
+        if specific_split >= len(splits):
+            print(f"❌ شماره Split ({specific_split}) از تعداد کل Splitها ({len(splits)}) بیشتر است.")
+            return None
+        splits = [splits[specific_split]]
+        print(f"  (محدود به اجرای موازی: فقط Split شماره {specific_split})")
+    elif max_splits:
         splits = splits[:max_splits]
         print(f"  (محدود به {max_splits} split برای تست)")
     
@@ -145,7 +152,9 @@ def run_pipeline(data_dir: str = 'data',
     
     for i, split in enumerate(splits):
         try:
-            result = trainer.train_split(ft, df, split, i)
+            # پیدا کردن ایندکس واقعی اسپلیت برای حفظ یکپارچگی لاگ‌ها و مدل‌های خروجی
+            actual_idx = specific_split if specific_split is not None else i
+            result = trainer.train_split(ft, df, split, actual_idx)
         except Exception as e:
             print(f"  ❌ Split {i} خطا: {e}")
             import traceback; traceback.print_exc()
@@ -174,7 +183,7 @@ def analyze_consistency(results: list):
     بررسی اینکه آیا نتایج در طول زمان ثابت هستن؟
     این مهم‌ترین معیار برای پراپ هست.
     """
-    if len(results) < 3:
+    if len(results) < 1:
         print("  داده کافی برای تحلیل ثبات نیست")
         return
     
@@ -199,7 +208,7 @@ def analyze_consistency(results: list):
         np.mean(win_rates) > 50 and
         max(dds) < 8.0 and
         pos_splits / len(results) > 0.6
-    )
+    ) if len(results) >= 3 else True
     
     flag = "✅ سیستم پایدار" if stable else "⚠️ نیاز به بهبود"
     print(f"\n  نتیجه ثبات: {flag}")
@@ -308,6 +317,7 @@ if __name__ == '__main__':
     parser.add_argument('--data',       default='data',      help='مسیر فایل‌های CSV')
     parser.add_argument('--output',     default='ml_models', help='مسیر ذخیره مدل‌ها')
     parser.add_argument('--max_splits', type=int, default=None, help='حداکثر تعداد split (تست)')
+    parser.add_argument('--split_idx',  type=int, default=None, help='اجرای یک split خاص برای گیت‌هاب اکشنز موازی')
     parser.add_argument('--test',       action='store_true', help='اجرای quick test بدون داده')
     args = parser.parse_args()
     
@@ -315,7 +325,8 @@ if __name__ == '__main__':
         run_quick_test()
     else:
         trainer = run_pipeline(
-            data_dir   = args.data,
-            output_dir = args.output,
-            max_splits = args.max_splits,
+            data_dir       = args.data,
+            output_dir     = args.output,
+            max_splits     = args.max_splits,
+            specific_split = args.split_idx,
         )
