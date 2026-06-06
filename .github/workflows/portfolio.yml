@@ -1,0 +1,31 @@
+name: Portfolio Master Backtest
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'portfolio_master.py'
+  workflow_dispatch: 
+
+jobs:
+  run-optimization:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn
+
+      - name: 🚀 Run Portfolio Master
+        run: python portfolio_master.py
