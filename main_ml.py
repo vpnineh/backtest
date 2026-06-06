@@ -126,9 +126,16 @@ def run_pipeline(data_dir: str = 'data',
           f"long={( ft['target']==1).sum():,} | "
           f"short={(ft['target']==2).sum():,}")
     
-    # ── ۳. Walk-Forward Splits ──
+        # ── ۳. Walk-Forward Splits ──
     print("\n▶ مرحله ۳: Walk-Forward Splits")
-    splits = walk_forward_splits(df, **WALK_FORWARD_CONFIG)
+    # embargo دقیقاً برابر label_horizon تا نشت لیبل به split بعدی مسدود شود.
+    # splits روی ft ساخته می‌شود (نه df) چون ردیف‌های انتهایی با لیبل NaN از ft حذف شده‌اند.
+    splits = walk_forward_splits(
+        ft,
+        **WALK_FORWARD_CONFIG,
+        embargo_bars=FEATURE_CONFIG['label_horizon'],
+    )
+
     
     if specific_split is not None:
         if specific_split >= len(splits):
@@ -287,7 +294,10 @@ def run_quick_test():
     
     # Splits
     print("\n▶ Walk-Forward Splits")
-    splits = walk_forward_splits(df, train_years=3, val_years=0.5, test_years=0.5, step_months=6)
+        splits = walk_forward_splits(
+        ft, train_years=3, val_years=0.5, test_years=0.5,
+        step_months=6, embargo_bars=40,   # = label_horizon همین تابع
+    )
     
     if not splits:
         print("❌ داده کافی نیست حتی برای quick test")
