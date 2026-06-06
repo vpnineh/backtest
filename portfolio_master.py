@@ -1,5 +1,5 @@
 """
-CorrArb Portfolio ML Master — v9.2 (Dual-Logic + Auto-Cleanup + Fix Indexing)
+CorrArb Portfolio ML Master — v9.3 (Accurate PnL & Proportional Costs)
 """
 
 import os
@@ -23,7 +23,8 @@ class Config:
     max_daily_loss_pct = 0.05       
     max_total_dd_pct   = 0.10       
     
-    risk_per_trade     = 0.005      
+    risk_per_trade     = 0.005      # ریسک 0.5% اکانت در هر پوزیشن
+    assumed_sl_pct     = 0.004      # حد ضرر فرضی: 0.4% حرکت قیمت (حدود 40 پیپ)
     max_concurrent     = 3          
     
     ml_prob_threshold  = 0.55       
@@ -34,8 +35,8 @@ class Config:
     trend_atr_thresh   = 0.0015     
     
     lot_size           = 100_000
-    commission         = 7.0
-    pip                = 0.0001
+    commission         = 7.0        # 7 دلار کمیسیون به ازای 1 لات
+    spread_pips        = 1.2        # اسپرد پایه
 
 PORTFOLIO_PAIRS = {
     'EURGBP': ('EURUSD', 'GBPUSD'),
@@ -44,11 +45,10 @@ PORTFOLIO_PAIRS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  اتوماسیون پوشه (Unzip و پاک‌سازی هوشمند) و بهینه‌سازی حافظه (RAM)
+#  اتوماسیون پوشه و بهینه‌سازی حافظه
 # ═══════════════════════════════════════════════════════════════════════════
 def clean_and_extract_data(data_path='data'):
     zips = glob.glob(os.path.join(data_path, '*.zip'))
-    
     if zips:
         print(f"📦 Found {len(zips)} ZIP files. Extracting and cleaning up...")
         for z in zips:
@@ -56,19 +56,16 @@ def clean_and_extract_data(data_path='data'):
                 with zipfile.ZipFile(z, 'r') as zip_ref:
                     zip_ref.extractall(data_path)
                 os.remove(z) 
-            except Exception as e:
-                print(f"⚠️ Failed to process {z}: {e}")
+            except Exception: pass
         
         txt_files = glob.glob(os.path.join(data_path, '*.txt'))
         for txt in txt_files:
-            try:
-                os.remove(txt)
-            except Exception:
-                pass
+            try: os.remove(txt)
+            except Exception: pass
                 
-        print(f"✅ Cleanup complete: Removed {len(zips)} ZIPs and {len(txt_files)} TXT files. Only CSVs remain.")
+        print("✅ Cleanup complete. Only CSVs remain.")
     else:
-        print("✅ Directory is clean. No ZIPs found, reading directly from CSVs.")
+        print("✅ Directory is clean. Reading directly from CSVs.")
 
 def load_symbol(symbol, all_csvs):
     files = [f for f in all_csvs if symbol in f.upper()]
@@ -89,8 +86,7 @@ def load_symbol(symbol, all_csvs):
             }).dropna()
             
             frames.append(resampled)
-        except Exception as e:
-            pass
+        except Exception: pass
             
     if not frames: return None
     final_df = pd.concat(frames).sort_index()
@@ -101,7 +97,7 @@ def calc_atr(h, l, c, period=14):
     return tr.rolling(period).mean()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  پردازش داده‌ها و هوش مصنوعی (Dual-Logic Feature Engineering)
+#  Dual-Logic Feature Engineering
 # ═══════════════════════════════════════════════════════════════════════════
 def process_portfolio_ml():
     clean_and_extract_data('data')
@@ -116,7 +112,6 @@ def process_portfolio_ml():
         df_quote = load_symbol(quote, all_csvs)
         
         if df_base is None or df_quote is None:
-            print(f"     ⚠️ Missing data for {pair_name}")
             continue
             
         raw = df_base.join(df_quote, lsuffix='_b', rsuffix='_q').dropna()
@@ -170,12 +165,11 @@ def process_portfolio_ml():
     return ml_data
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  موتور اجرای پورتفولیو و پراپ
+#  موتور اجرای پورتفولیو (با محاسبه دقیق لات، اهرم و کارمزد)
 # ═══════════════════════════════════════════════════════════════════════════
 def run_portfolio_backtest(ml_data):
     print("\n🚀 Running Dual-Logic Portfolio Backtest (2023-2025)...")
     
-    # راه‌حل ایمن برای ادغام زمان‌ها (رفع خطای پانداز در گیت‌هاب)
     all_timestamps = []
     for df in ml_data.values():
         all_timestamps.extend(df.index.tolist())
@@ -208,8 +202,20 @@ def run_portfolio_backtest(ml_data):
                 if sig != 0 and active_trades_this_step < Config.max_concurrent:
                     raw_ret = row['future_ret']
                     trade_ret = raw_ret if sig == 1 else -raw_ret
-                    trade_pnl = trade_ret * (eq * Config.risk_per_trade / 0.005) 
-                    trade_pnl -= 15.0 # کسر کمیسیون و اسپرد تخمینی
+                    
+                    # محاسبه ارزش پوزیشن بر اساس ریسک و استاپ‌لاس
+                    position_size_usd = (eq * Config.risk_per_trade) / Config.assumed_sl_pct
+                    
+                    # سود و زیان ناخالص
+                    gross_pnl = trade_ret * position_size_usd
+                    
+                    # محاسبه حجم به لات و کسر دقیق کمیسیون و اسپرد
+                    lots = position_size_usd / Config.lot_size
+                    cost_per_lot = Config.commission + (Config.spread_pips * 10) # ~ 19$ for 1 lot
+                    transaction_costs = lots * cost_per_lot
+                    
+                    # سود خالص معامله
+                    trade_pnl = gross_pnl - transaction_costs
                     
                     step_pnl += trade_pnl
                     active_trades_this_step += 1
@@ -233,7 +239,7 @@ def run_portfolio_backtest(ml_data):
     pf = wins['pnl'].sum() / abs(losses['pnl'].sum()) if not losses.empty else float('inf')
     
     print("\n" + "═" * 65)
-    print(" ▌  Portfolio Master v9.2 (Dual-Logic OOS Results)  ▐")
+    print(" ▌  Portfolio Master v9.3 (Accurate PnL & Proportional Costs)  ▐")
     print("═" * 65)
     print(f" Total Trades Executed: {len(df_res):,}")
     print(f" Win Rate:              {(len(wins)/len(df_res))*100:.1f}%")
