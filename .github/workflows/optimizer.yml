@@ -29,4 +29,4 @@ jobs:
           pip install pandas numpy
 
       - name: 🚀 Run Grid Search Optimizer
-        run: python optimizer.py
+        run: python ml_optimizer.py
