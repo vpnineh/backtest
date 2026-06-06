@@ -1,7 +1,7 @@
 """
-CorrArb Prop Simulator — v6 Prop Master
+CorrArb Prop Simulator — v6 Prop Master (Optimized 15-Year Parameters)
 هدف: رعایت سخت‌گیرانه قوانین پراپ + فیلترهای پیشرفته آماری
-داده: 2020 تا 2025 (فریم 15 دقیقه)
+داده: 2010 تا 2025 (فریم 15 دقیقه)
 """
 
 import pandas as pd
@@ -13,7 +13,7 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONFIG — تنظیمات منطبق بر قوانین پراپ و استراتژی آماری
+#  CONFIG — تنظیمات منطبق بر قوانین پراپ و بهترین خروجی تست ۱۵ ساله
 # ═══════════════════════════════════════════════════════════════════════════
 class Config:
     # ── قوانین پراپ فرم (Strict Rules) ──
@@ -40,27 +40,27 @@ class Config:
     min_lot  = 0.01
     warmup   = 500
 
-    # ── استراتژی آماری (Log Ratio) ──
+    # ── استراتژی آماری (بهینه‌شده برای بقا در 15 سال) ──
     z_fast_period      = 96         # 24 ساعت
-    z_entry            = 2.1        # مرز ورود
+    z_entry            = 2.1        # مرز ورود (محتاطانه و ایمن)
     z_exit             = 0.1        # مرز خروج (بازگشت به میانگین)
     z_stop_margin      = 4.0        # کات‌لاس داینامیک در صورت تغییر رژیم بازار
     min_net_profit_usd = 10.0       # فیلتر حداقل سود خالص (جلوگیری از درجا زدن)
 
     # ── فیلترها ──
     corr_period        = 96         # تایم فریم محاسبه همبستگی (24 ساعته)
-    corr_min           = 0.80       # حداقل همبستگی برای ورود مجاز
+    corr_min           = 0.80       # فیلتر همبستگی (بالا تنظیم شده چون ML نداریم)
     hour_start         = 2          # سشن لندن و نیویورک
     hour_end           = 19
     trade_days         = [0, 1, 2, 3, 4] # دوشنبه تا جمعه
     max_trades_day     = 3
 
-    # خروج‌های اضطراری 
+    # ── خروج‌های اضطراری ──
     sl_pips            = 40.0
     tp_pips            = 80.0
-    time_stop_bars     = 96         # حداکثر ۱ روز ماندن در پوزیشن
+    time_stop_bars     = 72         # حداکثر 18 ساعت ماندن در پوزیشن (بهینه‌شده)
     
-    # فیلتر نوسان (ATR)
+    # ── فیلتر نوسان (ATR) ──
     atr_period         = 14
     atr_ma_period      = 96
     atr_max_mult       = 3.0
@@ -68,7 +68,7 @@ class Config:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  بارگذاری داده
+#  بارگذاری داده (باگ Indexing گیت‌هاب در این بخش رفع شد)
 # ═══════════════════════════════════════════════════════════════════════════
 def load_data() -> pd.DataFrame:
     files_eur = sorted(glob.glob('data/*EURUSD*.csv'))
@@ -83,13 +83,19 @@ def load_data() -> pd.DataFrame:
                 p, sep=';', header=None,
                 names=['ts', 'o', 'h', 'l', 'c', 'v']
             )
-            df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
-            df = df.set_index('ts')
-            df = df[~df.index.duplicated(keep='last')]
-            df.columns = [f'{col}_{suffix}' for col in df.columns]
             frames.append(df)
-        return pd.concat(frames).sort_index()
+            
+        df = pd.concat(frames).sort_values('ts')
+        df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
+        
+        # رفع ارور Unalignable boolean Series
+        df = df.drop_duplicates(subset=['ts'], keep='last')
+        df = df.set_index('ts')
+        
+        df.columns = [f'{col}_{suffix}' for col in df.columns]
+        return df
 
+    print("  Loading and syncing datasets...")
     eur = read_pair(files_eur, 'eur')
     gbp = read_pair(files_gbp, 'gbp')
     raw = eur.join(gbp, how='inner').dropna()
@@ -131,7 +137,7 @@ def compute_signals(df: pd.DataFrame) -> dict:
     z_std     = log_ratio.rolling(C.z_fast_period).std()
     z_score   = (log_ratio - z_mean) / z_std.replace(0, np.nan)
 
-    # ── Correlation Guard (جدید) ──
+    # ── Correlation Guard ──
     ret_eur = df['c_eur'].pct_change()
     ret_gbp = df['c_gbp'].pct_change()
     corr_series = ret_eur.rolling(C.corr_period).corr(ret_gbp)
@@ -287,7 +293,7 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
             current_pnl = calc_dynamic_pnl(d, ep, cp, pos['lot'], cg)
             current_eq = acc['equity'] + current_pnl
             
-            # 1. تست دراداون پراپ (Daily Limit & Total Limit)
+            # 1. تست دراداون پراپ
             daily_limit = day_start_eq * (1 - C.max_daily_loss_pct)
             blown_daily = current_eq <= daily_limit
             blown_total = current_eq <= PROP_FLOOR
@@ -295,14 +301,13 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
             if blown_daily or blown_total:
                 acc['blown'] = True
                 acc['blown_rsn'] = "DailyDD" if blown_daily else "TotalDD"
-                # ثبت معامله در نقطه سوختن اکانت
                 rec = {**pos, 'exit': cp, 'exit_ts': ts, 'pnl': current_pnl, 'status': "BLOWN"}
                 acc['trades'].append(rec)
                 all_trades.append(rec)
                 acc['open_pos'] = None
                 continue
 
-            # 2. تست Z-Stop (کات لاس آماری داینامیک)
+            # 2. تست Z-Stop
             hit_z_stop = False
             if not np.isnan(zn):
                 if d == 1 and zn <= -C.z_stop_margin: hit_z_stop = True
@@ -314,16 +319,14 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
                 if d == 1 and zn >= -C.z_exit: hit_z_exit = True
                 if d == -1 and zn <= C.z_exit: hit_z_exit = True
             
-            # اگر Z-Exit فعال شد اما سود خالص کافی نبود، خروج لغو می‌شود
             if hit_z_exit and current_pnl < C.min_net_profit_usd:
                 hit_z_exit = False
 
-            # 4. تست‌های کلاسیک (TimeStop, SL, TP)
+            # 4. تست‌های کلاسیک
             hit_sl = (d == 1 and cp <= pos['sl']) or (d == -1 and cp >= pos['sl'])
             hit_tp = (d == 1 and cp >= pos['tp']) or (d == -1 and cp <= pos['tp'])
             time_stop = (bar - pos['entry_bar']) >= C.time_stop_bars
 
-            # خروج نهایی در صورت فعال شدن هر یک از تریگرها
             if hit_z_exit or hit_z_stop or hit_sl or hit_tp or time_stop:
                 exit_px = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
                 st = 'SL' if hit_sl else ('TP' if hit_tp else ('Z-Stop' if hit_z_stop else ('TimeStop' if time_stop else 'Z-Exit')))
@@ -346,13 +349,11 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
             acc_logs.append({'account': acc_num, 'start_ts': acc['start_ts'], 'end_ts': ts, 'reason': "TARGET_HIT", 'pnl': acc['equity'] - C.initial_balance})
             print(f"    💰 #{acc_num:>3} | {ts.date()} | Target Hit: ${w:>7.2f} | Total Bank: ${total_withdrawn:>9.2f}")
             acc_num += 1
-            # ریست کامل به اکانت جدید طبق قوانین
             acc = new_acc(ts)
             day_start_eq = acc['equity']
             trades_today, pending_sig = 0, 0
             continue
 
-        # ثبت سیگنال بعدی
         if acc['open_pos'] is None and not acc['blown'] and trades_today < C.max_trades_day:
             if sig_a[bar] != 0:
                 pending_sig = sig_a[bar]
@@ -379,11 +380,10 @@ def print_report(results: dict):
     wr = len(wins) / len(df_t) * 100
     pf = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) > 0 else float('inf')
     
-    # تفکیک دلایل خروج
     exit_reasons = df_t['status'].value_counts()
     
     print("\n" + "═" * 65)
-    print(" ▌  CorrArb Prop Simulator v6 (Prop Master) — Report  ▐")
+    print(" ▌  CorrArb Prop Simulator v6 (15-Year Optimized)  ▐")
     print("═" * 65)
     print(f" Total Trades:    {len(df_t):,}")
     print(f" Win Rate:        {wr:.2f}%")
