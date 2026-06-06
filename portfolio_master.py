@@ -27,12 +27,12 @@ class Config:
     assumed_sl_pct     = 0.004      # حد ضرر فرضی: 0.4% حرکت قیمت (حدود 40 پیپ)
     max_concurrent     = 3          
     
-    ml_prob_threshold  = 0.55       
-    train_end_date     = '2022-12-31'
-    test_start_date    = '2023-01-01'
+    ml_prob_threshold  = 0.60       
+    train_end_date     = '2020-12-31'
+    test_start_date    = '2021-01-01'
 
-    z_entry            = 2.0        
-    trend_atr_thresh   = 0.0015     
+    z_entry            = 2.25        
+    trend_atr_thresh   = 0.0012     
     
     lot_size           = 100_000
     commission         = 7.0        # 7 دلار کمیسیون به ازای 1 لات
