@@ -317,10 +317,12 @@ class WalkForwardTrainer:
         
         feat_cols = get_feature_cols(ft)
         
-        # ── داده train/val ──
-        tr_ft = ft.loc[split['train']].dropna()
-        vl_ft = ft.loc[split['val']].dropna()
-        ts_ft = ft.loc[split['test']].dropna()
+                # ── داده train/val ──
+        # فقط ردیف‌هایی که فیچر یا لیبلِ ناقص دارند حذف شوند، نه هر NaN تصادفی.
+        required = feat_cols + ['target_ret', 'target']
+        tr_ft = ft.loc[split['train']].dropna(subset=required)
+        vl_ft = ft.loc[split['val']].dropna(subset=required)
+        ts_ft = ft.loc[split['test']].dropna(subset=required)
         
         if len(tr_ft) < 200 or len(ts_ft) < 50:
             print("  ⚠️ داده کافی نیست — skip")
@@ -350,7 +352,9 @@ class WalkForwardTrainer:
         
         # ── Model C (RL) ──
         tr_prices  = df_prices.loc[split['train']]
+        # feat_cols همگی در required بودند، پس دیگر NaN نمانده؛ این fillna صرفاً محافظ است.
         tr_ft_rl   = tr_ft[feat_cols].fillna(0)
+
         
         rl_env = PropTradingEnv(tr_ft_rl, tr_prices, lookback=24, training=True)
         rl_agent = SimplePPOAgent(rl_env.obs_dim)
