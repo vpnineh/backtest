@@ -28,4 +28,4 @@ jobs:
           pip install pandas numpy scikit-learn
 
       - name: 🚀 Run Portfolio Master
-        run: python ml_portfolio_master.py
+        run: python portfolio_master.py
