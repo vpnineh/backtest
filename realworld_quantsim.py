@@ -500,21 +500,19 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
             tp  = ep + sv * C.tp_pips * pip
 
             # بررسی immediate SL
-            hi = high_a[bar]
-            lo = low_a[bar]
-            if not ((sv == 1 and lo <= sl) or (sv == -1 and hi >= sl)):
-                acc['open_pos'] = dict(
-                    account    = acc_num,
-                    dir        = sv,
-                    lot        = lot,
-                    entry      = ep,
-                    sl         = sl,
-                    tp         = tp,
-                    entry_ts   = ts,
-                    entry_bar  = bar,
-                    initial_sl = sl,
-                )
-                trades_today += 1
+            acc['open_pos'] = dict(
+                account    = acc_num,
+                dir        = sv,
+                lot        = lot,
+                entry      = ep,
+                sl         = sl,
+                tp         = tp,
+                entry_ts   = ts,
+                entry_bar  = bar,
+                initial_sl = sl,
+            )
+            trades_today += 1
+
 
         pending_sig = 0
 
@@ -534,14 +532,17 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
             hit_sl = (d == 1 and lo <= sl) or (d == -1 and hi >= sl)
             hit_tp = (d == 1 and hi >= tp) or (d == -1 and lo <= tp)
 
-            # Z-exit
+            # Z-exit (بستن روی close همان کندل، نه روی tp)
             zn = z_a[bar]
-            if not np.isnan(zn) and abs(zn) < C.z_exit:
-                hit_tp = True
+            hit_z = (not np.isnan(zn)) and abs(zn) < C.z_exit
 
             # هر دو → SL
             if hit_sl and hit_tp:
                 hit_tp = False
+            # SL/TP درون‌کندلی بر Z-exit مقدم است
+            if hit_sl or hit_tp:
+                hit_z = False
+
 
             # ── Intra-candle worst-case blown check ──
             if not hit_sl:
@@ -611,9 +612,15 @@ def run_backtest(df: pd.DataFrame, signals: dict) -> dict:
                 continue
 
             # ── بستن روی SL / TP ──
-            if hit_sl or hit_tp:
-                exit_px = sl if hit_sl else tp
-                st      = 'SL' if hit_sl else 'TP'
+            # ── بستن روی SL / TP / Z-exit ──
+            if hit_sl or hit_tp or hit_z:
+                if hit_sl:
+                    exit_px, st = sl, 'SL'
+                elif hit_tp:
+                    exit_px, st = tp, 'TP'
+                else:
+                    exit_px, st = cp, 'Z-exit'   # close واقعی کندل
+
                 raw     = d*(exit_px-ep)*pos['lot']*ls
                 pnl     = raw - trade_cost(pos['lot'])
                 acc['equity'] += pnl
