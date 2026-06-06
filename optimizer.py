@@ -59,6 +59,8 @@ class BaseConfig:
     atr_min_mult       = 0.5
 
 # ── توابع پایه (دقیقاً مشابه نسخه ۶) ──
+# این تابع را با تابع قبلی در کد optimizer.py جایگزین کنید
+
 def load_data() -> pd.DataFrame:
     print("  Loading 15 Years of Data... Please wait.")
     files_eur = sorted(glob.glob('data/*EURUSD*.csv'))
@@ -68,9 +70,31 @@ def load_data() -> pd.DataFrame:
         frames = [pd.read_csv(p, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v']) for p in paths]
         df = pd.concat(frames).sort_values('ts')
         df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
-        df = df.set_index('ts')[~df['ts'].duplicated(keep='last')]
+        
+        # --- بخش اصلاح‌شده ---
+        df = df.drop_duplicates(subset=['ts'], keep='last') # اول حذف تکراری‌ها
+        df = df.set_index('ts')                             # بعد تنظیم ایندکس
+        # ---------------------
+        
         df.columns = [f'{col}_{suffix}' for col in df.columns]
         return df
+
+    raw = read_pair(files_eur, 'eur').join(read_pair(files_gbp, 'gbp'), how='inner').dropna()
+    df = pd.DataFrame({
+        'o_eur': raw['o_eur'].resample('15min').first(),
+        'c_eur': raw['c_eur'].resample('15min').last(),
+        'h_eur': raw['h_eur'].resample('15min').max(),
+        'l_eur': raw['l_eur'].resample('15min').min(),
+        'o_gbp': raw['o_gbp'].resample('15min').first(),
+        'c_gbp': raw['c_gbp'].resample('15min').last(),
+        'h_gbp': raw['h_gbp'].resample('15min').max(),
+        'l_gbp': raw['l_gbp'].resample('15min').min(),
+    }).dropna()
+    df['c_eg'] = df['c_eur'] / df['c_gbp']
+    df['o_eg'] = df['o_eur'] / df['o_gbp']
+    df = df[df.index.weekday < 5]
+    print(f"✅ Data Loaded: {len(df):,} Candles | {df.index[0].date()} → {df.index[-1].date()}")
+    return df
 
     raw = read_pair(files_eur, 'eur').join(read_pair(files_gbp, 'gbp'), how='inner').dropna()
     df = pd.DataFrame({
