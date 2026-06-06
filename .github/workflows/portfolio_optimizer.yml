@@ -1,0 +1,20 @@
+name: Portfolio ML Execution
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: 
+
+jobs:
+  run-portfolio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Libraries
+        run: pip install pandas numpy scikit-learn
+      - name: Execute Portfolio Master
+        run: python portfolio_master.py
