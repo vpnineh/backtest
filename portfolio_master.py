@@ -1,5 +1,5 @@
 """
-CorrArb Portfolio ML Master — v9.1 (Dual-Logic + Auto-Unzip + RAM Optimized)
+CorrArb Portfolio ML Master — v9.2 (Dual-Logic + Auto-Cleanup + Fix Indexing)
 """
 
 import os
@@ -44,20 +44,31 @@ PORTFOLIO_PAIRS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  اتوماسیون پوشه (Unzip) و بهینه‌سازی حافظه (RAM)
+#  اتوماسیون پوشه (Unzip و پاک‌سازی هوشمند) و بهینه‌سازی حافظه (RAM)
 # ═══════════════════════════════════════════════════════════════════════════
-def extract_zips(data_path='data'):
+def clean_and_extract_data(data_path='data'):
     zips = glob.glob(os.path.join(data_path, '*.zip'))
+    
     if zips:
-        print(f"📦 Found {len(zips)} ZIP files. Extracting (this saves time for future runs)...")
+        print(f"📦 Found {len(zips)} ZIP files. Extracting and cleaning up...")
         for z in zips:
             try:
                 with zipfile.ZipFile(z, 'r') as zip_ref:
                     zip_ref.extractall(data_path)
-                os.remove(z) # پاک کردن زیپ برای خلوت شدن فضا
+                os.remove(z) 
             except Exception as e:
-                print(f"⚠️ Failed to extract {z}: {e}")
-        print("✅ Extraction complete.")
+                print(f"⚠️ Failed to process {z}: {e}")
+        
+        txt_files = glob.glob(os.path.join(data_path, '*.txt'))
+        for txt in txt_files:
+            try:
+                os.remove(txt)
+            except Exception:
+                pass
+                
+        print(f"✅ Cleanup complete: Removed {len(zips)} ZIPs and {len(txt_files)} TXT files. Only CSVs remain.")
+    else:
+        print("✅ Directory is clean. No ZIPs found, reading directly from CSVs.")
 
 def load_symbol(symbol, all_csvs):
     files = [f for f in all_csvs if symbol in f.upper()]
@@ -66,12 +77,10 @@ def load_symbol(symbol, all_csvs):
     frames = []
     for f in files:
         try:
-            # خواندن فایل
             df = pd.read_csv(f, sep=r'[;,]', engine='python', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
             df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S', errors='coerce')
             df = df.dropna(subset=['ts']).drop_duplicates('ts').set_index('ts').sort_index()
             
-            # تبدیل به 15 دقیقه در همین مرحله برای جلوگیری از پر شدن RAM سرور
             resampled = pd.DataFrame({
                 'o': df['o'].resample('15min').first(),
                 'h': df['h'].resample('15min').max(),
@@ -95,7 +104,7 @@ def calc_atr(h, l, c, period=14):
 #  پردازش داده‌ها و هوش مصنوعی (Dual-Logic Feature Engineering)
 # ═══════════════════════════════════════════════════════════════════════════
 def process_portfolio_ml():
-    extract_zips('data') # استخراج خودکار
+    clean_and_extract_data('data')
     
     print("📁 Loading data and applying Dual-Logic ML Features...")
     all_csvs = glob.glob('data/*.csv')
@@ -165,7 +174,12 @@ def process_portfolio_ml():
 # ═══════════════════════════════════════════════════════════════════════════
 def run_portfolio_backtest(ml_data):
     print("\n🚀 Running Dual-Logic Portfolio Backtest (2023-2025)...")
-    master_index = pd.DataFrame(index=pd.concat([df.index for df in ml_data.values()]).unique()).sort_index().index
+    
+    # راه‌حل ایمن برای ادغام زمان‌ها (رفع خطای پانداز در گیت‌هاب)
+    all_timestamps = []
+    for df in ml_data.values():
+        all_timestamps.extend(df.index.tolist())
+    master_index = pd.DatetimeIndex(sorted(list(set(all_timestamps))))
     
     eq = Config.initial_balance
     day_start_eq = eq
@@ -195,7 +209,7 @@ def run_portfolio_backtest(ml_data):
                     raw_ret = row['future_ret']
                     trade_ret = raw_ret if sig == 1 else -raw_ret
                     trade_pnl = trade_ret * (eq * Config.risk_per_trade / 0.005) 
-                    trade_pnl -= 15.0 # کسر کمیسیون و اسپرد
+                    trade_pnl -= 15.0 # کسر کمیسیون و اسپرد تخمینی
                     
                     step_pnl += trade_pnl
                     active_trades_this_step += 1
@@ -219,7 +233,7 @@ def run_portfolio_backtest(ml_data):
     pf = wins['pnl'].sum() / abs(losses['pnl'].sum()) if not losses.empty else float('inf')
     
     print("\n" + "═" * 65)
-    print(" ▌  Portfolio Master v9.1 (Dual-Logic OOS Results)  ▐")
+    print(" ▌  Portfolio Master v9.2 (Dual-Logic OOS Results)  ▐")
     print("═" * 65)
     print(f" Total Trades Executed: {len(df_res):,}")
     print(f" Win Rate:              {(len(wins)/len(df_res))*100:.1f}%")
