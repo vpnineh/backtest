@@ -1,17 +1,16 @@
-name: ML CorrArb Pipeline
+name: ML CorrArb - Parallel Training
 
 on:
   workflow_dispatch: 
-    inputs:
-      max_splits:
-        description: 'Maximum Walk-Forward Splits (Leave empty for all)'
-        required: false
-        default: ''
 
 jobs:
-  run-backtest-and-train:
+  train-splits:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # حداکثر زمان گیت‌هاب اکشنز (۶ ساعت)
+    strategy:
+      fail-fast: false # اگر یک ماشین ارور داد، بقیه متوقف نشوند
+      matrix:
+        # برای 16 سال داده، حدود 20 اسپلیت خواهیم داشت. (از 0 تا 19)
+        split: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Checkout Repository
@@ -28,18 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run ML Pipeline
+      - name: Run Model Training for Split ${{ matrix.split }}
         run: |
-          if [ -z "${{ github.event.inputs.max_splits }}" ]; then
-            python main_ml.py --data data --output ml_models
-          else
-            python main_ml.py --data data --output ml_models --max_splits ${{ github.event.inputs.max_splits }}
-          fi
+          python main_ml.py --data data --output ml_models_${{ matrix.split }} --split_idx ${{ matrix.split }}
 
-      - name: Upload Models and Reports
+      - name: Upload Split ${{ matrix.split }} Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ML_Models_and_Results
-          path: ml_models/
-          retention-days: 14
+          name: Model_Split_${{ matrix.split }}
+          path: ml_models_${{ matrix.split }}/
+          retention-days: 10
