@@ -1,310 +1,644 @@
 """
-CorrArb Portfolio Master — v8 (ML + Multi-Asset)
-هدف: مدیریت همزمان چندین جفت‌ارز آربیتراژی، کنترل ریسک متمرکز و اعمال قوانین سخت‌گیرانه پراپ
+CorrArb Portfolio v9 — Dual-Logic (Mean-Reversion + Trend-Following)
+با تشخیص رژیم بازار (ADX + ATR-Ratio)
 """
 
 import os
-import zipfile
 import glob
 import pandas as pd
 import numpy as np
 import warnings
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  تنظیمات مرکزی پورتفولیو
-# ═══════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+ASSETS = [
+    'EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD',
+    'USDCAD', 'USDCHF', 'EURGBP', 'AUDNZD',
+    'XAUUSD', 'XAGUSD'
+]
+
+# نمادهایی که "روندساز" هستند — منطق متفاوت
+TREND_ASSETS = {'XAUUSD', 'XAGUSD'}
+
+# ─────────────────────────────────────────────
 class Config:
-    # ── قوانین پراپ فرم ──
     initial_balance    = 5_000.0
-    profit_target_pct  = 0.05       # 5% تارگت
-    max_daily_loss_pct = 0.05       # 5% افت روزانه مجاز
-    max_total_dd_pct   = 0.10       # 10% افت کل مجاز
+    risk_per_trade_pct = 0.01        # 1% ریسک هر ترید
+    profit_target_pct  = 0.08        # 8% سود = پاس پراپ
+    max_daily_loss_pct = 0.04        # 4% حد روزانه
+    max_total_dd_pct   = 0.08        # 8% دراداون کل
+    sl_pips            = 25          # استاپ لاس پایه (پیپ)
+    tp_ratio           = 2.5         # نسبت TP:SL
+    trail_trigger_pips = 15          # فعال‌شدن تریل
+    trail_lock_pips    = 8           # قفل سود تریل
+    time_stop_bars     = 48          # تایم‌استاپ (بار ۱۵دقیقه)
+    z_entry_min        = 1.8         # حداقل Z برای ورود MR
+    z_stop_level       = 3.8         # Z-Stop خروج اضطراری
+    ml_threshold       = 0.55        # آستانه ML
+    adx_trend_level    = 25          # ADX بالای این = بازار روند دارد
+    train_end          = '2022-12-31'
+    test_start         = '2023-01-01'
+    pip_value          = {           # ارزش هر پیپ به دلار (لات استاندارد)
+        'EURUSD': 10, 'GBPUSD': 10, 'AUDUSD': 10, 'NZDUSD': 10,
+        'USDCAD':  7.7, 'USDCHF': 10, 'EURGBP': 13, 'AUDNZD': 6.5,
+        'XAUUSD': 10, 'XAGUSD': 50
+    }
+    pip_size           = {           # اندازه یک پیپ
+        'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001,
+        'NZDUSD': 0.0001, 'USDCAD': 0.0001, 'USDCHF': 0.0001,
+        'EURGBP': 0.0001, 'AUDNZD': 0.0001,
+        'XAUUSD': 0.1,    'XAGUSD': 0.01
+    }
 
-    # ── مدیریت سرمایه پورتفولیو ──
-    risk_per_trade     = 0.005      # ریسک هر معامله 0.5% (به دلیل تعدد معاملات پورتفولیو)
-    max_concurrent     = 4          # حداکثر ۴ پوزیشن همزمان در کل پورتفولیو
-    
-    # ── هزینه‌ها و بازار ──
-    spread_pips        = 1.2
-    commission_per_lot = 7.0
-    slippage_pips      = 0.3
-    pip                = 0.0001
-    lot_size           = 100_000
-    
-    # ── تنظیمات استراتژی ──
-    z_fast_period      = 96
-    z_entry            = 1.90       # ورود با تایید ماشین
-    z_exit             = 0.1
-    z_stop_margin      = 3.5
-    time_stop_bars     = 60
-    sl_pips            = 40.0
-    tp_pips            = 80.0
-    corr_min           = 0.70
-    
-    # ── ماشین یادگیری ──
-    train_end_date     = '2022-12-31'
-    test_start_date    = '2023-01-01'
-    ml_prob_threshold  = 0.55
+# ─────────────────────────────────────────────
+# بلوک ۱: لود دیتا
+# ─────────────────────────────────────────────
+def load_all_data():
+    all_files = glob.glob('data/*.csv')
+    portfolio = {}
+    print("\n📂 Loading Data...")
+    for sym in ASSETS:
+        hits = [f for f in all_files if sym in f.upper()]
+        if not hits:
+            print(f"  ⚠️  {sym}: file not found")
+            continue
+        df = pd.read_csv(
+            hits[0], sep=r'[;,]', engine='python',
+            header=None, names=['ts','o','h','l','c','v']
+        )
+        df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S', errors='coerce')
+        df = (df.dropna()
+                .drop_duplicates('ts')
+                .set_index('ts')
+                .sort_index()[['o','h','l','c']])
+        df = (df.resample('15min')
+                .agg({'o':'first','h':'max','l':'min','c':'last'})
+                .dropna())
+        portfolio[sym] = df
+        print(f"  ✅ {sym}: {len(df):,} bars  "
+              f"({df.index[0].date()} → {df.index[-1].date()})")
+    return portfolio
 
-# جفت‌ارزهای متقاطع که سیستم از روی فایل‌های پایه شما می‌سازد
-PORTFOLIO_PAIRS = {
-    'EURGBP': ('EURUSD', 'GBPUSD'),
-    'AUDNZD': ('AUDUSD', 'NZDUSD'),
-    'XAUXAG': ('XAUUSD', 'XAGUSD')  # طلا به نقره
-}
+# ─────────────────────────────────────────────
+# بلوک ۲: اندیکاتورها
+# ─────────────────────────────────────────────
+def add_indicators(df):
+    """همه اندیکاتورها را اضافه می‌کند"""
+    c = df['c']
+    h, l = df['h'], df['l']
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  اتوماسیون پوشه و پردازش داده‌ها
-# ═══════════════════════════════════════════════════════════════════════════
-def prepare_data_directory(data_path="data"):
-    print("📁 Scanning and extracting data folder...")
-    zip_files = glob.glob(os.path.join(data_path, "*.zip"))
-    for z in zip_files:
-        try:
-            with zipfile.ZipFile(z, 'r') as zip_ref:
-                zip_ref.extractall(data_path)
-            os.remove(z) # پاک کردن فایل زیپ برای خلوت شدن فضا
-        except Exception as e:
-            pass
-    return glob.glob(os.path.join(data_path, "*.csv"))
+    # ── Z-Score (برای Mean-Reversion)
+    ret = np.log(c).diff()
+    df['log_ret']  = ret
+    roll_mean      = ret.rolling(96).mean()
+    roll_std       = ret.rolling(96).std().replace(0, np.nan)
+    df['z_score']  = (ret - roll_mean) / roll_std
 
-def load_symbol(symbol, all_csvs):
-    files = sorted([f for f in all_csvs if symbol in f.upper()])
-    if not files:
-        return None
-    
-    frames = []
-    for f in files:
-        try:
-            # HistData format
-            df = pd.read_csv(f, sep=r'[;,]', engine='python', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
-            frames.append(df)
-        except: pass
-        
-    if not frames: return None
-    
-    df = pd.concat(frames)
-    df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S', errors='coerce')
-    df = df.dropna(subset=['ts']).drop_duplicates('ts', keep='last').set_index('ts').sort_index()
-    
-    # Resample to 15m immediately to save RAM
-    resampled = pd.DataFrame({
-        'o': df['o'].resample('15min').first(),
-        'h': df['h'].resample('15min').max(),
-        'l': df['l'].resample('15min').min(),
-        'c': df['c'].resample('15min').last(),
-    }).dropna()
-    
-    return resampled
+    # ── RSI
+    delta   = c.diff()
+    gain    = delta.clip(lower=0).rolling(14).mean()
+    loss    = (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)
+    df['rsi'] = 100 - 100 / (1 + gain / loss)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ویژگی‌ها و ماشین یادگیری
-# ═══════════════════════════════════════════════════════════════════════════
-def process_pair(pair_name, base_sym, quote_sym, all_csvs):
-    print(f"\n⚙️ Processing {pair_name} ({base_sym}/{quote_sym})...")
-    df_base = load_symbol(base_sym, all_csvs)
-    df_quote = load_symbol(quote_sym, all_csvs)
-    
-    if df_base is None or df_quote is None:
-        print(f"⚠️ Skipped {pair_name}: Missing data.")
-        return None
-        
-    raw = df_base.join(df_quote, how='inner', lsuffix='_base', rsuffix='_quote').dropna()
-    
-    # ساخت جفت متقاطع
-    raw['c_cross'] = raw['c_base'] / raw['c_quote']
-    raw['o_cross'] = raw['o_base'] / raw['o_quote']
-    
-    # ML Features
-    raw['log_ratio'] = np.log(raw['c_cross'])
-    raw['z_score'] = (raw['log_ratio'] - raw['log_ratio'].rolling(Config.z_fast_period).mean()) / raw['log_ratio'].rolling(Config.z_fast_period).std()
-    
-    ret_base, ret_quote = raw['c_base'].pct_change(), raw['c_quote'].pct_change()
-    raw['corr'] = ret_base.rolling(96).corr(ret_quote)
-    raw['hour'] = raw.index.hour
-    
-    raw['raw_sig'] = 0
-    raw.loc[(raw['z_score'] < -Config.z_entry) & (raw['corr'] > Config.corr_min), 'raw_sig'] = 1
-    raw.loc[(raw['z_score'] > Config.z_entry) & (raw['corr'] > Config.corr_min), 'raw_sig'] = -1
-    raw['raw_sig'] = raw['raw_sig'].where(raw['raw_sig'] != raw['raw_sig'].shift(), 0)
-    
-    raw['future_ret'] = raw['log_ratio'].shift(-12) - raw['log_ratio']
-    raw['label'] = 0
-    raw.loc[(raw['raw_sig'] == 1) & (raw['future_ret'] > 0), 'label'] = 1
-    raw.loc[(raw['raw_sig'] == -1) & (raw['future_ret'] < 0), 'label'] = 1
-    
-    raw = raw.dropna()
-    
-    # ── Train ML ──
-    train_df = raw[(raw.index <= Config.train_end_date) & (raw['raw_sig'] != 0)]
-    test_df = raw[raw.index >= Config.test_start_date]
-    
-    if len(train_df) < 50:
-        return None
-        
-    features = ['z_score', 'corr', 'hour']
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(train_df[features])
-    model = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
-    model.fit(X_train, train_df['label'])
-    
-    # ── Test (OOS) ──
-    test_df['ml_approved'] = 0
-    sig_idx = test_df[test_df['raw_sig'] != 0].index
-    if len(sig_idx) > 0:
-        X_test = scaler.transform(test_df.loc[sig_idx, features])
-        probs = model.predict_proba(X_test)[:, 1]
-        test_df.loc[sig_idx, 'ml_prob'] = probs
-        test_df.loc[(test_df['raw_sig'] != 0) & (test_df['ml_prob'] >= Config.ml_prob_threshold), 'ml_approved'] = test_df['raw_sig']
-        
-    return test_df
+    # ── ATR
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  موتور اجرای پورتفولیو (Centralized Risk)
-# ═══════════════════════════════════════════════════════════════════════════
-def run_portfolio_backtest(portfolio_data):
-    print("\n🚀 Running Centralized Portfolio Backtest (2023-2025)...")
-    
-    # تجمیع تمام سیگنال‌ها و داده‌ها روی یک تایم‌لاین واحد
-    master_index = None
-    for pair, df in portfolio_data.items():
-        if master_index is None:
-            master_index = df.index
+    # ── ADX (تشخیص رژیم — قلب Dual-Logic)
+    up_move   = h.diff()
+    down_move = (-l.diff())
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr14     = tr.rolling(14).sum().replace(0, np.nan)
+    plus_di   = 100 * pd.Series(plus_dm,  index=df.index).rolling(14).sum() / atr14
+    minus_di  = 100 * pd.Series(minus_dm, index=df.index).rolling(14).sum() / atr14
+    dx        = (100 * (plus_di - minus_di).abs() /
+                 (plus_di + minus_di).replace(0, np.nan))
+    df['adx']      = dx.rolling(14).mean()
+    df['plus_di']  = plus_di
+    df['minus_di'] = minus_di
+
+    # ── EMA برای Trend-Following
+    df['ema_fast'] = c.ewm(span=20, adjust=False).mean()
+    df['ema_slow'] = c.ewm(span=50, adjust=False).mean()
+    df['ema_diff'] = (df['ema_fast'] - df['ema_slow']) / df['atr'].replace(0, np.nan)
+
+    # ── Momentum (برای Trend)
+    df['mom_12']   = c.pct_change(12)
+    df['mom_48']   = c.pct_change(48)
+
+    # ── Volatility Ratio (ATR نسبی)
+    df['vol_ratio'] = df['atr'] / df['atr'].rolling(96).mean().replace(0, np.nan)
+
+    return df
+
+# ─────────────────────────────────────────────
+# بلوک ۳: تشخیص رژیم
+# ─────────────────────────────────────────────
+def get_regime(row, sym):
+    """
+    برای هر بار تشخیص دهد بازار در چه رژیمی است:
+    'trend'    → سیستم Trend-Following فعال
+    'ranging'  → سیستم Mean-Reversion فعال
+    'avoid'    → ورود ممنوع (نوسان خیلی بالا/پایین)
+    """
+    adx       = row.get('adx', 0)
+    vol_ratio = row.get('vol_ratio', 1.0)
+
+    # نوسان خیلی بالا = ریسک غیرقابل‌کنترل
+    if vol_ratio > 2.5:
+        return 'avoid'
+
+    # نمادهای روندساز — ADX پایین‌تر هم کافیه
+    if sym in TREND_ASSETS:
+        if adx > 20:
+            return 'trend'
+        elif adx < 15:
+            return 'ranging'
         else:
-            master_index = master_index.union(df.index)
-            
-    master_index = master_index.sort_values()
-    
-    # متغیرهای حساب
-    C = Config()
-    eq = day_start_eq = C.initial_balance
-    total_withdrawn = 0.0
-    acc_num = 1
-    blown_count = 0
-    open_positions = []
-    trades_log = []
-    
-    PROP_FLOOR = C.initial_balance * (1 - C.max_total_dd_pct)
-    PROFIT_LEVEL = C.initial_balance * (1 + C.profit_target_pct)
-    
-    # حلقه اصلی زمان
-    for ts in master_index:
-        # ریست روزانه پراپ
-        if ts.hour == 0 and ts.minute == 0:
-            day_start_eq = eq
-            
-        # بررسی چک کردن دراداون پورتفولیو
-        daily_limit = day_start_eq * (1 - C.max_daily_loss_pct)
-        if eq <= daily_limit or eq <= PROP_FLOOR:
-            # سوختن اکانت
-            for pos in open_positions:
-                trades_log.append({'pnl': pos['floating_pnl'], 'status': 'BLOWN', 'pair': pos['pair']})
-            blown_count += 1
-            acc_num += 1
-            eq = day_start_eq = C.initial_balance
-            open_positions = []
-            continue
+            return 'avoid'  # ناحیه خاکستری برای طلا
 
-        # مدیریت پوزیشن‌های باز
-        active_pos = []
-        for pos in open_positions:
-            pair = pos['pair']
-            if ts not in portfolio_data[pair].index:
-                active_pos.append(pos)
-                continue
-                
-            row = portfolio_data[pair].loc[ts]
-            cp = row['c_cross']
-            cg = row['c_quote']
-            ep, d, lot = pos['entry'], pos['dir'], pos['lot']
-            zn = row['z_score']
-            
-            # محاسبه سود لحظه‌ای
-            gross_gbp = d * (cp - ep) * lot * C.lot_size
-            net_usd = (gross_gbp * cg) - (C.commission_per_lot * lot)
-            pos['floating_pnl'] = net_usd
-            
-            # شروط خروج
-            hit_sl = (d == 1 and cp <= pos['sl']) or (d == -1 and cp >= pos['sl'])
-            hit_tp = (d == 1 and cp >= pos['tp']) or (d == -1 and cp <= pos['tp'])
-            hit_z_stop = not np.isnan(zn) and ((d == 1 and zn <= -C.z_stop_margin) or (d == -1 and zn >= C.z_stop_margin))
-            hit_z_exit = not np.isnan(zn) and ((d == 1 and zn >= -C.z_exit) or (d == -1 and zn <= C.z_exit))
-            
-            if hit_sl or hit_tp or hit_z_stop or hit_z_exit:
-                st = 'SL' if hit_sl else ('TP' if hit_tp else ('Z-Stop' if hit_z_stop else 'Z-Exit'))
-                eq += net_usd
-                trades_log.append({'pair': pair, 'pnl': net_usd, 'status': st})
-            else:
-                active_pos.append(pos)
-                
-        open_positions = active_pos
-        
-        # برداشت سود (تارگت)
-        if eq >= PROFIT_LEVEL and len(open_positions) == 0:
-            total_withdrawn += (eq - C.initial_balance)
-            acc_num += 1
-            eq = day_start_eq = C.initial_balance
-            continue
-
-        # ورود به پوزیشن‌های جدید
-        if len(open_positions) < C.max_concurrent:
-            for pair, df in portfolio_data.items():
-                if ts in df.index and len(open_positions) < C.max_concurrent:
-                    row = df.loc[ts]
-                    sig = row['ml_approved']
-                    
-                    # اطمینان از اینکه روی این جفت پوزیشن باز نداریم
-                    already_open = any(p['pair'] == pair for p in open_positions)
-                    
-                    if sig != 0 and not already_open:
-                        # محاسبه حجم بر اساس ریسک پورتفولیو
-                        raw_lot = (eq * C.risk_per_trade) / (C.sl_pips * 10 * row['c_quote'])
-                        lot = round(float(np.clip(raw_lot, 0.01, 5.0)), 2)
-                        
-                        ep = row['o_cross'] + (sig * (C.slippage_pips + C.spread_pips/2) * C.pip)
-                        open_positions.append({
-                            'pair': pair, 'dir': sig, 'lot': lot, 'entry': ep,
-                            'sl': ep - sig * C.sl_pips * C.pip, 'tp': ep + sig * C.tp_pips * C.pip,
-                            'floating_pnl': 0.0
-                        })
-
-    # گزارش‌گیری
-    df_trades = pd.DataFrame(trades_log)
-    if df_trades.empty:
-        print("❌ No trades executed.")
-        return
-        
-    wins = df_trades[df_trades['pnl'] > 0]
-    losses = df_trades[df_trades['pnl'] < 0]
-    pf = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) > 0 else 0
-    target_hits = acc_num - 1 - blown_count
-    
-    print("\n" + "═" * 65)
-    print(" ▌  Portfolio Master Backtest (2023-2025 OOS)  ▐")
-    print("═" * 65)
-    print(f" Total Trades:    {len(df_trades):,}")
-    print(f" Win Rate:        {len(wins) / len(df_trades) * 100:.1f}%")
-    print(f" Profit Factor:   {pf:.2f}")
-    print(f" Prop Accounts:   Passed: {target_hits} | Blown: {blown_count}")
-    print(f" Total Banked:    ${total_withdrawn:,.2f}")
-    print("═" * 65)
-    print(" Trade Distribution by Asset:")
-    print(df_trades['pair'].value_counts().to_string())
-
-if __name__ == "__main__":
-    all_csvs = prepare_data_directory()
-    portfolio_data = {}
-    
-    for pair_name, (base_sym, quote_sym) in PORTFOLIO_PAIRS.items():
-        processed_df = process_pair(pair_name, base_sym, quote_sym, all_csvs)
-        if processed_df is not None:
-            portfolio_data[pair_name] = processed_df
-            
-    if portfolio_data:
-        run_portfolio_backtest(portfolio_data)
+    # فارکس متقاطع — Z-Score عالی است
+    if adx < Config.adx_trend_level:
+        return 'ranging'
     else:
-        print("❌ Could not process any pairs. Check your data files.")
+        return 'trend'
+
+# ─────────────────────────────────────────────
+# بلوک ۴: ML Meta-Labeler (دو مدل جداگانه)
+# ─────────────────────────────────────────────
+def train_ml_models(df, sym):
+    """
+    دو مدل ML جداگانه:
+    - model_mr  : برای رژیم Ranging (Mean-Reversion)
+    - model_tr  : برای رژیم Trending (Trend-Following)
+    """
+    # فیچرهای MR
+    feat_mr = ['z_score', 'rsi', 'vol_ratio', 'atr']
+    # فیچرهای Trend
+    feat_tr = ['ema_diff', 'mom_12', 'mom_48', 'adx', 'rsi', 'vol_ratio']
+
+    # Label: آیا ۱۲ بار بعد سود می‌دهد؟
+    df['label_mr'] = np.where(
+        df['log_ret'].shift(-12).rolling(12).sum() > 0, 1, 0
+    )
+    df['label_tr'] = df['label_mr']  # می‌توان جداگانه تنظیم کرد
+
+    df = df.dropna()
+    train = df[df.index <= Config.train_end]
+
+    models = {}
+    for tag, feats, label_col in [
+        ('mr', feat_mr, 'label_mr'),
+        ('tr', feat_tr, 'label_tr')
+    ]:
+        X = train[feats].fillna(0)
+        y = train[label_col]
+        if len(X) < 100:
+            models[tag] = None
+            continue
+        clf = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=6,
+            min_samples_leaf=30,
+            random_state=42,
+            n_jobs=-1
+        )
+        clf.fit(X, y)
+        models[tag] = (clf, feats)
+
+    return models, df
+
+# ─────────────────────────────────────────────
+# بلوک ۵: تولید سیگنال‌ها
+# ─────────────────────────────────────────────
+def generate_signals(df, sym, models):
+    """
+    سیگنال‌های ترکیبی بر اساس رژیم + ML
+    """
+    test = df[df.index >= Config.test_start].copy()
+    signals = []
+
+    for i, (ts, row) in enumerate(test.iterrows()):
+        regime = get_regime(row, sym)
+        if regime == 'avoid':
+            continue
+
+        signal_dir = None    # 'L' یا 'S'
+        ml_prob    = 0.5
+        reason     = ''
+
+        # ══ رژیم Ranging — Mean-Reversion ══
+        if regime == 'ranging':
+            z = row['z_score']
+            if abs(z) < Config.z_entry_min:
+                continue
+            # ورود خلاف روند Z
+            if z > Config.z_entry_min:
+                signal_dir = 'S'   # Z بالا → انتظار برگشت پایین
+            else:
+                signal_dir = 'L'
+
+            # ML فیلتر
+            if models.get('mr') and models['mr'] is not None:
+                clf, feats = models['mr']
+                x_row = pd.DataFrame([row[feats].fillna(0)])
+                ml_prob = clf.predict_proba(x_row)[0][1]
+                # برای Short: ml_prob باید پایین باشد
+                if signal_dir == 'S' and ml_prob > (1 - Config.ml_threshold):
+                    continue
+                if signal_dir == 'L' and ml_prob < Config.ml_threshold:
+                    continue
+            reason = f'MR|z={z:.2f}'
+
+        # ══ رژیم Trending — Trend-Following ══
+        elif regime == 'trend':
+            ema_diff = row['ema_diff']
+            mom      = row['mom_12']
+            plus_di  = row['plus_di']
+            minus_di = row['minus_di']
+
+            # EMA + DI هم‌راستا باشند
+            if ema_diff > 0.3 and plus_di > minus_di and mom > 0:
+                signal_dir = 'L'
+            elif ema_diff < -0.3 and minus_di > plus_di and mom < 0:
+                signal_dir = 'S'
+            else:
+                continue
+
+            # ML فیلتر
+            if models.get('tr') and models['tr'] is not None:
+                clf, feats = models['tr']
+                x_row = pd.DataFrame([row[feats].fillna(0)])
+                ml_prob = clf.predict_proba(x_row)[0][1]
+                if signal_dir == 'L' and ml_prob < Config.ml_threshold:
+                    continue
+                if signal_dir == 'S' and ml_prob > (1 - Config.ml_threshold):
+                    continue
+            reason = f'TR|ema={ema_diff:.2f}'
+
+        if signal_dir:
+            signals.append({
+                'ts':     ts,
+                'sym':    sym,
+                'dir':    signal_dir,
+                'regime': regime,
+                'reason': reason,
+                'price':  row['c'],
+                'atr':    row['atr'],
+                'z':      row['z_score']
+            })
+
+    return pd.DataFrame(signals)
+
+# ─────────────────────────────────────────────
+# بلوک ۶: موتور بک‌تست (Per-Asset)
+# ─────────────────────────────────────────────
+def backtest_asset(sig_df, price_df, sym):
+    """بک‌تست روی یک نماد — خروجی: لیست تریدها"""
+    if sig_df.empty:
+        return []
+
+    pip_sz  = Config.pip_size.get(sym, 0.0001)
+    pip_val = Config.pip_value.get(sym, 10)
+
+    trades  = []
+    in_trade = False
+    entry_price = sl = tp = trail_sl = None
+    direction   = None
+    entry_ts    = None
+    bar_count   = 0
+    entry_z     = 0
+
+    # ایندکس قیمت برای lookup سریع
+    price_idx = price_df.index
+
+    sig_iter = iter(sig_df.itertuples())
+    current_sig = next(sig_iter, None)
+
+    for ts, row in price_df[price_df.index >= Config.test_start].iterrows():
+        o_, h_, l_, c_ = row['o'], row['h'], row['l'], row['c']
+
+        # ── اگر در معامله هستیم
+        if in_trade:
+            bar_count += 1
+            pnl_pips = 0
+            exit_reason = None
+            exit_price  = c_
+
+            if direction == 'L':
+                # Z-Stop (بازگشت اضطراری برای MR)
+                if row.get('z_score', 0) > Config.z_stop_level:
+                    exit_reason = 'Z-Stop'; exit_price = o_
+
+                # تریل
+                elif h_ > entry_price + Config.trail_trigger_pips * pip_sz:
+                    new_trail = h_ - Config.trail_lock_pips * pip_sz
+                    if trail_sl is None or new_trail > trail_sl:
+                        trail_sl = new_trail
+                    if l_ < trail_sl:
+                        exit_reason = 'Trail'; exit_price = trail_sl
+
+                # SL / TP / TimeStop
+                elif l_ < sl:
+                    exit_reason = 'SL'; exit_price = sl
+                elif h_ > tp:
+                    exit_reason = 'TP'; exit_price = tp
+                elif bar_count >= Config.time_stop_bars:
+                    exit_reason = 'TimeStop'; exit_price = c_
+
+                if exit_reason:
+                    pnl_pips = (exit_price - entry_price) / pip_sz
+
+            else:  # SHORT
+                if row.get('z_score', 0) < -Config.z_stop_level:
+                    exit_reason = 'Z-Stop'; exit_price = o_
+                elif l_ < entry_price - Config.trail_trigger_pips * pip_sz:
+                    new_trail = l_ + Config.trail_lock_pips * pip_sz
+                    if trail_sl is None or new_trail < trail_sl:
+                        trail_sl = new_trail
+                    if h_ > trail_sl:
+                        exit_reason = 'Trail'; exit_price = trail_sl
+                elif h_ > sl:
+                    exit_reason = 'SL'; exit_price = sl
+                elif l_ < tp:
+                    exit_reason = 'TP'; exit_price = tp
+                elif bar_count >= Config.time_stop_bars:
+                    exit_reason = 'TimeStop'; exit_price = c_
+
+                if exit_reason:
+                    pnl_pips = (entry_price - exit_price) / pip_sz
+
+            if exit_reason:
+                # محاسبه سود/زیان دلاری (لات کوچک 0.01)
+                lot  = 0.01
+                pnl$ = pnl_pips * pip_val * lot
+                trades.append({
+                    'sym':      sym,
+                    'entry_ts': entry_ts,
+                    'exit_ts':  ts,
+                    'dir':      direction,
+                    'pnl_pips': round(pnl_pips, 1),
+                    'pnl':      round(pnl$, 2),
+                    'bars':     bar_count,
+                    'reason':   exit_reason
+                })
+                in_trade = False
+                trail_sl = None
+
+        # ── ورود به معامله
+        if not in_trade and current_sig is not None:
+            if ts >= current_sig.ts:
+                atr   = current_sig.atr
+                sl_sz = Config.sl_pips * pip_sz
+                # ATR-based SL (سازگار با نوسان)
+                sl_atr = 1.5 * atr
+                sl_sz  = max(sl_sz, sl_atr)
+
+                direction   = current_sig.dir
+                entry_price = o_   # ورود در Open بار بعدی
+                entry_ts    = ts
+
+                if direction == 'L':
+                    sl = entry_price - sl_sz
+                    tp = entry_price + sl_sz * Config.tp_ratio
+                else:
+                    sl = entry_price + sl_sz
+                    tp = entry_price - sl_sz * Config.tp_ratio
+
+                in_trade  = True
+                bar_count = 0
+                trail_sl  = None
+
+                current_sig = next(sig_iter, None)
+
+    return trades
+
+# ─────────────────────────────────────────────
+# بلوک ۷: شبیه‌ساز پراپ (Portfolio-Level)
+# ─────────────────────────────────────────────
+def prop_simulator(all_trades_df):
+    """
+    شبیه‌ساز پراپ روی تمام تریدها — مدیریت دراداون روزانه و کلی
+    """
+    print("\n" + "═"*65)
+    print(" ▌  CorrArb Prop Simulator v9 — Dual Logic  ▐")
+    print("═"*65)
+
+    if all_trades_df.empty:
+        print("  ❌ هیچ ترید فعالی یافت نشد!")
+        return
+
+    trades = all_trades_df.sort_values('exit_ts').copy()
+
+    # ── وضعیت پراپ
+    balance        = Config.initial_balance
+    peak_balance   = balance
+    daily_start    = balance
+    current_date   = None
+    account_num    = 1
+    accounts       = []
+    banked_total   = 0.0
+    blown_count    = 0
+    passed_count   = 0
+
+    trade_results  = []
+
+    for _, t in trades.iterrows():
+        date = t['exit_ts'].date() if hasattr(t['exit_ts'], 'date') else pd.Timestamp(t['exit_ts']).date()
+
+        # ── ریست روزانه
+        if date != current_date:
+            daily_start  = balance
+            current_date = date
+
+        balance    += t['pnl']
+        peak_balance = max(peak_balance, balance)
+
+        dd_total = (peak_balance - balance) / peak_balance
+        dd_daily = (daily_start - balance) / daily_start if daily_start > 0 else 0
+
+        # ── بررسی شرایط
+        reason_out = None
+        if balance <= 0 or dd_total >= Config.max_total_dd_pct:
+            reason_out = f'BLOWN(DD={dd_total:.1%})'
+        elif dd_daily >= Config.max_daily_loss_pct:
+            reason_out = f'BLOWN(Daily={dd_daily:.1%})'
+
+        if reason_out:
+            blown_count += 1
+            accounts.append({
+                'num': account_num, 'result': 'BLOWN',
+                'final_bal': balance, 'reason': reason_out,
+                'trades': len(trade_results)
+            })
+            # ریست اکانت
+            balance      = Config.initial_balance
+            peak_balance = balance
+            daily_start  = balance
+            account_num += 1
+            trade_results = []
+            continue
+
+        # ── پاس کردن
+        profit_pct = (balance - Config.initial_balance) / Config.initial_balance
+        if profit_pct >= Config.profit_target_pct:
+            banked       = balance * 0.80   # 80% سود به تریدر
+            banked_total += banked
+            passed_count += 1
+            accounts.append({
+                'num':       account_num,
+                'result':    'PASSED',
+                'final_bal': balance,
+                'banked':    round(banked, 2),
+                'trades':    len(trade_results)
+            })
+            balance      = Config.initial_balance
+            peak_balance = balance
+            daily_start  = balance
+            account_num += 1
+            trade_results = []
+            continue
+
+        trade_results.append(t['pnl'])
+
+    # ── آمار نهایی
+    wins  = trades[trades['pnl'] > 0]['pnl']
+    loss  = trades[trades['pnl'] < 0]['pnl']
+    wr    = len(wins) / len(trades) * 100 if len(trades) else 0
+    pf    = wins.sum() / abs(loss.sum()) if len(loss) else 0
+
+    # آمار رژیم
+    if 'regime' in trades.columns:
+        mr_t = trades[trades['regime'] == 'ranging']
+        tr_t = trades[trades['regime'] == 'trend']
+    else:
+        mr_t = tr_t = pd.DataFrame()
+
+    total_months = max(1, (trades['exit_ts'].max() - trades['exit_ts'].min()).days / 30)
+
+    print(f" Total Trades:          {len(trades):>6,}")
+    print(f" Win Rate:              {wr:>6.1f}%")
+    print(f" Profit Factor:         {pf:>6.2f}")
+    print(f" Avg Win:               ${wins.mean():>7.2f}" if len(wins) else "")
+    print(f" Avg Loss:              ${loss.mean():>7.2f}" if len(loss) else "")
+    print(f"{'─'*65}")
+
+    # آمار رژیم
+    if len(mr_t) > 0:
+        mr_wr = len(mr_t[mr_t['pnl']>0]) / len(mr_t) * 100
+        mr_pf_num = mr_t[mr_t['pnl']>0]['pnl'].sum()
+        mr_pf_den = abs(mr_t[mr_t['pnl']<0]['pnl'].sum())
+        mr_pf = mr_pf_num / mr_pf_den if mr_pf_den > 0 else 0
+        print(f" MR Trades: {len(mr_t):>5} | WR:{mr_wr:.0f}% | PF:{mr_pf:.2f}")
+    if len(tr_t) > 0:
+        tr_wr = len(tr_t[tr_t['pnl']>0]) / len(tr_t) * 100
+        tr_pf_num = tr_t[tr_t['pnl']>0]['pnl'].sum()
+        tr_pf_den = abs(tr_t[tr_t['pnl']<0]['pnl'].sum())
+        tr_pf = tr_pf_num / tr_pf_den if tr_pf_den > 0 else 0
+        print(f" Trend Trades:{len(tr_t):>4} | WR:{tr_wr:.0f}% | PF:{tr_pf:.2f}")
+
+    # آمار به تفکیک نماد
+    print(f"{'─'*65}")
+    print(" آمار نمادها:")
+    for sym in ASSETS:
+        sym_t = trades[trades['sym'] == sym]
+        if len(sym_t) == 0:
+            continue
+        sym_wr = len(sym_t[sym_t['pnl']>0]) / len(sym_t) * 100
+        sym_pnl = sym_t['pnl'].sum()
+        sym_pf_n = sym_t[sym_t['pnl']>0]['pnl'].sum()
+        sym_pf_d = abs(sym_t[sym_t['pnl']<0]['pnl'].sum())
+        sym_pf = sym_pf_n / sym_pf_d if sym_pf_d > 0 else 0
+        flag = "🔥" if sym in TREND_ASSETS else "💱"
+        print(f"  {flag} {sym:<8} T:{len(sym_t):>4} WR:{sym_wr:.0f}% "
+              f"PF:{sym_pf:.2f} PnL:${sym_pnl:>7.1f}")
+
+    print(f"{'─'*65}")
+    print(f" Accounts Passed:       {passed_count:>4}")
+    print(f" Accounts Blown:        {blown_count:>4}")
+    rate = passed_count/(passed_count+blown_count)*100 if (passed_count+blown_count) > 0 else 0
+    print(f" Pass Rate:             {rate:.1f}%")
+    print(f" Total Banked:          ${banked_total:>9,.2f}")
+    print(f" Monthly Avg:           ${banked_total/total_months:.2f}/ماه")
+
+    # جدول اکانت‌ها
+    print(f"\n{'─'*65}")
+    print(" جزئیات اکانت‌ها:")
+    for acc in accounts[-15:]:   # آخرین ۱۵ اکانت
+        icon = '💰' if acc['result'] == 'PASSED' else '💥'
+        banked_str = f"| ${acc.get('banked',0):>7.1f}" if acc['result']=='PASSED' else ''
+        print(f"  {icon} #{acc['num']:>3} | {acc['result']:<7} "
+              f"| Bal:${acc['final_bal']:>7.1f} {banked_str}"
+              f"| T:{acc['trades']}")
+
+    print("═"*65)
+
+    # خروجی exit‌ها
+    reason_counts = trades['reason'].value_counts()
+    print("\n خروج‌ها:")
+    for r, cnt in reason_counts.items():
+        pct = cnt/len(trades)*100
+        print(f"   {r:<15}: {cnt:>4} ({pct:.1f}%)")
+    print("═"*65)
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    print("🚀 CorrArb v9 — Dual-Logic Portfolio System")
+    print("═"*65)
+
+    # ۱. لود دیتا
+    portfolio = load_all_data()
+    if not portfolio:
+        print("❌ هیچ داده‌ای یافت نشد!")
+        exit()
+
+    # ۲. اندیکاتور + ML + سیگنال (per asset)
+    all_signals = []
+    all_trades  = []
+
+    for sym, df in portfolio.items():
+        print(f"\n⚙️  Processing {sym}...")
+
+        # اندیکاتورها
+        df = add_indicators(df)
+
+        # آموزش ML
+        models, df = train_ml_models(df, sym)
+        print(f"   ML trained | train-bars: {len(df[df.index<=Config.train_end]):,}")
+
+        # سیگنال‌ها
+        sigs = generate_signals(df, sym, models)
+        if not sigs.empty:
+            all_signals.append(sigs)
+            print(f"   Signals: {len(sigs)} | "
+                  f"MR: {(sigs['regime']=='ranging').sum()} | "
+                  f"Trend: {(sigs['regime']=='trend').sum()}")
+
+            # بک‌تست
+            trades = backtest_asset(sigs, df, sym)
+            if trades:
+                t_df = pd.DataFrame(trades)
+                t_df['regime'] = sigs.set_index('ts').reindex(
+                    t_df['entry_ts']
+                )['regime'].values if 'regime' in sigs.columns else 'unknown'
+                all_trades.append(t_df)
+                print(f"   Trades: {len(trades)}")
+        else:
+            print(f"   ⚠️ No signals generated")
+
+    # ۳. ترکیب و شبیه‌سازی پراپ
+    if all_trades:
+        combined = pd.concat(all_trades, ignore_index=True)
+        combined['exit_ts'] = pd.to_datetime(combined['exit_ts'])
+        prop_simulator(combined)
+    else:
+        print("❌ هیچ ترید فعالی یافت نشد!")
