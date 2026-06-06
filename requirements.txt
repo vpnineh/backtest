@@ -1,5 +1,9 @@
-yfinance
-pandas==2.2.0
-numpy==1.26.4
-statsmodels==0.14.1
-matplotlib==3.8.2
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+joblib
+tensorflow
+stable-baselines3[extra]
+gymnasium
