@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         CorrArb Prop Trading Simulator — موتور دو-تایم‌فریمی (واقع‌بینانه)   ║
-║  • استراتژی: اصلی (CorrArb) روی EUR/GBP و ترید روی EUR/USD                   ║
-║  • معماری: تحلیل سیگنال در ۱۵ دقیقه / اجرای معامله و مدیریت در ۱ دقیقه       ║
-║  • هدف: حذف کامل توهم پر شدن אורدرها (Phantom Fills) در بک‌تست               ║
+║         London Breakout Prop Simulator — موتور شکست نوسان (Fat-Tail)         ║
+║  • استراتژی: Volatility Breakout روی باکس آسیا (فقط EUR/USD)                 ║
+║  • معماری: ضدِ توهم (تحلیل ساختار در 15m / اجرا و مدیریت در 1m)              ║
+║  • هدف: شکار ترندهای بزرگ با Risk:Reward بالا برای غلبه بر هزینه‌های پراپ    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -16,187 +16,124 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONFIG (دقیقاً پارامترهای اورجینال خودتان)
+#  CONFIG
 # ═══════════════════════════════════════════════════════════════════════════
 class Config:
-    # ── حساب پراپ ──
     initial_balance      = 5_000.0    
     profit_target_pct    = 0.05       
     max_daily_loss_pct   = 0.05       
     max_total_dd_pct     = 0.10       
 
-    # ── ریسک معامله ──
-    risk_per_trade_pct   = 0.010      # 1.0%
-
-    # ── هزینه‌های معامله ──
-    spread_pips          = 1.0        # EUR/USD spread
+    risk_per_trade_pct   = 0.005      # 0.5% ریسک (چون وین‌ریت پایین‌تر اما ریوارد بالاست)
+    spread_pips          = 1.0        
     commission_per_lot   = 6.0        
 
-    # ── مشخصات بازار ──
     pip                  = 0.0001
     lot_size             = 100_000
-    max_lot              = 2.0
+    max_lot              = 3.0
 
-    # ── اندیکاتورها ──
-    warmup               = 500        # کندل 15m
-
-    # ── CorrArb پارامترهای اصلی ──
-    arb_z_fast           = 96         
-    arb_z_slow           = 480        
-    arb_z_entry          = 2.0        
-    arb_z_exit           = 0.3        
-    arb_z_slow_confirm   = 0.5        
-    arb_adx_max          = 30         
-    arb_rsi_long_max     = 46         
-    arb_rsi_short_min    = 54         
-    arb_sl_pips          = 20.0       
-    arb_tp_pips          = 44.0       
-    arb_hour_start       = 7          
-    arb_hour_end         = 19         
+    # ── پارامترهای شکست لندن ──
+    asian_start_hour     = 0          # شروع رنج آسیا
+    asian_end_hour       = 7          # پایان رنج آسیا
+    trade_start_hour     = 8          # شروع سشن لندن
+    trade_end_hour       = 16         # پایان زمان مجاز ورود
+    close_all_hour       = 22         # بستن اجباری تمام پوزیشن‌های باز در انتهای روز
+    
+    # ── مدیریت ریسک و ریوارد ──
+    atr_period           = 14
+    buffer_pips          = 2.0        # فیلتر شکست (قیمت باید ۲ پیپ از باکس رد بشه تا فیک‌اوت نشیم)
+    sl_atr_multiplier    = 1.0        # حد ضرر = 1 برابر ATR 
+    tp_atr_multiplier    = 4.0        # تارگت = 4 برابر ATR (Risk:Reward = 1:4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  بارگذاری داده (نگه داشتن دیتای 1 دقیقه)
+#  بارگذاری داده (فقط EURUSD 1m نیاز است)
 # ═══════════════════════════════════════════════════════════════════════════
 def load_data():
     files_eur = sorted(glob.glob('data/*EURUSD*.csv'))
-    files_gbp = sorted(glob.glob('data/*GBPUSD*.csv'))
+    if not files_eur: raise FileNotFoundError("❌ فایل EURUSD پیدا نشد.")
 
-    if not files_eur or not files_gbp:
-        raise FileNotFoundError("❌ فایل‌های CSV پیدا نشدند.")
-
-    def read_pair(paths: list, suffix: str) -> pd.DataFrame:
-        frames = []
-        for p in paths:
-            df = pd.read_csv(p, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
-            df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
-            df = df.set_index('ts')
-            df = df[~df.index.duplicated(keep='last')]
-            df.columns = [f'{col}_{suffix}' for col in df.columns]
-            frames.append(df)
-        return pd.concat(frames).sort_index()
-
-    eur = read_pair(files_eur, 'eur')
-    gbp = read_pair(files_gbp, 'gbp')
-    df_1m = eur.join(gbp, how='inner').dropna()
-
-    # حذف آخر هفته‌ها
+    frames = []
+    for p in files_eur:
+        df = pd.read_csv(p, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
+        df['ts'] = pd.to_datetime(df['ts'], format='%Y%m%d %H%M%S')
+        df = df.set_index('ts')
+        df = df[~df.index.duplicated(keep='last')]
+        frames.append(df)
+    
+    df_1m = pd.concat(frames).sort_index()
     df_1m = df_1m[df_1m.index.weekday < 5]
     print(f"✅ {len(df_1m):,} کندل ۱ دقیقه‌ای بارگذاری شد.")
     return df_1m
 
-# (اندیکاتورها دقیقاً مثل قبل)
 def calc_atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14):
     tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def calc_rsi(c: pd.Series, period: int = 14):
-    delta = c.diff()
-    gain  = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
-
-def calc_adx(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14):
-    up = h.diff(); dn = -l.diff()
-    dmp = up.where((up > dn) & (up > 0), 0.0)
-    dmn = dn.where((dn > up) & (dn > 0), 0.0)
-    tr = calc_atr(h, l, c, 1)
-    s = tr.rolling(period).sum().replace(0, np.nan)
-    dip = 100 * dmp.rolling(period).sum() / s
-    din = 100 * dmn.rolling(period).sum() / s
-    dx = (abs(dip - din) / (dip + din).replace(0, np.nan)) * 100
-    return dx.rolling(period).mean()
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  تولید سیگنال در 15m و مپ کردن به 1m
+#  محاسبه سطوح شکست (روزانه) و انتقال به 1 دقیقه
 # ═══════════════════════════════════════════════════════════════════════════
-def compute_dual_tf_signals(df_1m: pd.DataFrame) -> dict:
-    print("  تبدیل به 15m و استخراج سیگنال‌های اصلی...", end="", flush=True)
+def compute_breakout_levels(df_1m: pd.DataFrame) -> pd.DataFrame:
+    print("  تشخیص باکس‌های آسیا و استخراج لبه‌های معاملاتی...", end="", flush=True)
     C = Config
     
-    # 1. ساخت کندل‌های 15 دقیقه برای تحلیل (بدون Lookahead)
+    # 1. ساخت کندل‌های 15m برای محاسبه ATR پایدار
     df_15m = pd.DataFrame({
-        'c_eur': df_1m['c_eur'].resample('15min').last(),
-        'h_eur': df_1m['h_eur'].resample('15min').max(),
-        'l_eur': df_1m['l_eur'].resample('15min').min(),
-        'c_gbp': df_1m['c_gbp'].resample('15min').last(),
+        'h': df_1m['h'].resample('15min').max(),
+        'l': df_1m['l'].resample('15min').min(),
+        'c': df_1m['c'].resample('15min').last(),
     }).dropna()
-
-    c_e = df_15m['c_eur']; h_e = df_15m['h_eur']; l_e = df_15m['l_eur']; c_g = df_15m['c_gbp']
+    atr_15m = calc_atr(df_15m['h'], df_15m['l'], df_15m['c'], C.atr_period)
     
-    rsi  = calc_rsi(c_e, 14)
-    adx  = calc_adx(h_e, l_e, c_e, 14)
-    hour = pd.Series(df_15m.index.hour, index=df_15m.index)
-
-    eurgbp    = c_e / c_g
-    z_mean_f  = eurgbp.rolling(C.arb_z_fast).mean()
-    z_std_f   = eurgbp.rolling(C.arb_z_fast).std()
-    z_fast    = (eurgbp - z_mean_f) / z_std_f.replace(0, np.nan)
-
-    z_mean_s  = eurgbp.rolling(C.arb_z_slow).mean()
-    z_std_s   = eurgbp.rolling(C.arb_z_slow).std()
-    z_slow    = (eurgbp - z_mean_s) / z_std_s.replace(0, np.nan)
-
-    std_ok    = z_std_f > z_std_f.rolling(C.arb_z_slow).mean() * 0.2
-    time_ok   = hour.between(C.arb_hour_start, C.arb_hour_end)
-    adx_ok    = adx < C.arb_adx_max
-
-    sig_15m = pd.Series(0, index=df_15m.index)
-    sig_15m[(z_fast < -C.arb_z_entry) & (z_slow < -C.arb_z_slow_confirm) & std_ok & adx_ok & time_ok & (rsi < C.arb_rsi_long_max)] = 1
-    sig_15m[(z_fast > C.arb_z_entry) & (z_slow > C.arb_z_slow_confirm) & std_ok & adx_ok & time_ok & (rsi > C.arb_rsi_short_min)] = -1
-    sig_15m = sig_15m.where(sig_15m != sig_15m.shift(), 0)
-
-    # 2. مپ کردن سیگنال 15m به چارت 1m
-    # با shift(1) مطمئن می‌شویم سیگنالِ ساعت 10:00 تا 10:14، دقیقاً در 10:15 روی چارت 1 دقیقه ظاهر می‌شود.
-    sig_shifted = sig_15m.shift(1)
-    z_shifted = z_fast.shift(1)
-
-    df_1m['sig'] = sig_shifted.reindex(df_1m.index).fillna(0)
-    # Z-score را به سمت جلو پُر می‌کنیم تا هر ۱ دقیقه بتوانیم شرط خروج را چک کنیم
-    df_1m['z_fast'] = z_shifted.reindex(df_1m.index).ffill()
-
+    df_1m['atr'] = atr_15m.reindex(df_1m.index).ffill()
+    df_1m['hour'] = df_1m.index.hour
+    df_1m['date'] = df_1m.index.date
+    
+    # 2. پیدا کردن سقف و کف باکس آسیا برای هر روز
+    asian_mask = (df_1m['hour'] >= C.asian_start_hour) & (df_1m['hour'] <= C.asian_end_hour)
+    asian_data = df_1m[asian_mask]
+    
+    daily_asian_high = asian_data.groupby('date')['h'].max()
+    daily_asian_low = asian_data.groupby('date')['l'].min()
+    
+    df_1m['asian_high'] = df_1m['date'].map(daily_asian_high)
+    df_1m['asian_low'] = df_1m['date'].map(daily_asian_low)
+    
     print(" ✓")
-    print(f"  سیگنال‌های ورود 15m (آماده اجرا در 1m): {int((df_1m['sig'] != 0).sum()):,}")
-    
-    return {'sig': df_1m['sig'].values, 'z_fast': df_1m['z_fast'].values}
-
+    return df_1m
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  اجرای پراپ در تایم فریم 1 دقیقه
 # ═══════════════════════════════════════════════════════════════════════════
-def run_prop_backtest_1m(df_1m: pd.DataFrame, signals: dict) -> dict:
+def run_prop_backtest_1m(df: pd.DataFrame) -> dict:
     C    = Config
     pip  = C.pip
     ls   = C.lot_size
     sp   = C.spread_pips
     comm = C.commission_per_lot
 
-    # داده‌های 1 دقیقه برای اجرای دقیق
-    close_a = df_1m['c_eur'].values
-    high_a  = df_1m['h_eur'].values
-    low_a   = df_1m['l_eur'].values
-    sig_a   = signals['sig']
-    z_a     = signals['z_fast']
-    ts_a    = df_1m.index
+    close_a = df['c'].values
+    high_a  = df['h'].values
+    low_a   = df['l'].values
+    atr_a   = df['atr'].values
+    ah_a    = df['asian_high'].values
+    al_a    = df['asian_low'].values
+    hour_a  = df['hour'].values
+    ts_a    = df.index
 
     total_withdrawn  = 0.0
     account_number   = 1
     all_account_logs = []
     all_trades       = []
-    global_eq_curve  = []
-    global_eq_ts     = []
-
+    
     equity      = C.initial_balance
     max_eq      = equity
     open_pos    = None
     cur_day     = None
     day_start_eq = equity
+    traded_today = False
 
-    # گرم‌آپ (باید بر اساس 1 دقیقه محاسبه شود. 500 کندل 15m = 7500 کندل 1m)
-    warmup_1m = C.warmup * 15
-    acc_start_ts  = ts_a[warmup_1m] if len(ts_a) > warmup_1m else ts_a[0]
+    acc_start_ts  = ts_a[0]
     acc_trades    = []
     acc_blown     = False
     PROP_FLOOR    = C.initial_balance * (1 - C.max_total_dd_pct)
@@ -212,89 +149,54 @@ def run_prop_backtest_1m(df_1m: pd.DataFrame, signals: dict) -> dict:
         rec  = {**pos, 'exit': exit_price, 'exit_ts': exit_ts, 'pnl': pnl, 'status': reason}
         return pnl, rec
 
-    sig_indices = set(i for i in np.where(sig_a != 0)[0] if i >= warmup_1m)
-    print(f"\n  شروع شبیه‌سازی پراپ 1 دقیقه‌ای... (کد اورجینال)")
+    print(f"\n  شروع شبیه‌سازی 1 دقیقه‌ای (London Breakout)...")
 
-    for bar in range(warmup_1m, len(ts_a)):
+    for bar in range(1000, len(ts_a)): # پرش از روزهای اول برای تکمیل ATR
         ts  = ts_a[bar]
         day = ts.date()
 
-        global_eq_curve.append(round(equity, 4))
-        global_eq_ts.append(ts)
-
+        # ریست روزانه
         if day != cur_day:
             cur_day = day
             day_start_eq = equity 
+            traded_today = False
 
-        # هندل کردن اکانت Blown
+        # اکانت Blown
         if acc_blown:
             if open_pos is not None:
                 pnl, rec = close_position(open_pos, close_a[bar], ts, 'blown_close')
                 equity += pnl
-                acc_trades.append(rec)
-                all_trades.append(rec)
+                acc_trades.append(rec); all_trades.append(rec)
                 open_pos = None
             
             _log_account(acc_start_ts, ts, equity, total_withdrawn, acc_trades, account_number, "BLOWN", all_account_logs)
             
-            equity = C.initial_balance
-            max_eq = equity
-            day_start_eq = equity
-            account_number += 1
-            acc_start_ts = ts
-            acc_trades = []
-            acc_blown = False
-            PROP_FLOOR = C.initial_balance * (1 - C.max_total_dd_pct)
+            equity = C.initial_balance; max_eq = equity; day_start_eq = equity
+            account_number += 1; acc_start_ts = ts; acc_trades = []; acc_blown = False
             continue
 
-        # ── مدیریت پوزیشن در تایم فریم 1 دقیقه ──
+        # ── مدیریت پوزیشن ──
         if open_pos is not None:
-            hi = high_a[bar]
-            lo = low_a[bar]
-            cp = close_a[bar]
-            d  = open_pos['dir']
-            ep = open_pos['entry']
-            sl = open_pos['sl']
-            tp = open_pos['tp']
+            hi = high_a[bar]; lo = low_a[bar]; cp = close_a[bar]
+            d  = open_pos['dir']; ep = open_pos['entry']
+            sl = open_pos['sl']; tp = open_pos['tp']
 
             hit_sl = (d == 1 and lo <= sl) or (d == -1 and hi >= sl)
             hit_tp = (d == 1 and hi >= tp) or (d == -1 and lo <= tp)
+            if hit_sl and hit_tp: hit_tp = False # بدبینانه
 
-            # اگر در 1 دقیقه هم تارگت بخورد هم استاپ، بدبینانه استاپ را لحاظ می‌کنیم!
-            if hit_sl and hit_tp:
-                hit_tp = False
+            # End of Day Exit (بستن قبل از رول‌اور برای جلوگیری از سواپ و گپ)
+            hit_eod = hour_a[bar] >= C.close_all_hour
 
-            # خروج بر اساس Z-Score
-            zn = z_a[bar]
-            hit_z = not np.isnan(zn) and abs(zn) < C.arb_z_exit
-
-            # Trailing Stop (از کد اصلی)
-            tp_dist = abs(tp - ep)
-            if tp_dist > 0:
-                progress = d * (cp - ep) / tp_dist
-                if progress > 0.5:
-                    breakeven = ep + d * tp_dist * 0.1
-                    open_pos['sl'] = max(sl, breakeven) if d == 1 else min(sl, breakeven)
-                if progress > 0.8:
-                    lock = ep + d * tp_dist * 0.5
-                    open_pos['sl'] = max(open_pos['sl'], lock) if d == 1 else min(open_pos['sl'], lock)
-
-            # Time Stop (در کد اصلی 384 کندل 15m بود که می‌شود 5760 کندل 1m)
-            bars_held_1m = bar - open_pos['entry_bar']
-            hit_time = bars_held_1m >= 5760 
-
-            if hit_sl or hit_tp or hit_z or hit_time:
-                # خروج با قیمت دقیق برخورد
-                if hit_sl: exit_px = open_pos['sl']
+            if hit_sl or hit_tp or hit_eod:
+                if hit_sl: exit_px = sl
                 elif hit_tp: exit_px = tp
-                else: exit_px = cp # Z-Exit یا TimeStop با قیمت کلوز همون دقیقه بسته میشن
+                else: exit_px = cp
                 
-                reason = 'SL' if hit_sl else ('TP' if hit_tp else ('Z-Exit' if hit_z else 'TimeStop'))
+                reason = 'SL' if hit_sl else ('TP' if hit_tp else 'End_Of_Day')
                 pnl, rec = close_position(open_pos, exit_px, ts, reason)
-                equity += pnl
-                max_eq = max(max_eq, equity)
-                acc_trades.append(rec)
-                all_trades.append(rec)
+                equity += pnl; max_eq = max(max_eq, equity)
+                acc_trades.append(rec); all_trades.append(rec)
                 open_pos = None
                 
                 if equity <= PROP_FLOOR or ((equity - day_start_eq) / day_start_eq) <= -C.max_daily_loss_pct:
@@ -302,52 +204,56 @@ def run_prop_backtest_1m(df_1m: pd.DataFrame, signals: dict) -> dict:
 
         # بررسی هدف برداشت
         if (equity - C.initial_balance) / C.initial_balance >= C.profit_target_pct and open_pos is None:
-            withdrawn = equity - C.initial_balance
-            total_withdrawn += withdrawn
+            total_withdrawn += (equity - C.initial_balance)
             _log_account(acc_start_ts, ts, equity, total_withdrawn, acc_trades, account_number, "TARGET_HIT", all_account_logs)
-            print(f"    💰 اکانت #{account_number:>3} | {ts.date()} | برداشت: ${withdrawn:>7.2f} | کل برداشت: ${total_withdrawn:>9.2f}")
-            equity = C.initial_balance
-            max_eq = equity
-            day_start_eq = equity
-            account_number += 1
-            acc_start_ts = ts
-            acc_trades = []
-            PROP_FLOOR = C.initial_balance * (1 - C.max_total_dd_pct)
+            equity = C.initial_balance; day_start_eq = equity; account_number += 1
+            acc_start_ts = ts; acc_trades = []
             continue
 
-        # ورود به پوزیشن
-        if open_pos is None and not acc_blown and bar in sig_indices:
-            sv = int(sig_a[bar])
-            lot = lot_calc(equity, C.arb_sl_pips)
-            ep2 = close_a[bar] + sv * sp * pip / 2  # لحاظ کردن اسپرد در قیمت ورود
-            
-            open_pos = {
-                'account': account_number,
-                'dir': sv,
-                'lot': lot,
-                'entry': ep2,
-                'sl': ep2 - sv * C.arb_sl_pips * pip,
-                'tp': ep2 + sv * C.arb_tp_pips * pip,
-                'entry_ts': ts,
-                'entry_bar': bar,
-            }
+        # ── ورود به پوزیشن ──
+        # فقط یک ترید در روز (جلوگیری از انتقام‌گیری از بازار)، فقط در سشن لندن/نیویورک
+        if open_pos is None and not acc_blown and not traded_today:
+            hr = hour_a[bar]
+            if C.trade_start_hour <= hr < C.trade_end_hour:
+                curr_c = close_a[bar]
+                a_high = ah_a[bar]
+                a_low  = al_a[bar]
+                curr_atr = atr_a[bar]
+                
+                if np.isnan(curr_atr) or np.isnan(a_high): continue
+
+                buffer = C.buffer_pips * pip
+                sl_dist = curr_atr * C.sl_atr_multiplier
+                tp_dist = curr_atr * C.tp_atr_multiplier
+
+                # شرط Long: شکست سقف باکس آسیا
+                if curr_c > (a_high + buffer):
+                    lot = lot_calc(equity, sl_dist / pip)
+                    ep = curr_c + (sp * pip / 2)
+                    open_pos = {'account': account_number, 'dir': 1, 'lot': lot, 'entry': ep,
+                                'sl': ep - sl_dist, 'tp': ep + tp_dist, 'entry_ts': ts, 'entry_bar': bar}
+                    traded_today = True
+
+                # شرط Short: شکست کف باکس آسیا
+                elif curr_c < (a_low - buffer):
+                    lot = lot_calc(equity, sl_dist / pip)
+                    ep = curr_c - (sp * pip / 2)
+                    open_pos = {'account': account_number, 'dir': -1, 'lot': lot, 'entry': ep,
+                                'sl': ep + sl_dist, 'tp': ep - tp_dist, 'entry_ts': ts, 'entry_bar': bar}
+                    traded_today = True
 
     if open_pos is not None:
         pnl, rec = close_position(open_pos, close_a[-1], ts_a[-1], 'EndOfData')
-        equity += pnl
-        acc_trades.append(rec)
-        all_trades.append(rec)
+        equity += pnl; acc_trades.append(rec); all_trades.append(rec)
 
     _log_account(acc_start_ts, ts_a[-1], equity, total_withdrawn, acc_trades, account_number, "ACTIVE/END", all_account_logs)
-
-    return {'all_trades': all_trades, 'acc_logs': all_account_logs, 'eq_curve': global_eq_curve, 'withdrawn': total_withdrawn, 'final_eq': equity, 'total_acc': account_number}
+    return {'all_trades': all_trades, 'acc_logs': all_account_logs, 'withdrawn': total_withdrawn}
 
 def _log_account(sts, ets, eq, wd, trds, acc, rsn, logs):
     C = Config
     logs.append({
         'Account': acc, 'Start': str(sts)[:10], 'End': str(ets)[:10],
         'PnL($)': round(eq - C.initial_balance, 2),
-        'Ret%': round((eq - C.initial_balance) / C.initial_balance * 100, 2),
         'Trades': len(trds), 
         'Win%': round(sum(1 for t in trds if t['pnl'] > 0) / len(trds) * 100 if trds else 0, 1),
         'Status': rsn
@@ -355,14 +261,13 @@ def _log_account(sts, ets, eq, wd, trds, acc, rsn, logs):
 
 if __name__ == "__main__":
     print("═" * 76)
-    print("  CorrArb Prop Simulator — موتور دو-تایم‌فریمی (حذف توهمِ پر شدن)")
+    print("  Prop Simulator — London Volatility Breakout (واقع‌بینانه)")
     print("═" * 76)
-    df_1m = load_data()
-    signals = compute_dual_tf_signals(df_1m)
-    results = run_prop_backtest_1m(df_1m, signals)
+    df = load_data()
+    df = compute_breakout_levels(df)
+    results = run_prop_backtest_1m(df)
     
     print("\n" + "═" * 76)
-    print("  خلاصه نتایج:")
     print(f"  مجموع برداشت خالص: ${results['withdrawn']:,.2f}")
     print(f"  تعداد کل معاملات: {len(results['all_trades'])}")
     
