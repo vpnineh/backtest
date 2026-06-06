@@ -100,9 +100,8 @@ FEATURE_CONFIG = {
 
 def run_pipeline(data_dir: str = 'data',
                  output_dir: str = 'ml_models',
-                 max_splits: int = None,      # None = همه split‌ها
-                 specific_split: int = None,  # ست کردن یک اسپلیت خاص برای موازی‌سازی گیت‌هاب
-                 skip_rl: bool = False,       # True = سریع‌تر اجرا بشه
+                 max_splits: int = None,    # None = همه split‌ها
+                 skip_rl: bool = False,     # True = سریع‌تر اجرا بشه
                  skip_lstm: bool = False):
     
     t0 = datetime.now()
@@ -126,24 +125,11 @@ def run_pipeline(data_dir: str = 'data',
           f"long={( ft['target']==1).sum():,} | "
           f"short={(ft['target']==2).sum():,}")
     
-        # ── ۳. Walk-Forward Splits ──
+    # ── ۳. Walk-Forward Splits ──
     print("\n▶ مرحله ۳: Walk-Forward Splits")
-    # embargo دقیقاً برابر label_horizon تا نشت لیبل به split بعدی مسدود شود.
-    # splits روی ft ساخته می‌شود (نه df) چون ردیف‌های انتهایی با لیبل NaN از ft حذف شده‌اند.
-    splits = walk_forward_splits(
-        ft,
-        **WALK_FORWARD_CONFIG,
-        embargo_bars=FEATURE_CONFIG['label_horizon'],
-    )
-
+    splits = walk_forward_splits(df, **WALK_FORWARD_CONFIG)
     
-    if specific_split is not None:
-        if specific_split >= len(splits):
-            print(f"❌ شماره Split ({specific_split}) از تعداد کل Splitها ({len(splits)}) بیشتر است.")
-            return None
-        splits = [splits[specific_split]]
-        print(f"  (محدود به اجرای موازی: فقط Split شماره {specific_split})")
-    elif max_splits:
+    if max_splits:
         splits = splits[:max_splits]
         print(f"  (محدود به {max_splits} split برای تست)")
     
@@ -159,9 +145,7 @@ def run_pipeline(data_dir: str = 'data',
     
     for i, split in enumerate(splits):
         try:
-            # پیدا کردن ایندکس واقعی اسپلیت برای حفظ یکپارچگی لاگ‌ها و مدل‌های خروجی
-            actual_idx = specific_split if specific_split is not None else i
-            result = trainer.train_split(ft, df, split, actual_idx)
+            result = trainer.train_split(ft, df, split, i)
         except Exception as e:
             print(f"  ❌ Split {i} خطا: {e}")
             import traceback; traceback.print_exc()
@@ -190,7 +174,7 @@ def analyze_consistency(results: list):
     بررسی اینکه آیا نتایج در طول زمان ثابت هستن؟
     این مهم‌ترین معیار برای پراپ هست.
     """
-    if len(results) < 1:
+    if len(results) < 3:
         print("  داده کافی برای تحلیل ثبات نیست")
         return
     
@@ -215,7 +199,7 @@ def analyze_consistency(results: list):
         np.mean(win_rates) > 50 and
         max(dds) < 8.0 and
         pos_splits / len(results) > 0.6
-    ) if len(results) >= 3 else True
+    )
     
     flag = "✅ سیستم پایدار" if stable else "⚠️ نیاز به بهبود"
     print(f"\n  نتیجه ثبات: {flag}")
@@ -294,10 +278,7 @@ def run_quick_test():
     
     # Splits
     print("\n▶ Walk-Forward Splits")
-        splits = walk_forward_splits(
-        ft, train_years=3, val_years=0.5, test_years=0.5,
-        step_months=6, embargo_bars=40,   # = label_horizon همین تابع
-    )
+    splits = walk_forward_splits(df, train_years=3, val_years=0.5, test_years=0.5, step_months=6)
     
     if not splits:
         print("❌ داده کافی نیست حتی برای quick test")
@@ -327,7 +308,6 @@ if __name__ == '__main__':
     parser.add_argument('--data',       default='data',      help='مسیر فایل‌های CSV')
     parser.add_argument('--output',     default='ml_models', help='مسیر ذخیره مدل‌ها')
     parser.add_argument('--max_splits', type=int, default=None, help='حداکثر تعداد split (تست)')
-    parser.add_argument('--split_idx',  type=int, default=None, help='اجرای یک split خاص برای گیت‌هاب اکشنز موازی')
     parser.add_argument('--test',       action='store_true', help='اجرای quick test بدون داده')
     args = parser.parse_args()
     
@@ -335,8 +315,7 @@ if __name__ == '__main__':
         run_quick_test()
     else:
         trainer = run_pipeline(
-            data_dir       = args.data,
-            output_dir     = args.output,
-            max_splits     = args.max_splits,
-            specific_split = args.split_idx,
+            data_dir   = args.data,
+            output_dir = args.output,
+            max_splits = args.max_splits,
         )

@@ -262,20 +262,9 @@ def build_features(df: pd.DataFrame, label_horizon: int = 40) -> pd.DataFrame:
     
     # target کیفی‌تر: میزان بازگشت (برای regression)
     ft['target_ret'] = (ratio_future - ratio) / ratio.replace(0, np.nan)
-
-    # ─────────────────────────────────────────────────────────────────────
-    # پاک‌سازی نشت لیبل: shift(-label_horizon) در انتهای دیتاست NaN می‌سازد.
-    # چون target_long/short با astype(float) به ۰ کلمپ می‌شوند، این ردیف‌ها
-    # به‌صورت کاذب وارد کلاس no-trade می‌شوند. آن‌ها را بر اساس target_ret حذف می‌کنیم.
-    n_before = len(ft)
-    ft = ft.dropna(subset=['target_ret'])
-    n_dropped = n_before - len(ft)
-    if n_dropped:
-        print(f"  ⓘ {n_dropped} ردیف انتهایی با لیبل ناقص حذف شد (label_horizon={label_horizon})")
-
-    print(f"  ✓ — {len(ft.columns)} feature")
+    
+    print(f" ✓ — {len(ft.columns)} feature")
     return ft
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -288,27 +277,23 @@ def walk_forward_splits(
     val_years:   float = 1.0,
     test_years:  float = 1.0,
     step_months: int   = 6,
-    embargo_bars: int  = 40,
 ) -> list:
     """
-    Walk-forward splits با embargo برای حذف data leakage مرزی.
-
-    embargo_bars باید برابر label_horizon باشد (پیش‌فرض ۴۰ کندل) تا
-    ردیف‌هایی که لیبلشان به آینده‌ی بازه‌ی بعدی نگاه می‌کند purge شوند.
-
+    Walk-forward splits بدون هیچ data leakage.
+    
     مثال با ۱۰ سال داده:
         Split 0: train=[2000-2004], val=[2004-2005], test=[2005-2006]
         Split 1: train=[2000.5-2004.5], val=[2004.5-2005.5], test=[2005.5-2006.5]
         ...
-
-    خروجی: list از dict {train, val, test, ...}
+    
+    خروجی: list از dict {train_idx, val_idx, test_idx}
     """
     import pandas as pd
     from dateutil.relativedelta import relativedelta
-
+    
     start = df.index[0]
     end   = df.index[-1]
-
+    
     train_d = relativedelta(years=int(train_years),
                             months=int((train_years % 1) * 12))
     val_d   = relativedelta(years=int(val_years),
@@ -316,31 +301,22 @@ def walk_forward_splits(
     test_d  = relativedelta(years=int(test_years),
                             months=int((test_years % 1) * 12))
     step_d  = relativedelta(months=step_months)
-
+    
     splits = []
     train_start = start
-
+    
     while True:
         val_start  = train_start + train_d
         test_start = val_start   + val_d
         test_end   = test_start  + test_d
-
+        
         if test_end > end:
             break
-
+        
         train_mask = (df.index >= train_start) & (df.index < val_start)
         val_mask   = (df.index >= val_start)   & (df.index < test_start)
         test_mask  = (df.index >= test_start)  & (df.index < test_end)
-
-        # ── Embargo / Purge ──────────────────────────────────────────────
-        # آخرین embargo_bars ردیفِ هر بازه‌ی train و val حذف می‌شوند چون
-        # لیبلشان (shift(-label_horizon)) به ردیف‌های بازه‌ی بعدی نشت می‌کند.
-        if embargo_bars > 0:
-            for mask in (train_mask, val_mask):
-                idx = np.flatnonzero(mask)
-                if idx.size > embargo_bars:
-                    mask[idx[-embargo_bars:]] = False
-
+        
         if train_mask.sum() > 100 and val_mask.sum() > 100 and test_mask.sum() > 100:
             splits.append({
                 'train': df.index[train_mask],
@@ -351,15 +327,15 @@ def walk_forward_splits(
                 'test_start':  test_start,
                 'test_end':    test_end,
             })
-
+        
         train_start += step_d
-
-    print(f"  Walk-forward splits: {len(splits)}  (embargo={embargo_bars} bars)")
+    
+    print(f"  Walk-forward splits: {len(splits)}")
     for i, s in enumerate(splits):
         print(f"    [{i}] train={s['train_start'].date()}→{s['val_start'].date()} "
               f"| val={s['val_start'].date()}→{s['test_start'].date()} "
               f"| test={s['test_start'].date()}→{s['test_end'].date()}")
-
+    
     return splits
 
 
