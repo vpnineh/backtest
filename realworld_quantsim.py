@@ -331,7 +331,9 @@ def run_prop_backtest(df: pd.DataFrame, signals: dict) -> dict:
                 acc_trades, account_number, acc_blown_reason,
                 all_account_logs
             )
-            total_withdrawn    += max(0, equity - 0)  # equity منفی → صفر (پراپ absorb)
+            # اکانت Blown: تریدر فقط اکانت را از دست می‌دهد
+            # پراپ سود/ضرر را absorb می‌کند — هیچ مبلغی به تریدر تعلق نمی‌گیرد
+            # total_withdrawn دست‌نخورده باقی می‌ماند
             equity              = C.initial_balance
             max_eq              = equity
             day_start_eq        = equity
@@ -526,6 +528,7 @@ def compute_stats(results: dict) -> dict:
     trades   = results['all_trades']
     acc_logs = results['account_logs']
     eq_curve = results['eq_curve']
+    eq_ts    = results['eq_ts']          # ← اضافه شد
     total_c  = results['total_curve']
     C        = Config
 
@@ -578,7 +581,7 @@ def compute_stats(results: dict) -> dict:
     # ── آمار اکانت‌ها ──
     n_accounts  = results['total_accounts']
     n_target    = int((al['reason'] == 'TARGET_HIT').sum())
-    n_blown     = int(al['reason'].str.contains('Daily|Total|DD').sum())
+    n_blown     = int(al['reason'].str.contains('DailyDD|TotalDD|blown').sum())
     n_active    = int((al['reason'] == 'ACTIVE/END').sum())
     avg_acc_ret = al[al['reason'] == 'TARGET_HIT']['ret_pct'].mean() if n_target > 0 else 0
 
@@ -595,7 +598,7 @@ def compute_stats(results: dict) -> dict:
 
     return dict(
         trades=t, acc_logs=al,
-        eq_curve=eq_curve, total_curve=total_c,
+        eq_curve=eq_curve, eq_ts=eq_ts, total_curve=total_c,
         total_withdrawn=total_withdrawn,
         final_equity=final_equity,
         total_value=total_value,
@@ -706,12 +709,12 @@ def print_full_report(s: dict) -> str:
         reason    = row['reason']
         if reason == 'TARGET_HIT':
             icon = "💰 WITHDRAW"
-        elif 'Daily' in str(reason) or 'Total' in str(reason):
-            icon = "💥 BLOWN"
+        elif 'DailyDD' in str(reason) or 'TotalDD' in str(reason) or 'blown' in str(reason):
+            icon = f"💥 BLOWN  ({reason[:28]})"
         elif reason == 'ACTIVE/END':
             icon = "🔄 ACTIVE"
         else:
-            icon = f"⚠️  {reason[:12]}"
+            icon = f"⚠️  {reason[:20]}"
 
         lines.append(
             f"  {int(row['account']):>4}  {start_str:>10}  {end_str:>10}  "
@@ -828,17 +831,18 @@ def save_outputs(s: dict, report_txt: str):
     )
 
     # ── Equity Curve CSV ──
+    # total_withdrawn هر بار = total_value - account_equity (واقعی)
+    withdrawn_curve = [
+        round(tv - ae, 2)
+        for tv, ae in zip(s['total_curve'], s['eq_curve'])
+    ]
     eq_df = pd.DataFrame({
-        'ts':            s['eq_ts'],
-        'account_equity':s['eq_curve'],
-        'total_value':   s['total_curve'],
-        'total_withdrawn': [
-            round(s['total_withdrawn'] *
-                  (i / max(len(s['eq_curve'])-1, 1)), 2)
-            for i in range(len(s['eq_curve']))
-        ],
+        'ts':             s['eq_ts'],
+        'account_equity': s['eq_curve'],
+        'total_withdrawn':withdrawn_curve,
+        'total_value':    s['total_curve'],
     })
-    # محاسبه DD صحیح
+    # DD نسبت به peak اکانت (هر بار اکانت ریست میشه، peak هم ریست)
     eq_df['account_dd'] = (
         (eq_df['account_equity'] - eq_df['account_equity'].cummax())
         / eq_df['account_equity'].cummax() * 100
