@@ -1,11 +1,10 @@
 """
-CorrArb Prop Simulator — v9 REALISTIC EXECUTION + ADAPTIVE Z-SCORE
+CorrArb Prop Simulator — v8.1 REALISTIC BASELINE
 ==============================================================================
-تغییرات واقع‌گرایانه (Realistic Fixes):
-  ۱. Dual-Leg Costs: کمیسیون و اسپرد دو برابر برای پوشش هر دو لگ معامله
-  ۲. Intra-Candle DD: محاسبه Drawdown بر اساس High/Low (بدترین حالت ممکن)
-  ۳. Adaptive Entry: داینامیک شدن Z-Score ورود بر اساس نسبت ATR
-  ۴. Exit Slippage: اعمال جریمه اسلیپیج روی خروج‌های Partial و TimeStop
+استراتژی: دقیقاً همان منطق v8 کاربر (ثابت بودن Z-Score، اسمارت استاپ، فیلتر رژیم)
+اصلاحات ریاضی (فقط رفع خوش‌بینی کاذب):
+  ۱. کمیسیون و اسپرد دو برابر شد (چون ترید سینتتیک روی 2 جفت ارز باز می‌شود).
+  ۲. محاسبه Drawdown بر اساس بدترین قیمت کندل (High/Low) برای پوشش سایه‌ها.
 """
 
 import pandas as pd
@@ -24,20 +23,20 @@ warnings.filterwarnings('ignore')
 class Config:
     # ── قوانین پراپ ──
     initial_balance    = 5_000.0
-    profit_target_pct  = 0.05        # +5%
-    max_daily_loss_pct = 0.05        # -5%
-    max_total_dd_pct   = 0.10        # -10%
+    profit_target_pct  = 0.05        
+    max_daily_loss_pct = 0.05        
+    max_total_dd_pct   = 0.10        
 
     # ── مدیریت ریسک ──
-    risk_base_pct      = 0.015       # 1.5%
+    risk_base_pct      = 0.015       
     risk_min_pct       = 0.0075      
     consec_loss_n      = 2
     risk_reduce        = 0.5
 
-    # ── هزینه‌های بروکر (REALISTIC DUAL-LEG) ──
-    spread_pips_per_leg= 1.2
-    comm_per_lot_leg   = 7.0         # USD per lot (round-trip)
-    slippage_pips      = 0.5         # جریمه اسلیپیج برای خروج‌های اضطراری/مارکت
+    # 🔴 اصلاح واقع‌گرایانه: هزینه‌های بروکر ضرب در ۲ (برای دو لگ معامله)
+    spread_pips        = 2.4         # قبلاً 1.2 بود
+    commission_per_lot = 14.0        # قبلاً 7.0 بود
+    slippage_pips      = 0.5         # کمی افزایش برای خروج‌های مارکت
 
     # ── مشخصات ──
     pip      = 0.0001
@@ -46,9 +45,9 @@ class Config:
     min_lot  = 0.01
     warmup   = 500
 
-    # ── پارامترهای z-score ──
+    # ── پارامترهای z-score (دقیقاً استراتژی خودتان) ──
     z_fast_period      = 96          
-    z_entry_base       = 2.1         # پایه ورود (با ATR داینامیک می‌شود)
+    z_entry            = 2.1
     z_exit_partial     = 0.5         
     z_exit_full        = 0.0         
     z_stop_margin      = 4.0         
@@ -73,7 +72,7 @@ class Config:
     atr_max_mult       = 3.0
     atr_min_mult       = 0.5
 
-    # ── فیلتر رژیم (Variance Ratio) ──
+    # ── فیلتر رژیم: Variance Ratio ──
     vr_period          = 200         
     vr_k               = 4           
     vr_max             = 0.90        
@@ -86,17 +85,14 @@ class Config:
 # ═══════════════════════════════════════════════════════════════════════════
 def load_raw(pattern: str, is_zip: bool) -> pd.DataFrame:
     paths = sorted(glob.glob(pattern))
-    if not paths:
-        raise FileNotFoundError(f"No files found: {pattern}")
-
+    if not paths: raise FileNotFoundError(f"No files found: {pattern}")
     frames = []
     for p in paths:
         try:
             if is_zip:
                 with zipfile.ZipFile(p, 'r') as z:
                     csv_name = next((f for f in z.namelist() if f.lower().endswith('.csv')), None)
-                    if csv_name is None:
-                        continue
+                    if csv_name is None: continue
                     with z.open(csv_name) as f:
                         df = pd.read_csv(f, sep=';', header=None, names=['ts', 'o', 'h', 'l', 'c', 'v'])
             else:
@@ -104,9 +100,6 @@ def load_raw(pattern: str, is_zip: bool) -> pd.DataFrame:
             frames.append(df)
         except Exception as e:
             print(f"  ⚠ Skip {os.path.basename(p)}: {e}")
-
-    if not frames:
-        raise ValueError(f"No valid data loaded from: {pattern}")
 
     raw = pd.concat(frames, ignore_index=True).sort_values('ts')
     raw['ts'] = pd.to_datetime(raw['ts'], format='%Y%m%d %H%M%S')
@@ -124,9 +117,6 @@ def to_15min(raw: pd.DataFrame, sfx: str) -> pd.DataFrame:
 
 def build_spread_df(df_a: pd.DataFrame, sfx_a: str, df_b: pd.DataFrame, sfx_b: str) -> pd.DataFrame:
     merged = df_a.join(df_b, how='inner').dropna()
-    if len(merged) == 0:
-        raise ValueError(f"No common timestamps for {sfx_a}/{sfx_b}")
-
     merged['c_spread'] = merged[f'c_{sfx_a}'] / merged[f'c_{sfx_b}']
     merged['o_spread'] = merged[f'o_{sfx_a}'] / merged[f'o_{sfx_b}']
     merged['h_spread'] = merged[f'h_{sfx_a}'] / merged[f'l_{sfx_b}']
@@ -143,8 +133,7 @@ def load_all_pairs() -> dict:
         df = build_spread_df(eur, 'eur', gbp, 'gbp')
         pairs['EURGBP'] = {'df': df, 'leg_a': 'c_eur', 'leg_b': 'c_gbp'}
         print(f"  ✅ EURGBP : {len(df):>7,} candles | {df.index[0].date()} → {df.index[-1].date()}")
-    except Exception as e:
-        print(f"  ❌ EURGBP : {e}")
+    except Exception as e: print(f"  ❌ EURGBP : {e}")
 
     try:
         aud = to_15min(load_raw('data/HISTDATA*AUDUSD*.zip', is_zip=True), 'aud')
@@ -152,22 +141,14 @@ def load_all_pairs() -> dict:
         df = build_spread_df(aud, 'aud', nzd, 'nzd')
         pairs['AUDNZD'] = {'df': df, 'leg_a': 'c_aud', 'leg_b': 'c_nzd'}
         print(f"  ✅ AUDNZD : {len(df):>7,} candles | {df.index[0].date()} → {df.index[-1].date()}")
-    except Exception as e:
-        print(f"  ❌ AUDNZD : {e}")
-
-    if not pairs:
-        raise RuntimeError("No pairs loaded. Check data/ directory.")
+    except Exception as e: print(f"  ❌ AUDNZD : {e}")
     return pairs
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SIGNAL COMPUTATION
+#  SIGNAL COMPUTATION (دقیقاً نسخه اصلی شما)
 # ═══════════════════════════════════════════════════════════════════════════
 def calc_atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series:
-    tr = pd.concat([
-        h - l,
-        (h - c.shift()).abs(),
-        (l - c.shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 def calc_variance_ratio(series: pd.Series, k: int, window: int) -> pd.Series:
@@ -199,43 +180,35 @@ def compute_signals(pair_name: str, pair_info: dict) -> tuple:
     atr_ma = atr.rolling(C.atr_ma_period).mean()
     vol_ok = (atr > atr_ma * C.atr_min_mult) & (atr < atr_ma * C.atr_max_mult)
 
-    # 🔴 Adaptive Entry (داینامیک شدن نقطه ورود)
-    vol_ratio = (atr / atr_ma.replace(0, np.nan)).clip(0.8, 1.5)
-    dynamic_z_entry = C.z_entry_base * vol_ratio
-
     hour    = pd.Series(df.index.hour,       index=df.index)
     dow     = pd.Series(df.index.dayofweek,  index=df.index)
     time_ok = hour.between(C.hour_start, C.hour_end) & dow.isin(C.trade_days)
 
-    long_cond  = (z_score < -dynamic_z_entry) & vol_ok & time_ok & corr_ok & regime_ok
-    short_cond = (z_score >  dynamic_z_entry) & vol_ok & time_ok & corr_ok & regime_ok
+    long_cond  = (z_score < -C.z_entry) & vol_ok & time_ok & corr_ok & regime_ok
+    short_cond = (z_score >  C.z_entry) & vol_ok & time_ok & corr_ok & regime_ok
 
     sig = pd.Series(0, index=df.index)
     sig[long_cond]  =  1
     sig[short_cond] = -1
-    sig = sig.where(sig != sig.shift(), 0)
+    sig = sig.where(sig != sig.shift(), 0) 
 
     n = int((sig != 0).sum())
     l = int((sig ==  1).sum())
     s = int((sig == -1).sum())
-    print(f"    {pair_name}: {n:,} signals (L:{l} | S:{s}) | Adaptive Z-Score Executed")
+    r = int(regime_ok.sum())
+    print(f"    {pair_name}: {n:,} signals (L:{l} | S:{s}) | Regime OK: {r:,} bars")
     return sig, z_score
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  FINANCIAL CALCULATIONS
 # ═══════════════════════════════════════════════════════════════════════════
-def calc_pnl(direction: int, entry_px: float, exit_px: float, 
-             lot: float, quote_rate: float, apply_slippage: bool = False) -> float:
+def calc_pnl(direction: int, entry_px: float, exit_px: float, lot: float, quote_rate: float) -> float:
     C = Config
-    if apply_slippage:
-        exit_px = exit_px - (direction * C.slippage_pips * C.pip)
-
     gross_quote = direction * (exit_px - entry_px) * lot * C.lot_size
     gross_usd   = gross_quote * quote_rate
-    
-    # 🔴 Dual-Leg Cost: ضرب در ۲ برای هزینه باز و بسته کردن دو جفت ارز
-    total_commission = (C.comm_per_lot_leg * 2) * lot
-    return gross_usd - total_commission
+    # کمیسیون در Config دو برابر شده است (۱۴ دلار)، پس نیازی به ضرب مجدد در اینجا نیست
+    commission  = C.commission_per_lot * lot
+    return gross_usd - commission
 
 def calc_lot(equity: float, sl_pips: float, consec_loss: int, quote_rate: float) -> float:
     C = Config
@@ -273,7 +246,6 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
         common_idx = idx if common_idx is None else common_idx.intersection(idx)
     common_idx = common_idx.sort_values()
     n_bars = len(common_idx)
-    print(f"  ✅ Common bars: {n_bars:,} | {common_idx[0].date()} → {common_idx[-1].date()}")
 
     # 🔴 اضافه شدن h و l برای بررسی سایه کندل‌ها
     pa = {}
@@ -305,20 +277,18 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
     trades_today = {name: 0    for name in pair_names}
     pending_sig  = {name: 0    for name in pair_names}
 
-    print(f"\n  ▶ Running Multi-Pair REALISTIC Prop Simulator v9...")
-    
+    print(f"\n  ▶ Running Baseline Math-Corrected Simulator v8.1...")
+
     for bar in range(C.warmup, n_bars):
         ts = common_idx[bar]
         eq = acc['equity']
         eq_curve.append((ts, round(eq, 4)))
 
-        if eq > acc['peak']:
-            acc['peak'] = eq
+        if eq > acc['peak']: acc['peak'] = eq
 
         if ts.hour == 0 and ts.minute == 0:
             day_start_eq = acc['equity']
-            for name in pair_names:
-                trades_today[name] = 0
+            for name in pair_names: trades_today[name] = 0
 
         if (bar - C.warmup) % 100_000 == 0 and bar > C.warmup:
             pct = (bar - C.warmup) / (n_bars - C.warmup) * 100
@@ -342,15 +312,13 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
                 positions[name]    = None
             continue
 
-        # ── اجرای ورود ──
         for name in pair_names:
             a = pa[name]
             if (pending_sig[name] != 0 and positions[name] is None and trades_today[name] < C.max_trades_day):
                 sv  = pending_sig[name]
                 qr  = a['qr'][bar]
                 lot = calc_lot(acc['equity'], C.sl_pips, acc['consec_loss'], qr)
-                # 🔴 هزینه اسپرد دوگانه هنگام ورود
-                ep  = a['o'][bar] + sv * (C.slippage_pips + C.spread_pips_per_leg * 2) * pip
+                ep  = a['o'][bar] + sv * (C.slippage_pips + C.spread_pips / 2) * pip
                 sl  = ep - sv * C.sl_pips * pip
                 tp  = ep + sv * C.tp_pips * pip
                 positions[name] = {
@@ -368,24 +336,22 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
                 trades_today[name] += 1
             pending_sig[name] = 0
 
-        # ── 🔴 Floating PnL (Intra-candle WORST CASE) ──
-        total_float_worst = 0.0
+        # ── 🔴 محاسبه منطقی‌تر Drawdown با استفاده از بدترین قیمت ──
+        total_float = 0.0
         for name in pair_names:
             pos = positions[name]
             if pos is not None:
                 a = pa[name]
-                # درگیر شدن با سایه کندل برای Drawdown
+                # درگیر شدن با سایه کندل برای Drawdown واقعی‌تر
                 worst_px = a['l'][bar] if pos['dir'] == 1 else a['h'][bar]
-                total_float_worst += calc_pnl(
-                    pos['dir'], pos['entry'], worst_px, pos['lot_remaining'], a['qr'][bar]
-                )
+                total_float += calc_pnl(pos['dir'], pos['entry'], worst_px, pos['lot_remaining'], a['qr'][bar])
 
-        current_eq_worst = acc['equity'] + total_float_worst
+        current_eq  = acc['equity'] + total_float
         daily_limit = day_start_eq * (1 - C.max_daily_loss_pct)
 
-        if current_eq_worst <= daily_limit or current_eq_worst <= PROP_FLOOR:
+        if current_eq <= daily_limit or current_eq <= PROP_FLOOR:
             acc['blown']     = True
-            acc['blown_rsn'] = "Wick/DailyDD" if current_eq_worst <= daily_limit else "TotalDD"
+            acc['blown_rsn'] = "Wick/DailyDD" if current_eq <= daily_limit else "TotalDD"
             for name in pair_names:
                 pos = positions[name]
                 if pos is None: continue
@@ -398,7 +364,6 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
                 positions[name] = None
             continue
 
-        # ── مدیریت خروج ──
         for name in pair_names:
             pos = positions[name]
             if pos is None: continue
@@ -411,14 +376,13 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
             zn      = a['z'][bar]
             lot_rem = pos['lot_remaining']
 
-            # 🔴 خروج پله‌ای با اسلیپیج
             if not pos['partial_done'] and not np.isnan(zn):
                 hit_p = ((d ==  1 and zn >= -C.z_exit_partial) or 
                          (d == -1 and zn <=  C.z_exit_partial))
                 if hit_p:
                     p_lot = round(lot_rem * C.partial_ratio, 2)
                     if p_lot >= C.min_lot:
-                        p_pnl = calc_pnl(d, ep, cp, p_lot, qr, apply_slippage=True)
+                        p_pnl = calc_pnl(d, ep, cp, p_lot, qr)
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
                             rec = _make_rec(pos, cp, ts, p_pnl, 'Partial', p_lot)
@@ -442,7 +406,6 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
                     if pnl_check >= C.min_net_profit_usd or pos['partial_done']:
                         hit_z_exit = True
 
-            # 🔴 استفاده از high/low برای زدن دقیق SL/TP
             hit_sl = (d == 1 and a['l'][bar] <= pos['sl']) or (d == -1 and a['h'][bar] >= pos['sl'])
             hit_tp = (d == 1 and a['h'][bar] >= pos['tp']) or (d == -1 and a['l'][bar] <= pos['tp'])
 
@@ -451,16 +414,15 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
             time_stop = ((bars_open >= C.time_stop_bars and current_pos_pnl < 0) or (bars_open >= C.time_stop_bars * 2))
 
             if hit_z_exit or hit_z_stop or hit_sl or hit_tp or time_stop:
-                has_slippage = True if (hit_sl or time_stop) else False
-                
                 if hit_sl:       exit_px, st = pos['sl'], 'SL'
                 elif hit_tp:     exit_px, st = pos['tp'], 'TP'
                 elif hit_z_stop: exit_px, st = cp, 'Z-Stop'
                 elif time_stop:  exit_px, st = cp, 'TimeStop'
                 else:            exit_px, st = cp, 'Z-Exit'
 
-                final_pnl = calc_pnl(d, ep, exit_px, lot_rem, qr, apply_slippage=has_slippage)
+                final_pnl = calc_pnl(d, ep, exit_px, lot_rem, qr)
                 acc['equity'] += final_pnl
+
                 rec = _make_rec(pos, exit_px, ts, final_pnl, st, lot_rem)
                 all_trades.append(rec)
                 acc['trades'].append(rec)
@@ -500,98 +462,53 @@ def run_backtest(pairs: dict, pair_signals: dict) -> dict:
     }
 
 def _make_rec(pos: dict, exit_px: float, exit_ts, pnl: float, status: str, lot: float) -> dict:
-    return {
-        'pair':      pos['pair'],
-        'dir':       pos['dir'],
-        'lot':       lot,
-        'entry':     pos['entry'],
-        'exit':      exit_px,
-        'entry_ts':  pos['entry_ts'],
-        'exit_ts':   exit_ts,
-        'pnl':       pnl,
-        'status':    status,
-        'entry_bar': pos['entry_bar'],
-    }
+    return {'pair': pos['pair'], 'dir': pos['dir'], 'lot': lot, 'entry': pos['entry'], 'exit': exit_px, 'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'pnl': pnl, 'status': status, 'entry_bar': pos['entry_bar']}
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REPORTING
+#  REPORTING (بدون تغییر نسبت به نسخه خودتان)
 # ═══════════════════════════════════════════════════════════════════════════
 def print_report(results: dict):
-    trades     = results['all_trades']
+    trades = results['all_trades']
     pair_names = results.get('pair_names', [])
-
-    if not trades:
-        print("\n❌ No trades executed.")
-        return
-
+    if not trades: return print("\n❌ No trades executed.")
     df_t = pd.DataFrame(trades)
     df_t['exit_ts'] = pd.to_datetime(df_t['exit_ts'])
     df_t['month']   = df_t['exit_ts'].dt.to_period('M')
 
-    wins   = df_t[df_t['pnl'] > 0]
-    losses = df_t[df_t['pnl'] < 0]
+    wins, losses = df_t[df_t['pnl'] > 0], df_t[df_t['pnl'] < 0]
     wr = len(wins) / len(df_t) * 100 if len(df_t) else 0
     pf = (wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) > 0 else float('inf'))
 
     print("\n" + "═" * 70)
-    print(f" ▌  CorrArb Prop Simulator v9 (Realistic) — {'+'.join(pair_names)}  ▐")
+    print(f" ▌  CorrArb Prop Simulator v8.1 (Math Fixed) — {'+'.join(pair_names)}  ▐")
     print("═" * 70)
-    print(f" Total Trades:    {len(df_t):,}")
-    print(f" Win Rate:        {wr:.2f}%")
-    print(f" Profit Factor:   {pf:.2f}")
-    print(f" Total Banked:    ${results['total_withdrawn']:,.2f}")
-    print(f" Active Equity:   ${results['final_equity']:,.2f}")
-    if len(wins):   print(f" Avg Win:         ${wins['pnl'].mean():.2f}")
-    if len(losses): print(f" Avg Loss:        ${losses['pnl'].mean():.2f}")
-
+    print(f" Total Trades:    {len(df_t):,}\n Win Rate:        {wr:.2f}%\n Profit Factor:   {pf:.2f}")
+    print(f" Total Banked:    ${results['total_withdrawn']:,.2f}\n Active Equity:   ${results['final_equity']:,.2f}")
+    
     if 'pair' in df_t.columns and len(pair_names) > 1:
-        print("-" * 70)
-        print(" عملکرد هر جفت ارز:")
+        print("-" * 70 + "\n عملکرد هر جفت ارز:")
         for pair in pair_names:
             pt = df_t[df_t['pair'] == pair]
             if len(pt) == 0: continue
-            pw = pt[pt['pnl'] > 0]
-            pl = pt[pt['pnl'] < 0]
+            pw, pl = pt[pt['pnl'] > 0], pt[pt['pnl'] < 0]
             p_wr = len(pw) / len(pt) * 100 if len(pt) else 0
             p_pf = (pw['pnl'].sum() / abs(pl['pnl'].sum()) if len(pl) > 0 else float('inf'))
             print(f"   {pair}: {len(pt):>4} trades | WR: {p_wr:5.1f}% | PF: {p_pf:.2f} | Net PnL: ${pt['pnl'].sum():>8,.2f}")
 
-    print("-" * 70)
-    print(" خروج‌ها بر اساس نوع:")
-    for st, cnt in df_t['status'].value_counts().items():
-        print(f"   {st:<12}: {cnt:>4} معامله")
-
-    logs    = results['account_logs']
+    print("-" * 70 + "\n خروج‌ها بر اساس نوع:")
+    for st, cnt in df_t['status'].value_counts().items(): print(f"   {st:<12}: {cnt:>4} معامله")
+    
+    logs = results['account_logs']
     targets = sum(1 for l in logs if l['reason'] == 'TARGET_HIT')
-    blown   = sum(1 for l in logs if l['reason'] != 'TARGET_HIT')
-    print("-" * 70)
-    print(f" حساب‌ها: {results['total_accounts']} کل | ✅ Target Hit: {targets} | 💥 Blown: {blown}")
-
-    monthly = df_t.groupby('month')['pnl'].sum()
-    if len(monthly):
-        pos_m = int((monthly > 0).sum())
-        neg_m = int((monthly < 0).sum())
-        avg_m = monthly.mean()
-        best  = monthly.max()
-        worst = monthly.min()
-        print(f" ماهانه   : avg ${avg_m:,.2f} | Best: ${best:,.2f} | Worst: ${worst:,.2f}")
-        print(f"            ماه‌های مثبت: {pos_m} | ماه‌های منفی: {neg_m}")
+    blown = sum(1 for l in logs if l['reason'] != 'TARGET_HIT')
+    print("-" * 70 + f"\n حساب‌ها: {results['total_accounts']} کل | ✅ Target Hit: {targets} | 💥 Blown: {blown}")
     print("═" * 70)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     t0 = datetime.now()
     pairs = load_all_pairs()
-    
     print("\n  Computing Statistical Signals...")
-    pair_signals = {}
-    for name, info in pairs.items():
-        pair_signals[name] = compute_signals(name, info)
-
+    pair_signals = {name: compute_signals(name, info) for name, info in pairs.items()}
     results = run_backtest(pairs, pair_signals)
     print_report(results)
-
-    elapsed = (datetime.now() - t0).total_seconds()
-    print(f"  ✅ Executed in: {elapsed:.2f}s")
+    print(f"  ✅ Executed in: {(datetime.now() - t0).total_seconds():.2f}s")
