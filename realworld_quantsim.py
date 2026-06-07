@@ -1,8 +1,14 @@
 """
-CorrArb v13 — Multi-Mode Risk Management Engine
-================================================
-AUDNZD + AUDCAD + GBPCAD + GBPCHF
-Includes automated correlation filters: Split Risk & Best Z-Score
+CorrArb v15 — Improved R:R + Better Signal Quality
+===================================================
+تغییرات نسبت به v14b:
+1. partial_ratio: 0.75 → 0.50 (نگه داشتن بیشتر)
+2. z_exit_partial: 0.50 → 0.30 (دیرتر partial exit)
+3. min_net_profit_usd: 15 → 8
+4. bad_hours: 8 ساعت → 4 ساعت
+5. TP افزایش / SL کاهش → بهبود R:R
+6. z_entry: 2.1 → 2.0 (سیگنال بیشتر)
+7. trailing stop بعد از partial
 """
 
 import pandas as pd
@@ -27,19 +33,22 @@ class GlobalConfig:
     consec_loss_n      = 2
     risk_reduce        = 0.5
     cooldown_days      = 10
-    monthly_loss_threshold = -250.0
+    monthly_loss_threshold = -200.0
+
     hour_start         = 2
-    hour_end           = 19
-    bad_hours          = {4, 5, 7, 9, 13, 18, 20}
+    hour_end           = 20
+    bad_hours          = {4, 5, 13, 20}       # v14b: {4,5,7,9,13,18,20}
     trade_days         = [0, 1, 2, 3, 4]
     max_trades_day     = 2
+
     z_fast_period      = 96
-    z_entry            = 2.1
-    z_exit_partial     = 0.50
+    z_entry            = 2.0                   # v14b: 2.1
+    z_exit_partial     = 0.30                  # v14b: 0.50
     z_exit_full        = 0.0
     z_stop_margin      = 4.0
-    min_net_profit_usd = 15.0
-    partial_ratio      = 0.75
+    min_net_profit_usd = 8.0                   # v14b: 15.0
+    partial_ratio      = 0.50                  # v14b: 0.75
+
     atr_period         = 14
     atr_ma_period      = 96
     atr_max_mult       = 3.0
@@ -47,6 +56,19 @@ class GlobalConfig:
     vr_period          = 200
     vr_k               = 4
     corr_period        = 96
+
+    # trailing stop بعد از partial
+    trailing_atr_mult  = 2.0                   # جدید
+
+    # Risk Control
+    dd_levels = [
+        (0.04, 0.75),
+        (0.07, 0.50),
+        (0.09, 0.30),
+    ]
+    rolling_pf_n   = 30
+    rolling_pf_bad = 0.80
+    rolling_pf_mult= 0.80
 
 
 PAIR_CFG = {
@@ -56,7 +78,8 @@ PAIR_CFG = {
         'spread_pip': 2.5, 'pip_size': 0.0001,
         'vr_max': 0.75, 'corr_min': 0.80,
         'risk_pct': 0.015, 'risk_min': 0.005,
-        'sl_pips': 30.0, 'tp_pips': 90.0,
+        'sl_pips': 25.0,   # v14b: 30.0
+        'tp_pips': 112.0,  # v14b: 90.0
     },
     'AUDCAD': {
         'leg1': 'AUDUSD', 'leg2': 'USDCAD',
@@ -64,7 +87,8 @@ PAIR_CFG = {
         'spread_pip': 2.5, 'pip_size': 0.0001,
         'vr_max': 0.85, 'corr_min': 0.55,
         'risk_pct': 0.010, 'risk_min': 0.004,
-        'sl_pips': 25.0, 'tp_pips': 75.0,
+        'sl_pips': 20.0,   # v14b: 25.0
+        'tp_pips': 90.0,   # v14b: 75.0
     },
     'GBPCAD': {
         'leg1': 'GBPUSD', 'leg2': 'USDCAD',
@@ -72,7 +96,8 @@ PAIR_CFG = {
         'spread_pip': 4.0, 'pip_size': 0.0001,
         'vr_max': 0.88, 'corr_min': 0.45,
         'risk_pct': 0.008, 'risk_min': 0.003,
-        'sl_pips': 28.0, 'tp_pips': 84.0,
+        'sl_pips': 22.0,   # v14b: 28.0
+        'tp_pips': 100.0,  # v14b: 84.0
     },
     'GBPCHF': {
         'leg1': 'GBPUSD', 'leg2': 'USDCHF',
@@ -80,7 +105,8 @@ PAIR_CFG = {
         'spread_pip': 3.0, 'pip_size': 0.0001,
         'vr_max': 0.90, 'corr_min': 0.40,
         'risk_pct': 0.007, 'risk_min': 0.003,
-        'sl_pips': 35.0, 'tp_pips': 105.0,
+        'sl_pips': 28.0,   # v14b: 35.0
+        'tp_pips': 126.0,  # v14b: 105.0
     },
 }
 
@@ -189,7 +215,11 @@ def build_pair(pcfg):
 # SIGNALS
 # ═══════════════════════════════════════════════════════
 def calc_atr(h, l, c, period=14):
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 
@@ -218,19 +248,50 @@ def compute_signals(df, pcfg):
 
     atr    = calc_atr(df['h_spread'], df['l_spread'], df['c_spread'], G.atr_period)
     atr_ma = atr.rolling(G.atr_ma_period).mean()
-    vol_ok = ((atr > atr_ma * G.atr_min_mult) & (atr < atr_ma * G.atr_max_mult))
+    vol_ok = ((atr > atr_ma * G.atr_min_mult) &
+              (atr < atr_ma * G.atr_max_mult))
 
     hour    = pd.Series(df.index.hour, index=df.index)
     dow     = pd.Series(df.index.dayofweek, index=df.index)
     time_ok = (hour.between(G.hour_start, G.hour_end) &
-               (~hour.isin(G.bad_hours)) & dow.isin(G.trade_days))
+               (~hour.isin(G.bad_hours)) &
+               dow.isin(G.trade_days))
 
     sig  = pd.Series(0, index=df.index)
     cond = vol_ok & time_ok & corr_ok & regime_ok
     sig[(z < -G.z_entry) & cond] =  1
     sig[(z >  G.z_entry) & cond] = -1
     sig = sig.where(sig != sig.shift(), 0)
-    return sig, z
+
+    # ATR را هم برمی‌گردانیم برای trailing stop
+    return sig, z, atr
+
+
+# ═══════════════════════════════════════════════════════
+# RISK MULTIPLIER
+# ═══════════════════════════════════════════════════════
+def get_risk_mult(equity, peak, pnl_hist, month_pnl, month_threshold):
+    G   = GlobalConfig
+    mult = 1.0
+
+    if peak > 0:
+        dd = (peak - equity) / peak
+        for dd_thresh, dd_mult in G.dd_levels:
+            if dd >= dd_thresh:
+                mult = min(mult, dd_mult)
+
+    if len(pnl_hist) >= G.rolling_pf_n // 2:
+        recent = pnl_hist[-G.rolling_pf_n:]
+        wins   = sum(p for p in recent if p > 0)
+        losses = abs(sum(p for p in recent if p < 0))
+        rpf    = wins / losses if losses > 0 else 1.5
+        if rpf < G.rolling_pf_bad:
+            mult *= G.rolling_pf_mult
+
+    if month_pnl < month_threshold:
+        mult *= 0.60
+
+    return max(mult, 0.20)
 
 
 # ═══════════════════════════════════════════════════════
@@ -242,25 +303,25 @@ def pnl_calc(d, entry, xp, lot, qr, pip):
 
 
 def new_acc(ts):
-    G = GlobalConfig
     return {
-        'equity': G.initial_balance, 'start_ts': ts, 'trades': [],
-        'blown': False, 'blown_rsn': '', 'peak': G.initial_balance,
+        'equity': GlobalConfig.initial_balance,
+        'start_ts': ts, 'trades': [],
+        'blown': False, 'blown_rsn': '',
+        'peak': GlobalConfig.initial_balance,
         'consec_loss': 0,
     }
 
 
-def run_portfolio(pair_data, corr_mode='none'):
+def run_portfolio(pair_data):
     G = GlobalConfig
     cidx = None
-    for name, (df, sig, z, pcfg) in pair_data.items():
+    for name, (df, sig, z, atr, pcfg) in pair_data.items():
         cidx = df.index if cidx is None else cidx.intersection(df.index)
     cidx = cidx.sort_values()
     N = len(cidx)
 
     pa = {}
-    pair_currs = {}
-    for name, (df, sig, z, pcfg) in pair_data.items():
+    for name, (df, sig, z, atr, pcfg) in pair_data.items():
         df_r = df.reindex(cidx).ffill()
         pa[name] = {
             'o':   df_r['o_spread'].values.astype(float),
@@ -268,9 +329,9 @@ def run_portfolio(pair_data, corr_mode='none'):
             'qr':  df_r['quote_rate'].values.astype(float),
             'sig': sig.reindex(cidx).fillna(0).values.astype(int),
             'z':   z.reindex(cidx).fillna(np.nan).values.astype(float),
+            'atr': atr.reindex(cidx).ffill().fillna(0).values.astype(float),
             'cfg': pcfg,
         }
-        pair_currs[name] = [name[:3], name[3:]]
 
     FLOOR  = G.initial_balance * (1 - G.max_total_dd_pct)
     TARGET = G.initial_balance * (1 + G.profit_target_pct)
@@ -284,6 +345,7 @@ def run_portfolio(pair_data, corr_mode='none'):
     all_trades   = []
     acc_logs     = []
     eq_curve     = []
+    pnl_hist     = []
 
     positions  = {n: None for n in pair_data}
     day_trades = {n: 0    for n in pair_data}
@@ -291,208 +353,302 @@ def run_portfolio(pair_data, corr_mode='none'):
     prev_date  = None
     prev_month = None
 
-    print(f"  ▶ Portfolio: {list(pair_data.keys())} | Mode: {corr_mode.upper()}")
+    print(f"  ▶ Portfolio: {list(pair_data.keys())}")
+    print(f"    Bars:{N:,} | {cidx[0].date()} → {cidx[-1].date()}")
 
     for bar in range(G.warmup, N):
         ts        = cidx[bar]
         cur_date  = ts.date()
         cur_month = (ts.year, ts.month)
 
+        # روز جدید
         if cur_date != prev_date:
             day_eq = acc['equity']
-            for n in pair_data: day_trades[n] = 0
-            eq_curve.append({'date': str(cur_date),
-                             'equity': acc['equity'] + withdrawn})
+            for n in pair_data:
+                day_trades[n] = 0
+            eq_curve.append({
+                'date':       str(cur_date),
+                'equity':     acc['equity'] + withdrawn,
+                'account_eq': acc['equity'],
+            })
             prev_date = cur_date
 
+        # ماه جدید
         if cur_month != prev_month:
             month_eq   = acc['equity']
             prev_month = cur_month
 
+        # peak update
         if acc['equity'] > acc['peak']:
             acc['peak'] = acc['equity']
 
         in_cd = cooldown_til is not None and ts < cooldown_til
 
+        # ── blown ──
         if acc['blown']:
             acc_logs.append({
-                'reason': acc['blown_rsn'],
-                'pnl': acc['equity'] - G.initial_balance,
-                'days': (ts - acc['start_ts']).days,
+                'reason':   acc['blown_rsn'],
+                'pnl':      acc['equity'] - G.initial_balance,
+                'days':     (ts - acc['start_ts']).days,
                 'n_trades': len(acc['trades']),
+                'end_ts':   ts,
             })
+            print(f"    💥 #{acc_num:>3} | {ts.date()} | "
+                  f"${acc['equity']:.2f} | {acc['blown_rsn']}")
             cooldown_til = ts + pd.Timedelta(days=G.cooldown_days)
             acc_num += 1
             acc = new_acc(ts)
             day_eq = month_eq = acc['equity']
             for n in pair_data:
-                day_trades[n] = 0; pending[n] = 0; positions[n] = None
-            prev_date = cur_date; prev_month = cur_month
+                day_trades[n] = 0
+                pending[n]    = 0
+                positions[n]  = None
+            pnl_hist   = []
+            prev_date  = cur_date
+            prev_month = cur_month
             continue
 
-        if in_cd: continue
+        if in_cd:
+            continue
 
-        m_stressed = (acc['equity'] - month_eq) < G.monthly_loss_threshold
+        # ── risk multiplier ──
+        month_pnl = acc['equity'] - month_eq
+        risk_mult = get_risk_mult(
+            acc['equity'], acc['peak'], pnl_hist,
+            month_pnl, G.monthly_loss_threshold)
 
-        candidates = [n for n in pair_data if pending[n] != 0 and positions[n] is None and day_trades[n] < G.max_trades_day]
-        active_pairs = [n for n in pair_data if positions[n] is not None]
-
-        if corr_mode == 'best_z' and candidates:
-            candidates.sort(key=lambda n: abs(pa[n]['z'][bar]) if not np.isnan(pa[n]['z'][bar]) else 0, reverse=True)
-            used_currs = set(c for p in active_pairs for c in pair_currs[p])
-            
-            for n in candidates:
-                if set(pair_currs[n]) & used_currs:
-                    pending[n] = 0
-                else:
-                    used_currs.update(pair_currs[n])
-
-        # open
+        # ── open pending ──
         for name in pair_data:
             a    = pa[name]
             pcfg = a['cfg']
-            if (pending[name] != 0 and positions[name] is None
+            if (pending[name] != 0
+                    and positions[name] is None
                     and day_trades[name] < G.max_trades_day):
-                sv   = pending[name]
-                pip  = pcfg['pip_size']
-                sp   = pcfg['spread_pip']
-                qr   = a['qr'][bar]
-                risk = pcfg['risk_pct'] * (0.5 if m_stressed else 1.0)
+
+                sv  = pending[name]
+                pip = pcfg['pip_size']
+                sp  = pcfg['spread_pip']
+                qr  = a['qr'][bar]
+
+                risk = pcfg['risk_pct'] * risk_mult
                 if acc['consec_loss'] >= G.consec_loss_n:
                     risk = max(risk * G.risk_reduce, pcfg['risk_min'])
 
-                if corr_mode == 'split':
-                    all_involved = active_pairs + [k for k in pair_data if pending[k] != 0 and positions[k] is None and day_trades[k] < G.max_trades_day]
-                    max_overlap = 1
-                    for c in pair_currs[name]:
-                        c_count = sum(1 for x in all_involved if c in pair_currs[x])
-                        max_overlap = max(max_overlap, c_count)
-                    risk = risk / max_overlap
-
                 pv  = pip * G.lot_size * qr
-                if pv <= 0: pv = 10.0
+                if pv <= 0:
+                    pv = 10.0
                 lot = round(float(np.clip(
                     acc['equity'] * risk / (pcfg['sl_pips'] * pv),
                     G.min_lot, G.max_lot)), 2)
+
                 ep = a['o'][bar] + sv * (G.slippage_pips + sp / 2) * pip
                 positions[name] = {
-                    'dir': sv, 'lot': lot, 'lot_rem': lot,
-                    'partial_done': False, 'entry': ep,
-                    'sl': ep - sv * pcfg['sl_pips'] * pip,
-                    'tp': ep + sv * pcfg['tp_pips'] * pip,
-                    'entry_ts': ts, 'entry_bar': bar, 'pip': pip,
+                    'dir':          sv,
+                    'lot':          lot,
+                    'lot_rem':      lot,
+                    'partial_done': False,
+                    'entry':        ep,
+                    'sl':           ep - sv * pcfg['sl_pips'] * pip,
+                    'tp':           ep + sv * pcfg['tp_pips'] * pip,
+                    'trail_sl':     None,   # trailing stop فعال بعد از partial
+                    'entry_ts':     ts,
+                    'entry_bar':    bar,
+                    'pip':          pip,
                 }
                 day_trades[name] += 1
             pending[name] = 0
 
-        # float
+        # ── float equity & daily/total DD check ──
         total_float = sum(
             pnl_calc(p['dir'], p['entry'], pa[n]['c'][bar],
                      p['lot_rem'], pa[n]['qr'][bar], p['pip'])
-            for n in pair_data if (p := positions[n]) is not None
+            for n in pair_data
+            if (p := positions[n]) is not None
         )
         cur_eq    = acc['equity'] + total_float
         daily_lim = day_eq * (1 - G.max_daily_loss_pct)
 
         if cur_eq <= daily_lim or cur_eq <= FLOOR:
             rsn = "DailyDD" if cur_eq <= daily_lim else "TotalDD"
-            acc['blown'] = True; acc['blown_rsn'] = rsn
+            acc['blown'] = True
+            acc['blown_rsn'] = rsn
             for name in pair_data:
                 pos = positions[name]
-                if pos is None: continue
-                pnl = pnl_calc(pos['dir'], pos['entry'], pa[name]['c'][bar],
-                               pos['lot_rem'], pa[name]['qr'][bar], pos['pip'])
+                if pos is None:
+                    continue
+                pnl = pnl_calc(pos['dir'], pos['entry'],
+                               pa[name]['c'][bar],
+                               pos['lot_rem'],
+                               pa[name]['qr'][bar], pos['pip'])
                 acc['equity'] += pnl
-                all_trades.append({'pair': name, 'pnl': pnl,
-                                   'status': 'BLOWN', 'exit_ts': ts})
+                all_trades.append({
+                    'pair': name, 'pnl': pnl,
+                    'status': 'BLOWN', 'exit_ts': ts,
+                })
                 acc['trades'].append(all_trades[-1])
                 positions[name] = None
             continue
 
-        # exit
+        # ── exit logic ──
         for name in pair_data:
             pos = positions[name]
-            if pos is None: continue
-            a    = pa[name]; pcfg = a['cfg']
-            cp   = a['c'][bar]; d = pos['dir']
-            ep   = pos['entry']; zn = a['z'][bar]
-            lr   = pos['lot_rem']; qr = a['qr'][bar]; pip = pos['pip']
+            if pos is None:
+                continue
 
+            a    = pa[name]
+            pcfg = a['cfg']
+            cp   = a['c'][bar]
+            d    = pos['dir']
+            ep   = pos['entry']
+            zn   = a['z'][bar]
+            lr   = pos['lot_rem']
+            qr   = a['qr'][bar]
+            pip  = pos['pip']
+            atr_now = a['atr'][bar]
+
+            # ── partial exit ──
             if not pos['partial_done'] and not np.isnan(zn):
-                if ((d==1 and zn>=-G.z_exit_partial) or (d==-1 and zn<=G.z_exit_partial)):
+                if ((d ==  1 and zn >= -G.z_exit_partial) or
+                        (d == -1 and zn <=  G.z_exit_partial)):
                     p_lot = round(lr * G.partial_ratio, 2)
                     if p_lot >= G.min_lot:
                         p_pnl = pnl_calc(d, ep, cp, p_lot, qr, pip)
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
-                            all_trades.append({'pair': name, 'pnl': p_pnl,
-                                               'status': 'Partial', 'exit_ts': ts})
+                            pnl_hist.append(p_pnl)
+                            all_trades.append({
+                                'pair': name, 'pnl': p_pnl,
+                                'status': 'Partial', 'exit_ts': ts,
+                            })
                             acc['trades'].append(all_trades[-1])
-                            pos['lot_rem'] = round(lr - p_lot, 2)
+                            pos['lot_rem']      = round(lr - p_lot, 2)
                             pos['partial_done'] = True
-                            pos['sl'] = pos['entry']
+                            # trailing stop روی entry + atr
+                            if atr_now > 0:
+                                trail = ep + d * G.trailing_atr_mult * atr_now
+                                pos['trail_sl'] = trail
+                            else:
+                                pos['sl'] = ep   # break-even
                             lr = pos['lot_rem']
                             if lr < G.min_lot:
-                                positions[name] = None; continue
+                                positions[name] = None
+                                continue
 
-            if positions[name] is None: continue
-            lr = pos['lot_rem']
+            if positions[name] is None:
+                continue
+
+            lr      = pos['lot_rem']
             pnl_now = pnl_calc(d, ep, cp, lr, qr, pip)
 
+            # trailing stop update
+            if pos['trail_sl'] is not None and atr_now > 0:
+                new_trail = cp + d * G.trailing_atr_mult * atr_now
+                # فقط در جهت سود حرکت کن
+                if d == 1:
+                    pos['trail_sl'] = max(pos['trail_sl'], new_trail)
+                else:
+                    pos['trail_sl'] = min(pos['trail_sl'], new_trail)
+
+            # شرایط خروج
             hit_zs = (not np.isnan(zn) and
-                      ((d==1 and zn<=-G.z_stop_margin) or (d==-1 and zn>=G.z_stop_margin)))
+                      ((d ==  1 and zn <= -G.z_stop_margin) or
+                       (d == -1 and zn >=  G.z_stop_margin)))
+
             hit_ze = (not np.isnan(zn) and
-                      ((d==1 and zn>=-G.z_exit_full) or (d==-1 and zn<=G.z_exit_full)))
+                      ((d ==  1 and zn >= -G.z_exit_full) or
+                       (d == -1 and zn <=  G.z_exit_full)))
             if hit_ze and pnl_now < G.min_net_profit_usd and not pos['partial_done']:
                 hit_ze = False
-            hit_sl = (d==1 and cp<=pos['sl']) or (d==-1 and cp>=pos['sl'])
-            hit_tp = (d==1 and cp>=pos['tp']) or (d==-1 and cp<=pos['tp'])
 
-            if hit_ze or hit_zs or hit_sl or hit_tp:
-                xp = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
-                st = ('SL' if hit_sl else 'TP' if hit_tp else
-                      'Z-Stop' if hit_zs else 'Z-Exit')
+            hit_sl = ((d ==  1 and cp <= pos['sl']) or
+                      (d == -1 and cp >= pos['sl']))
+
+            # trailing stop hit
+            hit_trail = False
+            if pos['trail_sl'] is not None:
+                hit_trail = ((d ==  1 and cp <= pos['trail_sl']) or
+                             (d == -1 and cp >= pos['trail_sl']))
+
+            hit_tp = ((d ==  1 and cp >= pos['tp']) or
+                      (d == -1 and cp <= pos['tp']))
+
+            if hit_ze or hit_zs or hit_sl or hit_tp or hit_trail:
+                if hit_sl:
+                    xp = pos['sl'];         st = 'SL'
+                elif hit_tp:
+                    xp = pos['tp'];         st = 'TP'
+                elif hit_trail:
+                    xp = pos['trail_sl'];   st = 'Trail'
+                else:
+                    xp = cp
+                    st = 'Z-Stop' if hit_zs else 'Z-Exit'
+
                 fpnl = pnl_calc(d, ep, xp, lr, qr, pip)
                 acc['equity'] += fpnl
-                all_trades.append({'pair': name, 'pnl': fpnl,
-                                   'status': st, 'exit_ts': ts})
+                pnl_hist.append(fpnl)
+                all_trades.append({
+                    'pair': name, 'pnl': fpnl,
+                    'status': st, 'exit_ts': ts,
+                })
                 acc['trades'].append(all_trades[-1])
                 positions[name] = None
-                if fpnl > 0: acc['consec_loss'] = 0
-                else:        acc['consec_loss'] += 1
 
-        # target
-        if acc['equity'] >= TARGET and all(positions[n] is None for n in pair_data):
-            w = acc['equity'] - G.initial_balance
+                if fpnl > 0:
+                    acc['consec_loss'] = 0
+                else:
+                    acc['consec_loss'] += 1
+
+        # ── target hit ──
+        if (acc['equity'] >= TARGET
+                and all(positions[n] is None for n in pair_data)):
+            w  = acc['equity'] - G.initial_balance
             withdrawn += w
             dt = (ts - acc['start_ts']).days
             nt = len(acc['trades'])
-            acc_logs.append({'reason': 'TARGET_HIT', 'pnl': w,
-                             'days': dt, 'n_trades': nt})
+            acc_logs.append({
+                'reason': 'TARGET_HIT', 'pnl': w,
+                'days': dt, 'n_trades': nt, 'end_ts': ts,
+            })
+            print(f"    💰 #{acc_num:>3} | {ts.date()} | ${w:.2f} | "
+                  f"Bank:${withdrawn:.2f} | {dt}d | {nt}T")
             acc_num += 1
             acc = new_acc(ts)
             day_eq = month_eq = acc['equity']
-            for n in pair_data: day_trades[n] = 0; pending[n] = 0
-            prev_date = cur_date; prev_month = cur_month
+            pnl_hist = []
+            for n in pair_data:
+                day_trades[n] = 0
+                pending[n]    = 0
+            prev_date  = cur_date
+            prev_month = cur_month
             continue
 
+        # ── new signals ──
         for name in pair_data:
             a = pa[name]
-            if (positions[name] is None and not acc['blown'] and not in_cd
-                    and day_trades[name] < G.max_trades_day and a['sig'][bar] != 0):
+            if (positions[name] is None
+                    and not acc['blown']
+                    and not in_cd
+                    and day_trades[name] < G.max_trades_day
+                    and a['sig'][bar] != 0):
                 pending[name] = int(a['sig'][bar])
 
-    return {'all_trades': all_trades, 'account_logs': acc_logs,
-            'withdrawn': withdrawn, 'final_equity': acc['equity'],
-            'common_idx': cidx, 'eq_curve': eq_curve}
+    return {
+        'all_trades':   all_trades,
+        'account_logs': acc_logs,
+        'withdrawn':    withdrawn,
+        'final_equity': acc['equity'],
+        'common_idx':   cidx,
+        'eq_curve':     eq_curve,
+    }
 
 
 # ═══════════════════════════════════════════════════════
 # REPORT
 # ═══════════════════════════════════════════════════════
-def print_report(res, title, suffix):
+def print_report(res, title):
     if not res['all_trades']:
-        print("❌ No trades"); return None
+        print("❌ No trades")
+        return
 
     df = pd.DataFrame(res['all_trades'])
     df['exit_ts'] = pd.to_datetime(df['exit_ts'])
@@ -502,35 +658,119 @@ def print_report(res, title, suffix):
     wins   = df[df['pnl'] > 0]
     losses = df[df['pnl'] < 0]
     wr     = len(wins) / len(df) * 100
-    pf     = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) else 99.0
+    pf     = (wins['pnl'].sum() / abs(losses['pnl'].sum())
+              if len(losses) else 99.0)
 
     ci = res['common_idx']
     all_months = pd.period_range(
         start=ci[GlobalConfig.warmup].to_period('M'),
         end=ci[-1].to_period('M'), freq='M')
-    monthly = df.groupby('month')['pnl'].sum().reindex(all_months, fill_value=0.0)
+    monthly = (df.groupby('month')['pnl'].sum()
+               .reindex(all_months, fill_value=0.0))
 
     pos_m = int((monthly > 0).sum())
     neg_m = int((monthly < 0).sum())
     tot_m = len(monthly)
+    ms = cur = 0
+    for v in monthly:
+        cur = cur + 1 if v < 0 else 0
+        ms  = max(ms, cur)
 
-    logs   = pd.DataFrame(res['account_logs']) if res['account_logs'] else pd.DataFrame()
+    logs   = (pd.DataFrame(res['account_logs'])
+              if res['account_logs'] else pd.DataFrame())
+    n_pass = int((logs['reason'] == 'TARGET_HIT').sum()) if len(logs) else 0
     n_blow = int((logs['reason'] != 'TARGET_HIT').sum()) if len(logs) else 0
+    neg_yr = int((df.groupby('year')['pnl'].sum() < 0).sum())
+
+    m_std  = monthly.std()
+    sharpe = (monthly.mean() / m_std * np.sqrt(12)) if m_std > 0 else 0
+
+    # exit breakdown
+    if 'status' in df.columns:
+        status_grp = df.groupby('status')['pnl'].agg(['count', 'sum', 'mean'])
 
     print("\n" + "═"*70)
     print(f"  {title}")
     print("═"*70)
     print(f"  Trades:{len(df):,}  WR:{wr:.1f}%  PF:{pf:.3f}")
-    print(f"  Net:${df['pnl'].sum():,.2f}  Banked:${res['withdrawn']:,.2f}")
-    print(f"  Blown:{n_blow}  +Mo:{pos_m}/{tot_m}({pos_m/tot_m*100:.0f}%)  MonthAvg:${monthly.mean():.2f}")
-    
-    monthly.to_csv(f'monthly_v13_{suffix}.csv', header=['pnl'])
-    pd.DataFrame(res['eq_curve']).to_csv(f'equity_v13_{suffix}.csv', index=False)
-    
-    return {
-        'Mode': suffix, 'Trades': len(df), 'WR%': round(wr, 1), 'PF': round(pf, 2),
-        'Banked': round(res['withdrawn']), 'MonAvg': round(monthly.mean()), 'Blown': n_blow
-    }
+    print(f"  AvgWin:${wins['pnl'].mean():.2f}  "
+          f"AvgLoss:${losses['pnl'].mean():.2f}  "
+          f"R:R={abs(wins['pnl'].mean()/losses['pnl'].mean()):.2f}")
+    print(f"  Net:${df['pnl'].sum():,.2f}  "
+          f"Banked:${res['withdrawn']:,.2f}  "
+          f"Eq:${res['final_equity']:,.2f}")
+    print(f"  Pass:{n_pass}  Blown:{n_blow}  NegYr:{neg_yr}")
+    print(f"  +Mo:{pos_m}/{tot_m}({pos_m/tot_m*100:.0f}%)  "
+          f"-Mo:{neg_m}  Streak:{ms}mo")
+    print(f"  MonthAvg:${monthly.mean():.2f}  "
+          f"Median:${monthly.median():.2f}  "
+          f"Sharpe:{sharpe:.2f}")
+    print(f"  Best:${monthly.max():,.2f}  Worst:${monthly.min():,.2f}")
+    print("-"*70)
+
+    # exit type breakdown
+    if 'status' in df.columns:
+        print("  Exit Types:")
+        for st, row in status_grp.iterrows():
+            print(f"    {st:<12}: {int(row['count']):>5}T  "
+                  f"Net:${row['sum']:>8,.1f}  "
+                  f"Avg:${row['mean']:>7.2f}")
+    print("-"*70)
+
+    if 'pair' in df.columns:
+        print("  By Pair:")
+        for pair, g in df.groupby('pair'):
+            w2  = g[g['pnl'] > 0]
+            l2  = g[g['pnl'] < 0]
+            ppf = (w2['pnl'].sum() / abs(l2['pnl'].sum())
+                   if len(l2) else 99.0)
+            print(f"    {pair}: {len(g)}T  "
+                  f"WR:{len(w2)/len(g)*100:.0f}%  "
+                  f"PF:{ppf:.2f}  "
+                  f"Net:${g['pnl'].sum():,.0f}")
+    print("-"*70)
+
+    print("  Yearly:")
+    for yr, g in df.groupby('year'):
+        w2   = g[g['pnl'] > 0]
+        l2   = g[g['pnl'] < 0]
+        ypf  = (w2['pnl'].sum() / abs(l2['pnl'].sum())
+                if len(l2) else 99.0)
+        mark = '✅' if g['pnl'].sum() >= 0 else '❌'
+        print(f"    {mark} {yr}:{len(g):>4}T  "
+              f"WR:{len(w2)/len(g)*100:5.1f}%  "
+              f"PF:{ypf:.2f}  "
+              f"${g['pnl'].sum():>+8,.2f}")
+    print("-"*70)
+
+    target = GlobalConfig.initial_balance * 0.02
+    above  = int((monthly >= target).sum())
+    print(f"  🎯 هدف $100/ماه: {above}/{tot_m} ({above/tot_m*100:.0f}%)")
+    print(f"  📊 میانگین: ${monthly.mean():.2f} "
+          f"→ {monthly.mean()/target*100:.0f}% از هدف")
+    print("═"*70)
+
+    # مقایسه نسخه‌ها
+    print("\n  📈 مقایسه نسخه‌ها:")
+    rows = [
+        ("v13 بدون RiskCtrl", 91,  59, 3, 10, "—",    "—"),
+        ("v14b RiskCtrl",     68,  56, 3,  2, "0.94", "—"),
+        (f"v15 ImprovedRR",
+         round(monthly.mean()),
+         round(pos_m / tot_m * 100),
+         neg_yr, n_blow,
+         f"{sharpe:.2f}",
+         f"{abs(wins['pnl'].mean()/losses['pnl'].mean()):.2f}"),
+    ]
+    print(f"  {'Version':<22} {'MonAvg':>7} {'+Mo%':>5} "
+          f"{'NegYr':>6} {'Blow':>5} {'Sharpe':>7} {'R:R':>5}")
+    for v, ma, pm, ny, bl, sh, rr in rows:
+        print(f"  {v:<22} ${ma:>5}  {pm:>4}%  "
+              f"{ny:>5}  {bl:>4}  {sh:>6}  {rr:>5}")
+
+    monthly.to_csv('monthly_v15.csv', header=['pnl'])
+    pd.DataFrame(res['eq_curve']).to_csv('equity_v15.csv', index=False)
+    print("\n  📊 monthly_v15.csv + equity_v15.csv saved")
 
 
 # ═══════════════════════════════════════════════════════
@@ -539,34 +779,22 @@ def print_report(res, title, suffix):
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  CorrArb v13 — Multi-Mode Risk Management Engine             ║")
+    print("║  CorrArb v15 — Improved R:R + Trailing Stop                ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
     pair_data = {}
     for name, pcfg in PAIR_CFG.items():
+        print(f"\n  Loading {name}...")
         df = build_pair(pcfg)
-        if df is None: continue
-        sig, z = compute_signals(df, pcfg)
-        pair_data[name] = (df, sig, z, pcfg)
+        if df is None:
+            print(f"  ❌ {name}: not found")
+            continue
+        sig, z, atr = compute_signals(df, pcfg)
+        n = int((sig != 0).sum())
+        print(f"  ✅ {name}: {len(df):,} bars | {n:,} signals")
+        pair_data[name] = (df, sig, z, atr, pcfg)
 
-    print(f"\n  ✅ Data Loaded in {(datetime.now()-t0).total_seconds():.1f}s")
-    
-    modes_to_test = [
-        ('none',   'Original (No Filters)'),
-        ('split',  'Risk Split (Halved logic)'),
-        ('best_z', 'Best Z-Score (Signal Filter)')
-    ]
-
-    stats = []
-    for mode_id, mode_title in modes_to_test:
-        res = run_portfolio(pair_data, corr_mode=mode_id)
-        report_data = print_report(res, mode_title, mode_id)
-        if report_data:
-            stats.append(report_data)
-
-    print("\n" + "═"*70)
-    print("  🏆 FINAL COMPARISON SUMMARY")
-    print("═"*70)
-    df_summary = pd.DataFrame(stats)
-    print(df_summary.to_string(index=False))
-    print("═"*70)
+    print()
+    res = run_portfolio(pair_data)
+    print_report(res, "v15 — Improved R:R + Trailing Stop")
+    print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
