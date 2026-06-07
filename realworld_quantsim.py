@@ -1,97 +1,61 @@
 """
-CorrArb v9g — Final Version
-============================
-Baseline قفل‌شده:
-  ✅ No TimeStop
-  ✅ SL = 30 pips
-  ✅ Partial = 0.75
-  ✅ z_exit_partial = 0.50
-
-بهبودهای جدید (فقط Risk/Prop):
-  ✅ Dynamic risk بر اساس rolling PF
-  ✅ Max consecutive accounts blown → stop
-  ✅ گزارش کامل‌تر برای تصمیم‌گیری واقعی
+v9h — Regime Analysis
+======================
+هدف: بفهمیم سال‌های بد چه ویژگی‌ای دارند
+تا بتوانیم فیلتر بزنیم
 """
 
 import pandas as pd
 import numpy as np
 import glob, zipfile, warnings
-from datetime import datetime, timedelta
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
 
 class Config:
-    # ── Prop ──
     initial_balance    = 5_000.0
     profit_target_pct  = 0.05
     max_daily_loss_pct = 0.05
     max_total_dd_pct   = 0.10
-
-    # ── Risk — قفل‌شده ──
     risk_base_pct      = 0.015
     risk_min_pct       = 0.005
     consec_loss_n      = 2
     risk_reduce        = 0.5
-
     PAIR_SPREAD        = {'AUDNZD': 2.5}
     PIP_SIZE           = {'AUDNZD': 0.0001}
-
     commission_per_lot = 7.0
     slippage_pips      = 0.5
     lot_size           = 100_000
     max_lot            = 3.0
     min_lot            = 0.01
     warmup             = 500
-
-    # ── Signal — قفل‌شده ──
     z_fast_period      = 96
     z_entry            = 2.1
-    z_exit_partial     = 0.50   # ← قفل
+    z_exit_partial     = 0.50
     z_exit_full        = 0.0
     z_stop_margin      = 4.0
     min_net_profit_usd = 15.0
-
     corr_period        = 96
     corr_min           = 0.80
     hour_start         = 2
     hour_end           = 19
     trade_days         = [0, 1, 2, 3, 4]
     max_trades_day     = 2
-
-    # ── Exit — قفل‌شده ──
     sl_pips            = 30.0
     tp_pips            = 90.0
-    partial_ratio      = 0.75   # ← قفل
-    use_time_stop      = False  # ← قفل
-
+    partial_ratio      = 0.75
     atr_period         = 14
     atr_ma_period      = 96
     atr_max_mult       = 3.0
     atr_min_mult       = 0.5
-
     vr_period          = 200
     vr_k               = 4
     vr_max             = 0.90
-
-    cooldown_days          = 10
+    cooldown_days      = 10
     monthly_loss_threshold = -150.0
 
-    # ── Dynamic Risk ──
-    # بر اساس rolling PF آخرین N ترید
-    dynamic_risk_enabled   = True
-    rolling_pf_window      = 30     # آخرین 30 ترید
-    rolling_pf_good        = 1.20   # اگر PF > این → risk * 1.2
-    rolling_pf_bad         = 0.90   # اگر PF < این → risk * 0.7
 
-    # ── Max Blown در row ──
-    max_consec_blown       = 3      # اگر 3 حساب پشت‌سرهم blown → pause 30 روز
-    blown_pause_days       = 30
-
-
-# ═══════════════════════════════════════════════════════
-# DATA
-# ═══════════════════════════════════════════════════════
 def load_raw_zip(pattern):
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -138,9 +102,6 @@ def load_audnzd():
     return m
 
 
-# ═══════════════════════════════════════════════════════
-# INDICATORS + SIGNALS
-# ═══════════════════════════════════════════════════════
 def calc_atr(h, l, c, period=14):
     tr = pd.concat([
         h - l,
@@ -158,111 +119,115 @@ def calc_vr(series, k, window):
     return vk / (k * v1.replace(0, np.nan))
 
 
-def compute_signals(df):
-    C      = Config
-    log_r  = np.log(df['c_spread'])
+def build_features(df):
+    """
+    ساخت feature های مختلف برای هر بار
+    تا بفهمیم در بارهای سودده vs زیان‌ده چه تفاوتی وجود دارد
+    """
+    C     = Config
+    log_r = np.log(df['c_spread'])
+
+    # Z-score
     z_mean = log_r.rolling(C.z_fast_period).mean()
     z_std  = log_r.rolling(C.z_fast_period).std()
     z      = (log_r - z_mean) / z_std.replace(0, np.nan)
 
-    corr_ok = (df['c_aud'].pct_change()
-               .rolling(C.corr_period)
-               .corr(df['c_nzd'].pct_change()) > C.corr_min)
-
-    vr        = calc_vr(log_r, C.vr_k, C.vr_period)
-    regime_ok = vr < C.vr_max
-
+    # ATR و نسبت ATR
     atr    = calc_atr(df['h_spread'], df['l_spread'],
                       df['c_spread'], C.atr_period)
     atr_ma = atr.rolling(C.atr_ma_period).mean()
-    vol_ok = ((atr > atr_ma * C.atr_min_mult) &
-              (atr < atr_ma * C.atr_max_mult))
+    atr_ratio = atr / atr_ma.replace(0, np.nan)
 
+    # Variance Ratio
+    vr = calc_vr(log_r, C.vr_k, C.vr_period)
+
+    # Correlation
+    corr = (df['c_aud'].pct_change()
+            .rolling(C.corr_period)
+            .corr(df['c_nzd'].pct_change()))
+
+    # Trend strength — میانگین متحرک spread
+    ma_fast = df['c_spread'].rolling(48).mean()
+    ma_slow = df['c_spread'].rolling(200).mean()
+    trend   = (ma_fast - ma_slow) / ma_slow.replace(0, np.nan) * 100
+
+    # Realized volatility — std بازده روزانه
+    daily_ret = log_r.resample('D').last().diff()
+    rvol_30d  = daily_ret.rolling(30).std()
+    rvol_30d  = rvol_30d.reindex(df.index, method='ffill')
+
+    # Session
     hour    = pd.Series(df.index.hour, index=df.index)
     dow     = pd.Series(df.index.dayofweek, index=df.index)
-    time_ok = (hour.between(C.hour_start, C.hour_end) &
-               dow.isin(C.trade_days))
+    time_ok = hour.between(C.hour_start, C.hour_end) & dow.isin(C.trade_days)
 
+    # Signal
     sig  = pd.Series(0, index=df.index)
-    cond = vol_ok & time_ok & corr_ok & regime_ok
+    cond = (atr_ratio > C.atr_min_mult) & (atr_ratio < C.atr_max_mult) & time_ok & (corr > C.corr_min) & (vr < C.vr_max)
     sig[(z < -C.z_entry) & cond] =  1
     sig[(z >  C.z_entry) & cond] = -1
     sig = sig.where(sig != sig.shift(), 0)
 
-    return sig, z
+    features = pd.DataFrame({
+        'z':        z,
+        'atr':      atr,
+        'atr_ratio': atr_ratio,
+        'vr':       vr,
+        'corr':     corr,
+        'trend':    trend,
+        'rvol_30d': rvol_30d,
+        'sig':      sig,
+    }, index=df.index)
+
+    return features, sig, z
 
 
-# ═══════════════════════════════════════════════════════
-# BACKTEST
-# ═══════════════════════════════════════════════════════
 def calc_pnl(direction, entry, exit_px, lot, qr):
     C     = Config
     gross = direction * (exit_px - entry) * lot * C.lot_size * qr
     return gross - C.commission_per_lot * lot
 
 
-def rolling_pf(trades_history, window):
-    """PF آخرین N ترید"""
-    if len(trades_history) < window // 2:
-        return 1.0   # کافی نیست → neutral
-    recent = trades_history[-window:]
-    wins   = sum(p for p in recent if p > 0)
-    losses = abs(sum(p for p in recent if p < 0))
-    return wins / losses if losses > 0 else 1.5
-
-
-def new_acc(ts):
-    C = Config
-    return {
-        'equity':      C.initial_balance,
-        'start_ts':    ts,
-        'trades':      [],
-        'blown':       False,
-        'blown_rsn':   '',
-        'peak':        C.initial_balance,
-        'consec_loss': 0,
-    }
-
-
-def run_backtest(df, sig, z):
+def run_analysis(df, features, sig, z):
+    """
+    اجرای backtest کامل و ذخیره feature های هر ترید
+    """
     C          = Config
     idx        = df.index.sort_values()
-    start_date = idx[C.warmup]
     pip        = C.PIP_SIZE['AUDNZD']
     spread     = C.PAIR_SPREAD['AUDNZD']
 
-    o_  = df['o_spread'].reindex(idx).ffill().values.astype(float)
-    c_  = df['c_spread'].reindex(idx).ffill().values.astype(float)
-    qr_ = df['quote_rate'].reindex(idx).ffill().values.astype(float)
-    sg_ = sig.reindex(idx).fillna(0).values.astype(int)
-    zz_ = z.reindex(idx).fillna(np.nan).values.astype(float)
+    o_   = df['o_spread'].reindex(idx).ffill().values.astype(float)
+    c_   = df['c_spread'].reindex(idx).ffill().values.astype(float)
+    qr_  = df['quote_rate'].reindex(idx).ffill().values.astype(float)
+    sg_  = sig.reindex(idx).fillna(0).values.astype(int)
+    zz_  = z.reindex(idx).fillna(np.nan).values.astype(float)
+
+    feat_z     = features['z'].reindex(idx).fillna(np.nan).values
+    feat_atr_r = features['atr_ratio'].reindex(idx).fillna(np.nan).values
+    feat_vr    = features['vr'].reindex(idx).fillna(np.nan).values
+    feat_corr  = features['corr'].reindex(idx).fillna(np.nan).values
+    feat_trend = features['trend'].reindex(idx).fillna(np.nan).values
+    feat_rvol  = features['rvol_30d'].reindex(idx).fillna(np.nan).values
 
     FLOOR  = C.initial_balance * (1 - C.max_total_dd_pct)
     TARGET = C.initial_balance * (1 + C.profit_target_pct)
 
-    acc              = new_acc(start_date)
-    withdrawn        = 0.0
-    acc_num          = 1
-    day_eq           = C.initial_balance
-    month_eq         = C.initial_balance
-    cooldown_til     = None
-    all_trades       = []
-    acc_logs         = []
-    monthly_log      = []    # (year, month, pnl)
-    eq_curve         = []    # (date, total_equity)
+    acc          = {'equity': C.initial_balance, 'start_ts': idx[C.warmup],
+                    'trades': [], 'blown': False, 'blown_rsn': '',
+                    'peak': C.initial_balance, 'consec_loss': 0}
+    withdrawn    = 0.0
+    acc_num      = 1
+    day_eq       = C.initial_balance
+    month_eq     = C.initial_balance
+    cooldown_til = None
+    trade_records = []
 
-    pos              = None
-    day_trades       = 0
-    pending          = 0
-    prev_date        = None
-    prev_month       = None
-
-    # Dynamic risk tracking
-    global_pnl_hist  = []    # همه PnL‌ها برای rolling PF
-    consec_blown     = 0     # تعداد blown پشت‌سرهم
-    blown_pause_til  = None  # pause بعد از blown‌های متوالی
-
-    print(f"  ▶ Running v9g Final...")
+    pos        = None
+    day_trades = 0
+    pending    = 0
+    prev_date  = None
+    prev_month = None
 
     for bar in range(C.warmup, len(idx)):
         ts        = idx[bar]
@@ -272,93 +237,57 @@ def run_backtest(df, sig, z):
         if cur_date != prev_date:
             day_eq     = acc['equity']
             day_trades = 0
-            eq_curve.append({
-                'date':   str(cur_date),
-                'equity': round(acc['equity'] + withdrawn, 2),
-            })
-            prev_date = cur_date
+            prev_date  = cur_date
 
         if cur_month != prev_month:
-            if prev_month is not None:
-                monthly_log.append({
-                    'year':  prev_month[0],
-                    'month': prev_month[1],
-                    'pnl':   round(acc['equity'] - month_eq, 2),
-                })
             month_eq   = acc['equity']
             prev_month = cur_month
 
         if acc['equity'] > acc['peak']:
             acc['peak'] = acc['equity']
 
-        # pause بعد از blown‌های متوالی
-        in_blown_pause = (blown_pause_til is not None and
-                          ts < blown_pause_til)
-        in_cd          = ((cooldown_til is not None and ts < cooldown_til)
-                          or in_blown_pause)
+        in_cd = cooldown_til is not None and ts < cooldown_til
 
-        # ── Blown ──
         if acc['blown']:
-            acc_logs.append({
-                'account':  acc_num,
-                'start_ts': str(acc['start_ts'].date()),
-                'end_ts':   str(ts.date()),
-                'reason':   acc['blown_rsn'],
-                'pnl':      round(acc['equity'] - C.initial_balance, 2),
-                'n_trades': len(acc['trades']),
-                'days':     (ts - acc['start_ts']).days,
-            })
-            consec_blown += 1
-            icon = '💥'
-            extra = ''
-            if consec_blown >= C.max_consec_blown:
-                blown_pause_til = ts + timedelta(days=C.blown_pause_days)
-                extra = f' ⏸ PAUSE {C.blown_pause_days}d'
-                consec_blown = 0
-            print(f"    {icon} #{acc_num:>3} | {ts.date()} | "
-                  f"Eq:${acc['equity']:>8.2f} | {acc['blown_rsn']}{extra}")
-            cooldown_til = ts + timedelta(days=C.cooldown_days)
-            acc_num   += 1
-            acc        = new_acc(ts)
-            day_eq     = month_eq = acc['equity']
-            day_trades = 0
-            pending    = 0
-            pos        = None
+            cooldown_til = ts + pd.Timedelta(days=C.cooldown_days)
+            acc_num += 1
+            acc = {'equity': C.initial_balance, 'start_ts': ts,
+                   'trades': [], 'blown': False, 'blown_rsn': '',
+                   'peak': C.initial_balance, 'consec_loss': 0}
+            day_eq = month_eq = acc['equity']
+            day_trades = pending = 0
+            pos = None
             continue
 
         if in_cd:
             continue
 
-        # reset consec_blown اگر target hit شده باشد
         m_stressed = (acc['equity'] - month_eq) < C.monthly_loss_threshold
 
-        # Dynamic risk multiplier
-        if C.dynamic_risk_enabled and len(global_pnl_hist) >= C.rolling_pf_window // 2:
-            rpf = rolling_pf(global_pnl_hist, C.rolling_pf_window)
-            if rpf >= C.rolling_pf_good:
-                risk_mult = 1.2
-            elif rpf < C.rolling_pf_bad:
-                risk_mult = 0.7
-            else:
-                risk_mult = 1.0
-        else:
-            risk_mult = 1.0
-
-        # ── Open pending ──
         if pending != 0 and pos is None and day_trades < C.max_trades_day:
             sv   = pending
-            risk = C.risk_base_pct * risk_mult
-            if m_stressed:
-                risk *= 0.5
+            risk = C.risk_base_pct * (0.5 if m_stressed else 1.0)
             if acc['consec_loss'] >= C.consec_loss_n:
                 risk = max(risk * C.risk_reduce, C.risk_min_pct)
-
             pv  = pip * C.lot_size * qr_[bar]
             lot = round(float(np.clip(
                 acc['equity'] * risk / (C.sl_pips * pv),
                 C.min_lot, C.max_lot)), 2)
-
             ep  = o_[bar] + sv * (C.slippage_pips + spread / 2) * pip
+
+            # ذخیره feature های لحظه ورود
+            entry_features = {
+                'z_entry':    feat_z[bar],
+                'atr_ratio':  feat_atr_r[bar],
+                'vr_entry':   feat_vr[bar],
+                'corr_entry': feat_corr[bar],
+                'trend':      feat_trend[bar],
+                'rvol_30d':   feat_rvol[bar],
+                'hour':       ts.hour,
+                'dow':        ts.dayofweek,
+                'year':       ts.year,
+                'month':      ts.month,
+            }
             pos = {
                 'dir':          sv,
                 'lot':          lot,
@@ -369,12 +298,13 @@ def run_backtest(df, sig, z):
                 'tp':           ep + sv * C.tp_pips * pip,
                 'entry_ts':     ts,
                 'entry_bar':    bar,
+                'entry_feat':   entry_features,
+                'partial_pnl':  0.0,
             }
             day_trades += 1
 
         pending = 0
 
-        # ── Float DD ──
         flt = 0.0
         if pos is not None:
             flt = calc_pnl(pos['dir'], pos['entry'],
@@ -384,26 +314,20 @@ def run_backtest(df, sig, z):
         daily_lim = day_eq * (1 - C.max_daily_loss_pct)
 
         if cur_eq <= daily_lim or cur_eq <= FLOOR:
-            rsn              = "DailyDD" if cur_eq <= daily_lim else "TotalDD"
-            acc['blown']     = True
-            acc['blown_rsn'] = rsn
+            acc['blown'] = True
+            acc['blown_rsn'] = "DailyDD" if cur_eq <= daily_lim else "TotalDD"
             if pos is not None:
                 pnl = calc_pnl(pos['dir'], pos['entry'],
                                c_[bar], pos['lot_rem'], qr_[bar])
                 acc['equity'] += pnl
-                tr = {
-                    'dir': pos['dir'], 'lot': pos['lot_rem'],
-                    'entry': pos['entry'], 'exit': c_[bar],
-                    'entry_ts': pos['entry_ts'], 'exit_ts': ts,
-                    'pnl': pnl, 'status': 'BLOWN',
-                }
-                all_trades.append(tr)
-                acc['trades'].append(tr)
-                global_pnl_hist.append(pnl)
+                rec = {**pos['entry_feat'],
+                       'total_pnl': pos['partial_pnl'] + pnl,
+                       'status': 'BLOWN', 'exit_ts': ts,
+                       'bars_held': bar - pos['entry_bar']}
+                trade_records.append(rec)
                 pos = None
             continue
 
-        # ── Exit ──
         if pos is not None:
             cp = c_[bar]
             d  = pos['dir']
@@ -411,7 +335,6 @@ def run_backtest(df, sig, z):
             zn = zz_[bar]
             lr = pos['lot_rem']
 
-            # Partial
             if not pos['partial_done'] and not np.isnan(zn):
                 if ((d == 1 and zn >= -C.z_exit_partial) or
                         (d == -1 and zn <=  C.z_exit_partial)):
@@ -420,236 +343,279 @@ def run_backtest(df, sig, z):
                         p_pnl = calc_pnl(d, ep, cp, p_lot, qr_[bar])
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
-                            tr = {
-                                'dir': d, 'lot': p_lot,
-                                'entry': ep, 'exit': cp,
-                                'entry_ts': pos['entry_ts'], 'exit_ts': ts,
-                                'pnl': p_pnl, 'status': 'Partial',
-                            }
-                            all_trades.append(tr)
-                            acc['trades'].append(tr)
-                            global_pnl_hist.append(p_pnl)
+                            pos['partial_pnl'] += p_pnl
                             pos['lot_rem']      = round(lr - p_lot, 2)
                             pos['partial_done'] = True
                             pos['sl']           = pos['entry']
                             lr = pos['lot_rem']
                             if lr < C.min_lot:
+                                rec = {**pos['entry_feat'],
+                                       'total_pnl': pos['partial_pnl'],
+                                       'status': 'PartialOnly', 'exit_ts': ts,
+                                       'bars_held': bar - pos['entry_bar']}
+                                trade_records.append(rec)
                                 pos = None
 
             if pos is not None:
                 lr      = pos['lot_rem']
                 pnl_now = calc_pnl(d, ep, cp, lr, qr_[bar])
-
-                hit_zs = (not np.isnan(zn) and
-                          ((d == 1 and zn <= -C.z_stop_margin) or
-                           (d == -1 and zn >=  C.z_stop_margin)))
-                hit_ze = (not np.isnan(zn) and
-                          ((d == 1 and zn >= -C.z_exit_full) or
-                           (d == -1 and zn <=  C.z_exit_full)))
+                hit_zs  = (not np.isnan(zn) and
+                           ((d==1 and zn<=-C.z_stop_margin) or
+                            (d==-1 and zn>=C.z_stop_margin)))
+                hit_ze  = (not np.isnan(zn) and
+                           ((d==1 and zn>=-C.z_exit_full) or
+                            (d==-1 and zn<=C.z_exit_full)))
                 if hit_ze and pnl_now < C.min_net_profit_usd and not pos['partial_done']:
                     hit_ze = False
-
-                hit_sl = ((d == 1 and cp <= pos['sl']) or
-                          (d == -1 and cp >= pos['sl']))
-                hit_tp = ((d == 1 and cp >= pos['tp']) or
-                          (d == -1 and cp <= pos['tp']))
+                hit_sl = ((d==1 and cp<=pos['sl']) or (d==-1 and cp>=pos['sl']))
+                hit_tp = ((d==1 and cp>=pos['tp']) or (d==-1 and cp<=pos['tp']))
 
                 if hit_ze or hit_zs or hit_sl or hit_tp:
-                    xp = (pos['sl'] if hit_sl else
-                          pos['tp'] if hit_tp else cp)
-                    st = ('SL'     if hit_sl else
-                          'TP'     if hit_tp else
-                          'Z-Stop' if hit_zs else 'Z-Exit')
+                    xp   = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
+                    st   = ('SL' if hit_sl else 'TP' if hit_tp else
+                            'Z-Stop' if hit_zs else 'Z-Exit')
                     fpnl = calc_pnl(d, ep, xp, lr, qr_[bar])
                     acc['equity'] += fpnl
-                    tr = {
-                        'dir': d, 'lot': lr,
-                        'entry': ep, 'exit': xp,
-                        'entry_ts': pos['entry_ts'], 'exit_ts': ts,
-                        'pnl': fpnl, 'status': st,
-                    }
-                    all_trades.append(tr)
-                    acc['trades'].append(tr)
-                    global_pnl_hist.append(fpnl)
+                    rec = {**pos['entry_feat'],
+                           'total_pnl': pos['partial_pnl'] + fpnl,
+                           'status': st, 'exit_ts': ts,
+                           'bars_held': bar - pos['entry_bar']}
+                    trade_records.append(rec)
                     pos = None
+                    if fpnl > 0: acc['consec_loss'] = 0
+                    else:        acc['consec_loss'] += 1
 
-                    if fpnl > 0:
-                        acc['consec_loss'] = 0
-                    else:
-                        acc['consec_loss'] += 1
-
-        # ── Target ──
         if acc['equity'] >= TARGET and pos is None:
-            w  = acc['equity'] - C.initial_balance
+            w = acc['equity'] - C.initial_balance
             withdrawn += w
-            dt = (ts - acc['start_ts']).days
-            nt = len(acc['trades'])
-            acc_logs.append({
-                'account':  acc_num,
-                'start_ts': str(acc['start_ts'].date()),
-                'end_ts':   str(ts.date()),
-                'reason':   'TARGET_HIT',
-                'pnl':      round(w, 2),
-                'n_trades': nt,
-                'days':     dt,
-            })
-            print(f"    💰 #{acc_num:>3} | {ts.date()} | ${w:>7.2f} | "
-                  f"Bank:${withdrawn:>9.2f} | {dt}d | {nt}T")
-            consec_blown = 0    # reset بعد از موفقیت
-            acc_num   += 1
-            acc        = new_acc(ts)
-            day_eq     = month_eq = acc['equity']
-            day_trades = 0
-            pending    = 0
+            acc_num += 1
+            acc = {'equity': C.initial_balance, 'start_ts': ts,
+                   'trades': [], 'blown': False, 'blown_rsn': '',
+                   'peak': C.initial_balance, 'consec_loss': 0}
+            day_eq = month_eq = acc['equity']
+            day_trades = pending = 0
             continue
 
         if (pos is None and not acc['blown'] and not in_cd
-                and day_trades < C.max_trades_day
-                and sg_[bar] != 0):
+                and day_trades < C.max_trades_day and sg_[bar] != 0):
             pending = int(sg_[bar])
 
-    return {
-        'all_trades':   all_trades,
-        'account_logs': acc_logs,
-        'withdrawn':    withdrawn,
-        'final_equity': acc['equity'],
-        'common_idx':   idx,
-        'monthly_log':  monthly_log,
-        'eq_curve':     eq_curve,
-    }
+    return pd.DataFrame(trade_records), withdrawn
 
 
-# ═══════════════════════════════════════════════════════
-# REPORT
-# ═══════════════════════════════════════════════════════
-def print_report(res):
-    trades = res['all_trades']
-    if not trades:
-        print("❌ No trades")
+def analyze_regimes(df_trades):
+    """
+    تحلیل: در چه شرایطی تریدها سودده/زیان‌ده هستند
+    """
+    if not len(df_trades):
+        print("No trades")
         return
 
-    df = pd.DataFrame(trades)
-    df['exit_ts']  = pd.to_datetime(df['exit_ts'])
-    df['entry_ts'] = pd.to_datetime(df['entry_ts'])
-    df['month']    = df['exit_ts'].dt.to_period('M')
-    df['year']     = df['exit_ts'].dt.year
-
-    wins   = df[df['pnl'] > 0]
-    losses = df[df['pnl'] < 0]
-    wr     = len(wins) / len(df) * 100
-    pf     = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) else 99.0
-
-    # Monthly از monthly_log
-    ml = pd.DataFrame(res['monthly_log'])
-    if len(ml):
-        ml['period'] = ml.apply(
-            lambda r: pd.Period(f"{int(r['year'])}-{int(r['month']):02d}", freq='M'), axis=1)
-        ml = ml.set_index('period')['pnl']
-
-    ci = res['common_idx']
-    all_months = pd.period_range(
-        start=ci[Config.warmup].to_period('M'),
-        end=ci[-1].to_period('M'), freq='M')
-    monthly = ml.reindex(all_months, fill_value=0.0) if len(ml) else pd.Series(0, index=all_months)
-
-    pos_m  = int((monthly > 0).sum())
-    neg_m  = int((monthly < 0).sum())
-    zero_m = int((monthly == 0).sum())
-    tot_m  = len(monthly)
-
-    # Consecutive losing months
-    max_consec_neg = cur_neg = 0
-    for v in monthly:
-        if v < 0:
-            cur_neg += 1
-            max_consec_neg = max(max_consec_neg, cur_neg)
-        else:
-            cur_neg = 0
-
-    logs    = res['account_logs']
-    df_acc  = pd.DataFrame(logs) if logs else pd.DataFrame()
-    targets = df_acc[df_acc['reason'] == 'TARGET_HIT'] if len(df_acc) else pd.DataFrame()
-    blowns  = df_acc[df_acc['reason'] != 'TARGET_HIT'] if len(df_acc) else pd.DataFrame()
-
-    # سودآوری سالانه
-    yearly = df.groupby('year')['pnl'].sum()
-    neg_years = int((yearly < 0).sum())
+    df = df_trades.copy()
+    df['win'] = df['total_pnl'] > 0
+    df['exit_ts'] = pd.to_datetime(df['exit_ts'])
 
     print("\n" + "═"*70)
-    print("  CorrArb v9g — FINAL | AUDNZD")
-    print("  No TimeStop | SL=30 | Partial=0.75 | ZEP=0.50")
+    print("  REGIME ANALYSIS — چه چیزی سودده/زیان‌ده را تفکیک می‌کند؟")
     print("═"*70)
-    print(f"  Trades:         {len(df):>6,}  |  WR: {wr:.1f}%  |  PF: {pf:.3f}")
-    print(f"  Avg Win:       ${wins['pnl'].mean():>7.2f}  |  Avg Loss: ${losses['pnl'].mean():>7.2f}")
-    print(f"  Net PnL:       ${df['pnl'].sum():>10,.2f}")
-    print("-"*70)
-    print(f"  Total Banked:  ${res['withdrawn']:>10,.2f}")
-    print(f"  Active Equity: ${res['final_equity']:>10,.2f}")
-    print(f"  Accounts Pass: {len(targets):>4}  |  Blown: {len(blowns):>3}")
-    if len(targets):
-        print(f"  Avg Days/Pass: {targets['days'].mean():.0f}d  |  Avg T/Pass: {targets['n_trades'].mean():.0f}")
-    print("-"*70)
-    print(f"  +Months: {pos_m:>3} / {tot_m}  ({pos_m/tot_m*100:.0f}%)")
-    print(f"  -Months: {neg_m:>3} / {tot_m}")
-    print(f"   0Month: {zero_m:>3} / {tot_m}")
-    print(f"  Max consec. negative months: {max_consec_neg}")
-    print(f"  Monthly avg: ${monthly.mean():.2f}  |  Median: ${monthly.median():.2f}")
-    print(f"  Best month:  ${monthly.max():,.2f}  |  Worst: ${monthly.min():,.2f}")
-    print(f"  Negative years: {neg_years} / {len(yearly)}")
-    print("-"*70)
-    print("  By Exit Type:")
-    g = df.groupby('status')['pnl'].agg(['count', 'mean', 'sum'])
-    for st, row in g.sort_values('sum').iterrows():
-        mark = '▲' if row['sum'] >= 0 else '▼'
-        print(f"    {st:<10} {int(row['count']):>5}  "
-              f"avg:${row['mean']:>8.2f}  "
-              f"total:${row['sum']:>10,.2f}  {mark}")
-    print("-"*70)
-    print("  Yearly:")
-    for yr, g2 in df.groupby('year'):
-        w2 = g2[g2['pnl'] > 0]
-        l2 = g2[g2['pnl'] < 0]
-        ypf  = w2['pnl'].sum() / abs(l2['pnl'].sum()) if len(l2) else 99.0
-        sign = '+' if g2['pnl'].sum() >= 0 else '-'
-        mark = '✅' if g2['pnl'].sum() >= 0 else '❌'
-        print(f"    {mark} {yr}: {len(g2):>4}T  "
-              f"WR:{len(w2)/len(g2)*100:5.1f}%  "
-              f"PF:{ypf:.2f}  "
-              f"{sign}${abs(g2['pnl'].sum()):>8,.2f}")
-    print("-"*70)
 
-    # هدف ۲٪
-    target_m = Config.initial_balance * 0.02
-    above_target = int((monthly >= target_m).sum())
-    print(f"  🎯 هدف ۲٪/ماه (${target_m:.0f}):")
-    print(f"     ماه‌های بالای هدف: {above_target} از {tot_m} ({above_target/tot_m*100:.0f}%)")
-    print(f"     میانگین ماهانه:    ${monthly.mean():.2f}")
-    print(f"     هدف چقدر محقق شد: {monthly.mean()/target_m*100:.0f}%")
+    # ── 1. تحلیل بر اساس VR ──
+    print("\n  1️⃣  Variance Ratio (vr_entry)")
+    print("     هرچه VR کمتر → mean-reversion قوی‌تر")
+    bins_vr = [0, 0.5, 0.65, 0.75, 0.85, 0.90, 1.0]
+    df['vr_bin'] = pd.cut(df['vr_entry'], bins=bins_vr)
+    g = df.groupby('vr_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} VR {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    # ── 2. تحلیل بر اساس ATR Ratio ──
+    print("\n  2️⃣  ATR Ratio (volatility)")
+    print("     هرچه بیشتر → بازار پرنوسان‌تر")
+    bins_atr = [0, 0.7, 0.9, 1.1, 1.5, 2.0, 3.0]
+    df['atr_bin'] = pd.cut(df['atr_ratio'], bins=bins_atr)
+    g = df.groupby('atr_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} ATR {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    # ── 3. تحلیل بر اساس Correlation ──
+    print("\n  3️⃣  Correlation AUD/NZD")
+    bins_corr = [0.8, 0.85, 0.90, 0.95, 1.0]
+    df['corr_bin'] = pd.cut(df['corr_entry'], bins=bins_corr)
+    g = df.groupby('corr_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} Corr {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    # ── 4. تحلیل بر اساس Realized Volatility ──
+    print("\n  4️⃣  Realized Volatility (30d)")
+    print("     نوسان‌پذیری 30 روز اخیر")
+    rv_pct = df['rvol_30d'].quantile([0.25, 0.5, 0.75])
+    bins_rv = [0, rv_pct[0.25], rv_pct[0.5], rv_pct[0.75], df['rvol_30d'].max() + 0.001]
+    df['rv_bin'] = pd.cut(df['rvol_30d'], bins=bins_rv,
+                          labels=['Q1-Low', 'Q2', 'Q3', 'Q4-High'])
+    g = df.groupby('rv_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} RVol {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    # ── 5. تحلیل بر اساس Trend ──
+    print("\n  5️⃣  Trend Strength (MA48 vs MA200)")
+    print("     هرچه بزرگتر → trend قوی‌تر (mean reversion ضعیف‌تر)")
+    tr_pct = df['trend'].abs().quantile([0.33, 0.67])
+    df['trend_abs'] = df['trend'].abs()
+    df['trend_bin'] = pd.cut(df['trend_abs'],
+                             bins=[0, tr_pct[0.33], tr_pct[0.67], df['trend_abs'].max()+0.001],
+                             labels=['Low', 'Mid', 'High'])
+    g = df.groupby('trend_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} Trend {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    # ── 6. تحلیل بر اساس ساعت ──
+    print("\n  6️⃣  Session (Hour UTC)")
+    g = df.groupby('hour').agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for h, row in g.iterrows():
+        if row['count'] < 10: continue
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        bar_  = '█' * min(int(abs(row['total']) / 200), 15)
+        print(f"    {mark} H{h:02d}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>6.2f}  "
+              f"{bar_}")
+
+    # ── 7. تحلیل بر اساس سال ──
+    print("\n  7️⃣  Yearly Performance")
+    df['year'] = df['exit_ts'].dt.year
+    g = df.groupby('year').agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum'),
+        avg_vr=('vr_entry', 'mean'),
+        avg_rv=('rvol_30d', 'mean'),
+        avg_corr=('corr_entry', 'mean'),
+    )
+    print(f"    {'Year':>4}  {'n':>4}  {'WR':>5}  {'AvgPnL':>7}  {'Total':>8}  {'AvgVR':>6}  {'AvgRV':>8}  {'AvgCorr':>8}")
+    print("    " + "─"*70)
+    for yr, row in g.iterrows():
+        mark = '✅' if row['total'] > 0 else '❌'
+        print(f"    {mark}{yr}: {int(row['count']):>4}  "
+              f"WR:{row['wr']*100:4.0f}%  "
+              f"avg:${row['avg_pnl']:>6.2f}  "
+              f"tot:${row['total']:>8,.0f}  "
+              f"VR:{row['avg_vr']:.3f}  "
+              f"RV:{row['avg_rv']:.5f}  "
+              f"Corr:{row['avg_corr']:.3f}")
+
+    # ── 8. Z-score at entry ──
+    print("\n  8️⃣  |Z| at entry")
+    print("     هرچه بزرگتر → spread بیشتر از mean فاصله داشته")
+    df['z_abs'] = df['z_entry'].abs()
+    bins_z = [2.1, 2.5, 3.0, 3.5, 4.0, 6.0]
+    df['z_bin'] = pd.cut(df['z_abs'], bins=bins_z)
+    g = df.groupby('z_bin', observed=True).agg(
+        count=('total_pnl', 'count'),
+        wr=('win', 'mean'),
+        avg_pnl=('total_pnl', 'mean'),
+        total=('total_pnl', 'sum')
+    )
+    for idx_v, row in g.iterrows():
+        mark = '✅' if row['avg_pnl'] > 0 else '❌'
+        print(f"    {mark} |Z| {idx_v}: n={int(row['count']):>4}  "
+              f"WR={row['wr']*100:.0f}%  "
+              f"avg=${row['avg_pnl']:>7.2f}  "
+              f"total=${row['total']:>8,.0f}")
+
+    print("\n" + "═"*70)
+    print("  نتیجه‌گیری:")
+    print("  فیلترهای بالقوه بر اساس آنالیز فوق:")
+
+    # خودکار بهترین VR را پیدا کن
+    bins_vr2 = [0, 0.5, 0.65, 0.75, 0.85, 0.90, 1.0]
+    df['vr_bin2'] = pd.cut(df['vr_entry'], bins=bins_vr2)
+    vr_g = df.groupby('vr_bin2', observed=True)['total_pnl'].mean()
+    best_vr = vr_g[vr_g > 0]
+    if len(best_vr):
+        print(f"  ✅ VR بهتر از: {best_vr.index[0].left:.2f} تا {best_vr.index[-1].right:.2f}")
+
+    # بهترین RV
+    rv_g = df.groupby('rv_bin', observed=True)['total_pnl'].mean()
+    best_rv = rv_g[rv_g > 0]
+    if len(best_rv):
+        print(f"  ✅ RVol مناسب: {list(best_rv.index)}")
+
+    # بهترین ساعت
+    good_hours = g[(g['avg_pnl'] > 0) & (g['count'] >= 10)].index.tolist() if 'avg_pnl' in g.columns else []
+
     print("═"*70)
 
     # ذخیره
-    try:
-        pd.DataFrame(res['eq_curve']).to_csv('equity_v9g.csv', index=False)
-        monthly.to_frame('pnl').to_csv('monthly_v9g.csv')
-        print("  📊 equity_v9g.csv + monthly_v9g.csv saved")
-    except Exception as e:
-        print(f"  ⚠ Save error: {e}")
+    df_trades.to_csv('trades_with_features.csv', index=False)
+    print("\n  📊 trades_with_features.csv saved")
+
+    return df
 
 
-# ═══════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════╗")
-    print("║   CorrArb v9g — Final Locked Baseline               ║")
+    print("║   CorrArb v9h — Regime Analysis                     ║")
     print("╚══════════════════════════════════════════════════════╝")
 
-    df     = load_audnzd()
-    sig, z = compute_signals(df)
+    df            = load_audnzd()
+    features, sig, z = build_features(df)
     print(f"  Signals: {(sig != 0).sum():,}")
 
-    res = run_backtest(df, sig, z)
-    print_report(res)
+    df_trades, withdrawn = run_analysis(df, features, sig, z)
+    print(f"  Total trades: {len(df_trades):,} | Withdrawn: ${withdrawn:,.2f}")
+
+    analyze_regimes(df_trades)
 
     print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
