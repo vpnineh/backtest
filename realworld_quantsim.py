@@ -1,13 +1,8 @@
 """
-CorrArb v14 — Final Production Version
-========================================
-همان v13 + Portfolio-level Risk Control:
-
-  ✅ Portfolio DD limit: اگر account equity از peak 6% افت کرد
-     → risk را نصف کن
-  ✅ Hard stop: اگر 8% افت → هیچ ترید جدیدی نگیر تا account reset
-  ✅ Rolling performance: اگر آخرین 20 ترید PF < 0.80 → risk کم شود
-  ✅ گزارش نهایی کامل
+CorrArb v14b — Fixed Risk Control
+===================================
+مشکل v14: port_dd_stop سیستم را قفل کرد
+اصلاح: risk control فقط lot size را کم می‌کند، هرگز trade را کامل نمی‌بندد
 """
 
 import pandas as pd
@@ -53,11 +48,16 @@ class GlobalConfig:
     vr_k               = 4
     corr_period        = 96
 
-    # ── Portfolio Risk Control ──
-    port_dd_warn    = 0.06   # 6% از peak → risk نصف
-    port_dd_stop    = 0.09   # 9% از peak → متوقف کن (قبل از 10% blow)
-    rolling_pf_n    = 20     # آخرین N ترید
-    rolling_pf_bad  = 0.80   # اگر PF < این → risk * 0.7
+    # ── Risk Control — فقط scale down، هرگز stop کامل نه ──
+    # اگر از peak X% افت کرد → risk را multiply کن
+    dd_levels = [
+        (0.04, 0.75),   # 4% DD → risk * 0.75
+        (0.07, 0.50),   # 7% DD → risk * 0.50
+        (0.09, 0.30),   # 9% DD → risk * 0.30  (نزدیک blow)
+    ]
+    rolling_pf_n   = 30
+    rolling_pf_bad = 0.80
+    rolling_pf_mult= 0.80  # اگر rolling PF بد بود → risk * 0.80
 
 
 PAIR_CFG = {
@@ -245,20 +245,49 @@ def compute_signals(df, pcfg):
 
 
 # ═══════════════════════════════════════════════════════
+# RISK MULTIPLIER
+# ═══════════════════════════════════════════════════════
+def get_risk_mult(equity, peak, pnl_hist, month_pnl, month_threshold):
+    """
+    محاسبه risk multiplier بر اساس:
+    1. DD از peak
+    2. Rolling PF
+    3. Monthly stress
+    هرگز صفر نمی‌شود — فقط کاهش می‌یابد
+    """
+    G = GlobalConfig
+    mult = 1.0
+
+    # DD از peak
+    if peak > 0:
+        dd = (peak - equity) / peak
+        for dd_thresh, dd_mult in G.dd_levels:
+            if dd >= dd_thresh:
+                mult = min(mult, dd_mult)
+
+    # Rolling PF
+    if len(pnl_hist) >= G.rolling_pf_n // 2:
+        recent = pnl_hist[-G.rolling_pf_n:]
+        wins   = sum(p for p in recent if p > 0)
+        losses = abs(sum(p for p in recent if p < 0))
+        rpf    = wins / losses if losses > 0 else 1.5
+        if rpf < G.rolling_pf_bad:
+            mult *= G.rolling_pf_mult
+
+    # Monthly stress
+    if month_pnl < month_threshold:
+        mult *= 0.60
+
+    # حداقل 0.20 — هرگز صفر نشود
+    return max(mult, 0.20)
+
+
+# ═══════════════════════════════════════════════════════
 # BACKTEST
 # ═══════════════════════════════════════════════════════
 def pnl_calc(d, entry, xp, lot, qr, pip):
     gross = d * (xp - entry) * lot * GlobalConfig.lot_size * qr
     return gross - GlobalConfig.commission_per_lot * lot
-
-
-def get_rolling_pf(pnl_history, n):
-    if len(pnl_history) < n // 2:
-        return 1.0
-    recent = pnl_history[-n:]
-    wins   = sum(p for p in recent if p > 0)
-    losses = abs(sum(p for p in recent if p < 0))
-    return wins / losses if losses > 0 else 1.5
 
 
 def new_acc(ts):
@@ -302,7 +331,7 @@ def run_portfolio(pair_data):
     all_trades   = []
     acc_logs     = []
     eq_curve     = []
-    pnl_history  = []   # برای rolling PF
+    pnl_hist     = []
 
     positions  = {n: None for n in pair_data}
     day_trades = {n: 0    for n in pair_data}
@@ -352,66 +381,49 @@ def run_portfolio(pair_data):
             day_eq = month_eq = acc['equity']
             for n in pair_data:
                 day_trades[n] = 0; pending[n] = 0; positions[n] = None
-            pnl_history = []  # reset rolling PF بعد از blow
+            pnl_hist = []
             prev_date = cur_date; prev_month = cur_month
             continue
 
         if in_cd:
             continue
 
-        # Portfolio DD status
-        dd_from_peak = (acc['peak'] - acc['equity']) / acc['peak'] if acc['peak'] > 0 else 0
-        port_warned  = dd_from_peak >= G.port_dd_warn
-        port_stopped = dd_from_peak >= G.port_dd_stop
-
-        # Rolling PF
-        roll_pf = get_rolling_pf(pnl_history, G.rolling_pf_n)
-        roll_bad = roll_pf < G.rolling_pf_bad
-
-        m_stressed = (acc['equity'] - month_eq) < G.monthly_loss_threshold
-
-        # اگر port_stopped → هیچ ترید جدیدی نگیر
-        can_trade = not port_stopped
+        # Risk multiplier
+        month_pnl = acc['equity'] - month_eq
+        risk_mult = get_risk_mult(
+            acc['equity'], acc['peak'], pnl_hist,
+            month_pnl, G.monthly_loss_threshold)
 
         # open
-        if can_trade:
-            for name in pair_data:
-                a    = pa[name]
-                pcfg = a['cfg']
-                if (pending[name] != 0 and positions[name] is None
-                        and day_trades[name] < G.max_trades_day):
-                    sv   = pending[name]
-                    pip  = pcfg['pip_size']
-                    sp   = pcfg['spread_pip']
-                    qr   = a['qr'][bar]
+        for name in pair_data:
+            a    = pa[name]
+            pcfg = a['cfg']
+            if (pending[name] != 0 and positions[name] is None
+                    and day_trades[name] < G.max_trades_day):
+                sv   = pending[name]
+                pip  = pcfg['pip_size']
+                sp   = pcfg['spread_pip']
+                qr   = a['qr'][bar]
 
-                    # Risk با DD و rolling PF
-                    risk = pcfg['risk_pct']
-                    if port_warned:  risk *= 0.50
-                    if roll_bad:     risk *= 0.70
-                    if m_stressed:   risk *= 0.60
-                    if acc['consec_loss'] >= G.consec_loss_n:
-                        risk = max(risk * G.risk_reduce, pcfg['risk_min'])
+                risk = pcfg['risk_pct'] * risk_mult
+                if acc['consec_loss'] >= G.consec_loss_n:
+                    risk = max(risk * G.risk_reduce, pcfg['risk_min'])
 
-                    pv  = pip * G.lot_size * qr
-                    if pv <= 0: pv = 10.0
-                    lot = round(float(np.clip(
-                        acc['equity'] * risk / (pcfg['sl_pips'] * pv),
-                        G.min_lot, G.max_lot)), 2)
-                    ep = a['o'][bar] + sv * (G.slippage_pips + sp / 2) * pip
-                    positions[name] = {
-                        'dir': sv, 'lot': lot, 'lot_rem': lot,
-                        'partial_done': False, 'entry': ep,
-                        'sl': ep - sv * pcfg['sl_pips'] * pip,
-                        'tp': ep + sv * pcfg['tp_pips'] * pip,
-                        'entry_ts': ts, 'entry_bar': bar, 'pip': pip,
-                    }
-                    day_trades[name] += 1
-            for name in pair_data:
-                pending[name] = 0
-        else:
-            for name in pair_data:
-                pending[name] = 0
+                pv  = pip * G.lot_size * qr
+                if pv <= 0: pv = 10.0
+                lot = round(float(np.clip(
+                    acc['equity'] * risk / (pcfg['sl_pips'] * pv),
+                    G.min_lot, G.max_lot)), 2)
+                ep = a['o'][bar] + sv * (G.slippage_pips + sp / 2) * pip
+                positions[name] = {
+                    'dir': sv, 'lot': lot, 'lot_rem': lot,
+                    'partial_done': False, 'entry': ep,
+                    'sl': ep - sv * pcfg['sl_pips'] * pip,
+                    'tp': ep + sv * pcfg['tp_pips'] * pip,
+                    'entry_ts': ts, 'entry_bar': bar, 'pip': pip,
+                }
+                day_trades[name] += 1
+            pending[name] = 0
 
         # float
         total_float = sum(
@@ -453,7 +465,7 @@ def run_portfolio(pair_data):
                         p_pnl = pnl_calc(d, ep, cp, p_lot, qr, pip)
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
-                            pnl_history.append(p_pnl)
+                            pnl_hist.append(p_pnl)
                             all_trades.append({'pair': name, 'pnl': p_pnl,
                                                'status': 'Partial', 'exit_ts': ts})
                             acc['trades'].append(all_trades[-1])
@@ -483,7 +495,7 @@ def run_portfolio(pair_data):
                       'Z-Stop' if hit_zs else 'Z-Exit')
                 fpnl = pnl_calc(d, ep, xp, lr, qr, pip)
                 acc['equity'] += fpnl
-                pnl_history.append(fpnl)
+                pnl_hist.append(fpnl)
                 all_trades.append({'pair': name, 'pnl': fpnl,
                                    'status': st, 'exit_ts': ts})
                 acc['trades'].append(all_trades[-1])
@@ -504,18 +516,17 @@ def run_portfolio(pair_data):
             acc_num += 1
             acc = new_acc(ts)
             day_eq = month_eq = acc['equity']
-            pnl_history = []
+            pnl_hist = []
             for n in pair_data: day_trades[n] = 0; pending[n] = 0
             prev_date = cur_date; prev_month = cur_month
             continue
 
         # signals
-        if can_trade:
-            for name in pair_data:
-                a = pa[name]
-                if (positions[name] is None and not acc['blown'] and not in_cd
-                        and day_trades[name] < G.max_trades_day and a['sig'][bar] != 0):
-                    pending[name] = int(a['sig'][bar])
+        for name in pair_data:
+            a = pa[name]
+            if (positions[name] is None and not acc['blown'] and not in_cd
+                    and day_trades[name] < G.max_trades_day and a['sig'][bar] != 0):
+                pending[name] = int(a['sig'][bar])
 
     return {'all_trades': all_trades, 'account_logs': acc_logs,
             'withdrawn': withdrawn, 'final_equity': acc['equity'],
@@ -555,26 +566,25 @@ def print_report(res, title):
 
     logs   = pd.DataFrame(res['account_logs']) if res['account_logs'] else pd.DataFrame()
     n_pass = int((logs['reason'] == 'TARGET_HIT').sum()) if len(logs) else 0
-    n_blow = int((logs['reason'] != 'TARGET_HIT').sum()) if len(logs) else 0
+    n_blow = int((logs['reason'] != 'TARGET_HIT'].sum()) if len(logs) else 0
     neg_yr = int((df.groupby('year')['pnl'].sum() < 0).sum())
 
-    # Sharpe-like: monthly returns
-    m_mean = monthly.mean()
     m_std  = monthly.std()
-    sharpe = (m_mean / m_std * np.sqrt(12)) if m_std > 0 else 0
+    sharpe = (monthly.mean() / m_std * np.sqrt(12)) if m_std > 0 else 0
 
-    print("\n" + "═"*72)
+    print("\n" + "═"*70)
     print(f"  {title}")
-    print("═"*72)
+    print("═"*70)
     print(f"  Trades:{len(df):,}  WR:{wr:.1f}%  PF:{pf:.3f}")
     print(f"  AvgWin:${wins['pnl'].mean():.2f}  AvgLoss:${losses['pnl'].mean():.2f}")
     print(f"  Net:${df['pnl'].sum():,.2f}  Banked:${res['withdrawn']:,.2f}"
           f"  Eq:${res['final_equity']:,.2f}")
     print(f"  Pass:{n_pass}  Blown:{n_blow}  NegYr:{neg_yr}")
     print(f"  +Mo:{pos_m}/{tot_m}({pos_m/tot_m*100:.0f}%)  -Mo:{neg_m}  Streak:{ms}mo")
-    print(f"  MonthAvg:${m_mean:.2f}  Median:${monthly.median():.2f}  Sharpe:{sharpe:.2f}")
+    print(f"  MonthAvg:${monthly.mean():.2f}  Median:${monthly.median():.2f}"
+          f"  Sharpe:{sharpe:.2f}")
     print(f"  Best:${monthly.max():,.2f}  Worst:${monthly.min():,.2f}")
-    print("-"*72)
+    print("-"*70)
     if 'pair' in df.columns:
         print("  By Pair:")
         for pair, g in df.groupby('pair'):
@@ -582,7 +592,7 @@ def print_report(res, title):
             ppf = w2['pnl'].sum()/abs(l2['pnl'].sum()) if len(l2) else 99.0
             print(f"    {pair}: {len(g)}T  WR:{len(w2)/len(g)*100:.0f}%"
                   f"  PF:{ppf:.2f}  Net:${g['pnl'].sum():,.0f}")
-    print("-"*72)
+    print("-"*70)
     print("  Yearly:")
     for yr, g in df.groupby('year'):
         w2 = g[g['pnl']>0]; l2 = g[g['pnl']<0]
@@ -590,44 +600,34 @@ def print_report(res, title):
         mark = '✅' if g['pnl'].sum() >= 0 else '❌'
         print(f"    {mark} {yr}:{len(g):>4}T  WR:{len(w2)/len(g)*100:5.1f}%"
               f"  PF:{ypf:.2f}  ${g['pnl'].sum():>+8,.2f}")
-    print("-"*72)
+    print("-"*70)
     target = GlobalConfig.initial_balance * 0.02
     above  = int((monthly >= target).sum())
     print(f"  🎯 هدف $100/ماه: {above}/{tot_m} ({above/tot_m*100:.0f}%)")
-    print(f"  📊 میانگین: ${m_mean:.2f} → {m_mean/target*100:.0f}% از هدف")
-    print("═"*72)
+    print(f"  📊 میانگین: ${monthly.mean():.2f} → {monthly.mean()/target*100:.0f}% از هدف")
+    print("═"*70)
 
-    # ذخیره
-    monthly.to_csv('monthly_v14.csv', header=['pnl'])
-    pd.DataFrame(res['eq_curve']).to_csv('equity_v14.csv', index=False)
-    df.to_csv('trades_v14.csv', index=False)
-    print("  📊 monthly_v14.csv + equity_v14.csv + trades_v14.csv saved")
+    monthly.to_csv('monthly_v14b.csv', header=['pnl'])
+    pd.DataFrame(res['eq_curve']).to_csv('equity_v14b.csv', index=False)
+    print("  📊 monthly_v14b.csv + equity_v14b.csv saved")
 
-    # مقایسه نهایی
-    print("\n  📈 مقایسه کامل نسخه‌ها:")
+    print("\n  📈 مقایسه نهایی:")
+    rows = [
+        ("v13 بدون RiskCtrl", 91,  59, 3, 10, "—"),
+        (f"v14b با RiskCtrl",
+         round(monthly.mean()), round(pos_m/tot_m*100),
+         neg_yr, n_blow, f"{sharpe:.2f}"),
+    ]
     print(f"  {'Version':<22} {'MonAvg':>8} {'+Mo%':>6} {'NegYr':>7}"
           f" {'Blow':>6} {'Sharpe':>7}")
-    print("  " + "─"*60)
-    history = [
-        ("v9c  AUDNZD only",      26,  49, 5,  0, "—"),
-        ("v11  +AUDCAD",          47,  55, 3,  5, "—"),
-        ("v12  +GBPCAD",          59,  58, 3,  6, "—"),
-        ("v13  +GBPCHF (raw)",    91,  59, 3, 10, "—"),
-        (f"v14  +RiskCtrl",
-         round(m_mean), round(pos_m/tot_m*100), neg_yr, n_blow,
-         f"{sharpe:.2f}"),
-    ]
-    for v, ma, pm, ny, bl, sh in history:
+    for v, ma, pm, ny, bl, sh in rows:
         print(f"  {v:<22} ${ma:>6}   {pm:>4}%   {ny:>5}   {bl:>5}   {sh:>6}")
 
 
-# ═══════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  CorrArb v14 — Final + Portfolio Risk Control              ║")
+    print("║  CorrArb v14b — Fixed Portfolio Risk Control               ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
     pair_data = {}
@@ -643,5 +643,5 @@ if __name__ == "__main__":
 
     print()
     res = run_portfolio(pair_data)
-    print_report(res, "v14 — Quad + Portfolio Risk Control")
+    print_report(res, "v14b — Quad + Fixed Risk Control")
     print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
