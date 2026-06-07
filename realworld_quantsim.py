@@ -49,10 +49,11 @@ class Config:
     hour_start         = 2
     hour_end           = 19
     trade_days         = [1, 2, 3]   # فقط سه‌شنبه، چهارشنبه، پنج‌شنبه
+    max_trades_day     = 2           # 🔴 این خط جا افتاده بود!
 
     vr_period          = 200         
     vr_k               = 4           
-    vr_max             = 0.90        
+    vr_max             = 0.90
 
     # ── فیلتر روند بیدار شده ──
     use_trend_filter   = True
