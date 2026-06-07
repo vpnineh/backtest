@@ -65,15 +65,13 @@ class Config:
     
     # [Option 1] استاپ و تارگت داینامیک (ATR)
     use_dynamic_stops  = True
-    atr_sl_mult        = 1.5         # SL = 1.5 * ATR
-    atr_tp_mult        = 2.0         # TP = 2.0 * ATR
-    # در صورت خاموش بودن بالا، از این مقادیر ثابت استفاده می‌شود:
+    atr_sl_mult        = 3.0         # 🔴 افزایش از 1.5 به 3.0 (فضای تنفس برای فرار از نویز)
+    atr_tp_mult        = 6.0         # 🔴 افزایش از 2.0 به 6.0 (نسبت ریوارد به ریسک 1:2)
     sl_pips_static     = 30.0
     tp_pips_static     = 90.0
     atr_period         = 14
 
     # [Option 2] خروج پله‌ای (Partial Exit)
-    # شما خواستید حذف شود، پس False است. اگر خواستید تست کنید True کنید.
     enable_partial_exit = False
     partial_ratio       = 0.50
     z_exit_partial      = 0.5
@@ -81,7 +79,7 @@ class Config:
     # [Option 3] فیلتر روند (Trend Filter)
     use_trend_filter   = True
     trend_ma_period    = 200
-    trend_max_slope    = 0.0003      # حداکثر شیب مجاز (3 پیپ در هر کندل 15m)
+    trend_max_slope    = 0.00003     # 🔴 حساسیت 10 برابر بیشتر شد (0.3 پیپ در کندل به جای 3 پیپ)
 
     # =======================================================
     approx_quote_rate = {'EURGBP': 1.25, 'AUDNZD': 0.60}
