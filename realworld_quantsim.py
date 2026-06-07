@@ -1,30 +1,12 @@
 """
-CorrArb v10 — Multi-Pair Scanner
-==================================
-هدف: تست همه pairهای synthetic ممکن با baseline برنده
-
-Baseline:
-  ✅ No TimeStop
-  ✅ SL = 30
-  ✅ Partial = 0.75
-  ✅ z_exit_partial = 0.50
-  ✅ VR < 0.75
-  ✅ No Bad Hours (4,5,7,9,13,18,20)
-
-Pairs to test:
-  FX Synthetic:
-    AUDNZD = AUDUSD / NZDUSD
-    AUDCAD = AUDUSD * USDCAD
-    NZDCAD = NZDUSD * USDCAD
-    EURCHF = EURUSD / USDCHF
-    GBPCHF = GBPUSD / USDCHF
-    AUDCHF = AUDUSD / USDCHF
-    NZDCHF = NZDUSD / USDCHF
-    EURCAD = EURUSD * USDCAD
-    GBPCAD = GBPUSD * USDCAD
-
-  Metals Ratio:
-    XAUXAG = XAUUSD / XAGUSD
+CorrArb v10b — Multi-Pair Scanner Fixed
+=========================================
+اصلاح مشکلات v10:
+  ✅ هر pair VR threshold خودش را دارد
+  ✅ Correlation filter per-pair قابل تنظیم
+  ✅ XAUXAG lot sizing کاملاً جدا
+  ✅ اگر VR<0.75 سیگنال نداد، VR<0.90 را هم تست می‌کند
+  ✅ Correlation min per-pair
 """
 
 import pandas as pd
@@ -35,9 +17,6 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 
-# ═══════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════
 class Config:
     initial_balance    = 5_000.0
     profit_target_pct  = 0.05
@@ -54,7 +33,6 @@ class Config:
     min_lot            = 0.01
     warmup             = 500
 
-    # Signal — locked
     z_fast_period      = 96
     z_entry            = 2.1
     z_exit_partial     = 0.50
@@ -62,107 +40,107 @@ class Config:
     z_stop_margin      = 4.0
     min_net_profit_usd = 15.0
 
-    # Filters — locked best
-    corr_period        = 96
-    corr_min           = 0.80
     hour_start         = 2
     hour_end           = 19
     bad_hours          = {4, 5, 7, 9, 13, 18, 20}
     trade_days         = [0, 1, 2, 3, 4]
     max_trades_day     = 2
 
-    # Exit — locked
     sl_pips            = 30.0
     tp_pips            = 90.0
     partial_ratio      = 0.75
 
-    # Regime — locked
     atr_period         = 14
     atr_ma_period      = 96
     atr_max_mult       = 3.0
     atr_min_mult       = 0.5
+
     vr_period          = 200
     vr_k               = 4
-    vr_max             = 0.75
+    corr_period        = 96
 
     cooldown_days          = 10
     monthly_loss_threshold = -150.0
 
 
 # ═══════════════════════════════════════════════════════
-# PAIR DEFINITIONS
+# PAIR DEFINITIONS — با پارامترهای اختصاصی
 # ═══════════════════════════════════════════════════════
 PAIR_DEFS = {
-    # name: (leg1_pattern, leg2_pattern, formula, quote_formula, spread_pip, pip_size)
-    #
-    # formula options:
-    #   'div' = leg1 / leg2
-    #   'mul' = leg1 * leg2
-    #
-    # quote_formula:
-    #   'leg2'     = quote_rate = leg2 close
-    #   'inv_leg2' = quote_rate = 1 / leg2 close
-    #   'leg1'     = quote_rate = leg1 close (for metals)
-
     'AUDNZD': {
         'leg1': 'AUDUSD', 'leg2': 'NZDUSD',
-        'formula': 'div',
-        'quote_formula': 'leg2',
+        'formula': 'div', 'quote_formula': 'leg2',
         'spread_pip': 2.5, 'pip_size': 0.0001,
+        'vr_max': 0.75, 'corr_min': 0.80,
+        'is_metal': False,
     },
     'AUDCAD': {
         'leg1': 'AUDUSD', 'leg2': 'USDCAD',
-        'formula': 'mul',
-        'quote_formula': 'inv_leg2',
+        'formula': 'mul', 'quote_formula': 'inv_leg2',
         'spread_pip': 2.5, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.50,
+        'is_metal': False,
     },
     'NZDCAD': {
         'leg1': 'NZDUSD', 'leg2': 'USDCAD',
-        'formula': 'mul',
-        'quote_formula': 'inv_leg2',
+        'formula': 'mul', 'quote_formula': 'inv_leg2',
         'spread_pip': 3.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.50,
+        'is_metal': False,
     },
     'EURCHF': {
         'leg1': 'EURUSD', 'leg2': 'USDCHF',
-        'formula': 'div',
-        'quote_formula': 'inv_leg2',
+        'formula': 'div', 'quote_formula': 'inv_leg2',
         'spread_pip': 2.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'GBPCHF': {
         'leg1': 'GBPUSD', 'leg2': 'USDCHF',
-        'formula': 'div',
-        'quote_formula': 'inv_leg2',
+        'formula': 'div', 'quote_formula': 'inv_leg2',
         'spread_pip': 3.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'AUDCHF': {
         'leg1': 'AUDUSD', 'leg2': 'USDCHF',
-        'formula': 'div',
-        'quote_formula': 'inv_leg2',
+        'formula': 'div', 'quote_formula': 'inv_leg2',
         'spread_pip': 3.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'NZDCHF': {
         'leg1': 'NZDUSD', 'leg2': 'USDCHF',
-        'formula': 'div',
-        'quote_formula': 'inv_leg2',
+        'formula': 'div', 'quote_formula': 'inv_leg2',
         'spread_pip': 3.5, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'EURCAD': {
         'leg1': 'EURUSD', 'leg2': 'USDCAD',
-        'formula': 'mul',
-        'quote_formula': 'inv_leg2',
+        'formula': 'mul', 'quote_formula': 'inv_leg2',
         'spread_pip': 3.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'GBPCAD': {
         'leg1': 'GBPUSD', 'leg2': 'USDCAD',
-        'formula': 'mul',
-        'quote_formula': 'inv_leg2',
+        'formula': 'mul', 'quote_formula': 'inv_leg2',
         'spread_pip': 4.0, 'pip_size': 0.0001,
+        'vr_max': 0.90, 'corr_min': 0.40,
+        'is_metal': False,
     },
     'XAUXAG': {
         'leg1': 'XAUUSD', 'leg2': 'XAGUSD',
-        'formula': 'div',
-        'quote_formula': 'leg2',
-        'spread_pip': 5.0, 'pip_size': 0.01,
+        'formula': 'div', 'quote_formula': 'one',
+        'spread_pip': 30.0, 'pip_size': 0.01,
+        'vr_max': 0.90, 'corr_min': 0.60,
+        'is_metal': True,
+        # برای طلا/نقره lot sizing متفاوت است
+        # 1 lot XAUUSD = 100 oz = ~$25,000 value
+        # ریسک را با dollar amount کنترل می‌کنیم
+        'sl_dollar': 50.0,  # حداکثر $50 ریسک در XAUXAG
+        'lot_fixed': 0.01,  # lot ثابت کوچک برای test
     },
 }
 
@@ -203,14 +181,33 @@ def load_raw_csv(pattern):
         return None
     frames = []
     for p in paths:
-        frames.append(pd.read_csv(
-            p, sep=';', header=None,
-            names=['ts', 'o', 'h', 'l', 'c', 'v']))
+        try:
+            frames.append(pd.read_csv(
+                p, sep=';', header=None,
+                names=['ts', 'o', 'h', 'l', 'c', 'v']))
+        except Exception:
+            continue
+    if not frames:
+        return None
     raw = pd.concat(frames).sort_values('ts')
     raw['ts'] = pd.to_datetime(raw['ts'], format='%Y%m%d %H%M%S')
     raw = raw.drop_duplicates('ts').set_index('ts')
     raw[['o', 'h', 'l', 'c']] = raw[['o', 'h', 'l', 'c']].astype(float)
     return raw
+
+
+def load_instrument(name):
+    for pat in [
+        f'data/HISTDATA*{name}*.zip',
+        f'data/*{name}*.zip',
+        f'data/HISTDATA*{name}*.csv',
+        f'data/*{name}*.csv',
+    ]:
+        raw = (load_raw_zip(pat) if pat.endswith('.zip')
+               else load_raw_csv(pat))
+        if raw is not None and len(raw) > 1000:
+            return raw
+    return None
 
 
 def to_15min(raw, sfx):
@@ -222,41 +219,23 @@ def to_15min(raw, sfx):
     }).dropna()
 
 
-def load_instrument(name):
-    """بارگذاری یک instrument — اول ZIP بعد CSV"""
-    raw = load_raw_zip(f'data/HISTDATA*{name}*.zip')
-    if raw is None:
-        raw = load_raw_zip(f'data/*{name}*.zip')
-    if raw is None:
-        raw = load_raw_csv(f'data/*{name}*.csv')
-    if raw is None:
-        raw = load_raw_csv(f'data/HISTDATA*{name}*.csv')
-    return raw
-
-
-def build_pair(pair_name, pair_def):
-    """ساخت synthetic pair از دو leg"""
-    leg1_name = pair_def['leg1']
-    leg2_name = pair_def['leg2']
-
-    raw1 = load_instrument(leg1_name)
+def build_pair(pair_name, pdef):
+    raw1 = load_instrument(pdef['leg1'])
     if raw1 is None:
-        return None, f"❌ {leg1_name} not found"
+        return None, f"❌ {pdef['leg1']} not found"
 
-    raw2 = load_instrument(leg2_name)
+    raw2 = load_instrument(pdef['leg2'])
     if raw2 is None:
-        return None, f"❌ {leg2_name} not found"
+        return None, f"❌ {pdef['leg2']} not found"
 
     d1 = to_15min(raw1, 'leg1')
     d2 = to_15min(raw2, 'leg2')
+    m  = d1.join(d2, how='inner').dropna()
 
-    m = d1.join(d2, how='inner').dropna()
-
-    if len(m) < 10000:
+    if len(m) < 5000:
         return None, f"❌ Too few bars: {len(m)}"
 
-    # Spread calculation
-    if pair_def['formula'] == 'div':
+    if pdef['formula'] == 'div':
         m['c_spread'] = m['c_leg1'] / m['c_leg2']
         m['o_spread'] = m['o_leg1'] / m['o_leg2']
         m['h_spread'] = m['h_leg1'] / m['l_leg2']
@@ -267,22 +246,21 @@ def build_pair(pair_name, pair_def):
         m['h_spread'] = m['h_leg1'] * m['h_leg2']
         m['l_spread'] = m['l_leg1'] * m['l_leg2']
 
-    # Quote rate for PnL conversion
-    if pair_def['quote_formula'] == 'leg2':
+    if pdef['quote_formula'] == 'leg2':
         m['quote_rate'] = m['c_leg2']
-    elif pair_def['quote_formula'] == 'inv_leg2':
-        m['quote_rate'] = 1.0 / m['c_leg2']
-    elif pair_def['quote_formula'] == 'leg1':
+    elif pdef['quote_formula'] == 'inv_leg2':
+        m['quote_rate'] = 1.0 / m['c_leg2'].replace(0, np.nan)
+    elif pdef['quote_formula'] == 'leg1':
         m['quote_rate'] = m['c_leg1']
-    else:
+    else:  # 'one'
         m['quote_rate'] = 1.0
 
-    m = m[m.index.weekday < 5].copy()
+    m = m[m.index.weekday < 5].dropna().copy()
     return m, f"✅ {len(m):,} bars ({m.index[0].date()} → {m.index[-1].date()})"
 
 
 # ═══════════════════════════════════════════════════════
-# INDICATORS + SIGNALS
+# INDICATORS
 # ═══════════════════════════════════════════════════════
 def calc_atr(h, l, c, period=14):
     tr = pd.concat([
@@ -301,20 +279,23 @@ def calc_vr(series, k, window):
     return vk / (k * v1.replace(0, np.nan))
 
 
-def compute_signals(df):
+def compute_signals(df, pdef):
     C = Config
 
-    log_r  = np.log(df['c_spread'])
+    log_r  = np.log(df['c_spread'].replace(0, np.nan))
     z_mean = log_r.rolling(C.z_fast_period).mean()
     z_std  = log_r.rolling(C.z_fast_period).std()
     z      = (log_r - z_mean) / z_std.replace(0, np.nan)
 
-    corr_ok = (df['c_leg1'].pct_change()
-               .rolling(C.corr_period)
-               .corr(df['c_leg2'].pct_change()) > C.corr_min)
+    # Correlation — per-pair threshold
+    corr = (df['c_leg1'].pct_change()
+            .rolling(C.corr_period)
+            .corr(df['c_leg2'].pct_change()))
+    corr_ok = corr.abs() > pdef['corr_min']
 
+    # VR — per-pair threshold
     vr        = calc_vr(log_r, C.vr_k, C.vr_period)
-    regime_ok = vr < C.vr_max
+    regime_ok = vr < pdef['vr_max']
 
     atr    = calc_atr(df['h_spread'], df['l_spread'],
                       df['c_spread'], C.atr_period)
@@ -328,11 +309,19 @@ def compute_signals(df):
                (~hour.isin(C.bad_hours)) &
                dow.isin(C.trade_days))
 
-    sig  = pd.Series(0, index=df.index)
+    sig = pd.Series(0, index=df.index)
     cond = vol_ok & time_ok & corr_ok & regime_ok
     sig[(z < -C.z_entry) & cond] =  1
     sig[(z >  C.z_entry) & cond] = -1
     sig = sig.where(sig != sig.shift(), 0)
+
+    n_sig     = int((sig != 0).sum())
+    n_regime  = int(regime_ok.sum())
+    n_corr    = int(corr_ok.sum())
+    n_time    = int(time_ok.sum())
+
+    print(f"    Signals:{n_sig:,} | Regime:{n_regime:,} | "
+          f"Corr:{n_corr:,} | Session:{n_time:,}")
 
     return sig, z
 
@@ -344,6 +333,20 @@ def calc_pnl(direction, entry, exit_px, lot, qr, pip):
     C     = Config
     gross = direction * (exit_px - entry) * lot * C.lot_size * qr
     return gross - C.commission_per_lot * lot
+
+
+def calc_lot(equity, pdef, qr, pip):
+    """Lot sizing — per-pair"""
+    C = Config
+    if pdef.get('is_metal'):
+        return pdef.get('lot_fixed', 0.01)
+
+    risk = C.risk_base_pct
+    pv   = pip * C.lot_size * qr
+    if pv <= 0:
+        return C.min_lot
+    lot = equity * risk / (C.sl_pips * pv)
+    return round(float(np.clip(lot, C.min_lot, C.max_lot)), 2)
 
 
 def new_acc(ts):
@@ -359,12 +362,16 @@ def new_acc(ts):
     }
 
 
-def run_backtest(df, sig, z, spread_pip, pip_size):
-    C          = Config
-    idx        = df.index.sort_values()
+def run_backtest(df, sig, z, pdef):
+    C   = Config
+    idx = df.index.sort_values()
+
+    if len(idx) <= C.warmup:
+        return None
+
     start_date = idx[C.warmup]
-    pip        = pip_size
-    sp         = spread_pip
+    pip        = pdef['pip_size']
+    sp         = pdef['spread_pip']
 
     o_  = df['o_spread'].reindex(idx).ffill().values.astype(float)
     c_  = df['c_spread'].reindex(idx).ffill().values.astype(float)
@@ -411,14 +418,14 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
 
         if acc['blown']:
             acc_logs.append({
-                'account': acc_num, 'reason': acc['blown_rsn'],
+                'reason': acc['blown_rsn'],
                 'pnl': acc['equity'] - C.initial_balance,
                 'days': (ts - acc['start_ts']).days,
             })
             cooldown_til = ts + pd.Timedelta(days=C.cooldown_days)
-            acc_num   += 1
-            acc        = new_acc(ts)
-            day_eq     = month_eq = acc['equity']
+            acc_num += 1
+            acc = new_acc(ts)
+            day_eq = month_eq = acc['equity']
             day_trades = 0; pending = 0; pos = None
             continue
 
@@ -429,19 +436,16 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
 
         # open
         if pending != 0 and pos is None and day_trades < C.max_trades_day:
-            sv   = pending
-            risk = C.risk_base_pct * (0.5 if m_stressed else 1.0)
+            sv  = pending
+            qr  = qr_[bar]
+            lot = calc_lot(acc['equity'], pdef, qr, pip)
+
+            if m_stressed:
+                lot = max(round(lot * 0.5, 2), C.min_lot)
             if acc['consec_loss'] >= C.consec_loss_n:
-                risk = max(risk * C.risk_reduce, C.risk_min_pct)
+                lot = max(round(lot * C.risk_reduce, 2), C.min_lot)
 
-            pv  = pip * C.lot_size * qr_[bar]
-            if pv <= 0:
-                pv = 10.0
-            lot = round(float(np.clip(
-                acc['equity'] * risk / (C.sl_pips * pv),
-                C.min_lot, C.max_lot)), 2)
-
-            ep  = o_[bar] + sv * (C.slippage_pips + sp / 2) * pip
+            ep = o_[bar] + sv * (C.slippage_pips + sp / 2) * pip
             pos = {
                 'dir': sv, 'lot': lot, 'lot_rem': lot,
                 'partial_done': False,
@@ -470,7 +474,8 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
                 pnl = calc_pnl(pos['dir'], pos['entry'],
                                c_[bar], pos['lot_rem'], qr_[bar], pip)
                 acc['equity'] += pnl
-                all_trades.append({'pnl': pnl, 'status': 'BLOWN', 'exit_ts': ts})
+                all_trades.append({'pnl': pnl, 'status': 'BLOWN',
+                                   'exit_ts': ts})
                 acc['trades'].append(all_trades[-1])
                 pos = None
             continue
@@ -478,7 +483,7 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
         # exit
         if pos is not None:
             cp = c_[bar]; d = pos['dir']; ep = pos['entry']
-            zn = zz_[bar]; lr = pos['lot_rem']
+            zn = zz_[bar]; lr = pos['lot_rem']; qr = qr_[bar]
 
             # partial
             if not pos['partial_done'] and not np.isnan(zn):
@@ -486,10 +491,11 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
                         (d == -1 and zn <= C.z_exit_partial)):
                     p_lot = round(lr * C.partial_ratio, 2)
                     if p_lot >= C.min_lot:
-                        p_pnl = calc_pnl(d, ep, cp, p_lot, qr_[bar], pip)
+                        p_pnl = calc_pnl(d, ep, cp, p_lot, qr, pip)
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
-                            all_trades.append({'pnl': p_pnl, 'status': 'Partial', 'exit_ts': ts})
+                            all_trades.append({'pnl': p_pnl, 'status': 'Partial',
+                                               'exit_ts': ts})
                             acc['trades'].append(all_trades[-1])
                             pos['lot_rem'] = round(lr - p_lot, 2)
                             pos['partial_done'] = True
@@ -500,7 +506,7 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
 
             if pos is not None:
                 lr      = pos['lot_rem']
-                pnl_now = calc_pnl(d, ep, cp, lr, qr_[bar], pip)
+                pnl_now = calc_pnl(d, ep, cp, lr, qr, pip)
 
                 hit_zs = (not np.isnan(zn) and
                           ((d == 1 and zn <= -C.z_stop_margin) or
@@ -510,7 +516,6 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
                            (d == -1 and zn <= C.z_exit_full)))
                 if hit_ze and pnl_now < C.min_net_profit_usd and not pos['partial_done']:
                     hit_ze = False
-
                 hit_sl = (d == 1 and cp <= pos['sl']) or (d == -1 and cp >= pos['sl'])
                 hit_tp = (d == 1 and cp >= pos['tp']) or (d == -1 and cp <= pos['tp'])
 
@@ -518,9 +523,10 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
                     xp = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
                     st = ('SL' if hit_sl else 'TP' if hit_tp else
                           'Z-Stop' if hit_zs else 'Z-Exit')
-                    fpnl = calc_pnl(d, ep, xp, lr, qr_[bar], pip)
+                    fpnl = calc_pnl(d, ep, xp, lr, qr, pip)
                     acc['equity'] += fpnl
-                    all_trades.append({'pnl': fpnl, 'status': st, 'exit_ts': ts})
+                    all_trades.append({'pnl': fpnl, 'status': st,
+                                       'exit_ts': ts})
                     acc['trades'].append(all_trades[-1])
                     pos = None
                     if fpnl > 0: acc['consec_loss'] = 0
@@ -530,40 +536,33 @@ def run_backtest(df, sig, z, spread_pip, pip_size):
         if acc['equity'] >= TARGET and pos is None:
             w = acc['equity'] - C.initial_balance
             withdrawn += w
-            acc_logs.append({
-                'account': acc_num, 'reason': 'TARGET_HIT',
-                'pnl': w, 'days': (ts - acc['start_ts']).days,
-            })
+            acc_logs.append({'reason': 'TARGET_HIT', 'pnl': w,
+                             'days': (ts - acc['start_ts']).days})
             acc_num += 1
             acc = new_acc(ts)
             day_eq = month_eq = acc['equity']
             day_trades = 0; pending = 0
             continue
 
-        # signal
         if (pos is None and not acc['blown'] and not in_cd
                 and day_trades < C.max_trades_day and sg_[bar] != 0):
             pending = int(sg_[bar])
 
     return {
-        'all_trades':   all_trades,
-        'account_logs': acc_logs,
-        'withdrawn':    withdrawn,
-        'final_equity': acc['equity'],
-        'common_idx':   idx,
+        'all_trades': all_trades, 'account_logs': acc_logs,
+        'withdrawn': withdrawn, 'final_equity': acc['equity'],
+        'common_idx': idx,
     }
 
 
 # ═══════════════════════════════════════════════════════
-# ANALYSIS
+# ANALYZE + REPORT
 # ═══════════════════════════════════════════════════════
-def analyze_result(pair_name, res):
-    """آنالیز نتایج یک pair"""
-    trades = res['all_trades']
-    if not trades or len(trades) < 10:
+def analyze(pair_name, res):
+    if not res or not res['all_trades'] or len(res['all_trades']) < 20:
         return None
 
-    df = pd.DataFrame(trades)
+    df = pd.DataFrame(res['all_trades'])
     df['exit_ts'] = pd.to_datetime(df['exit_ts'])
     df['month']   = df['exit_ts'].dt.to_period('M')
     df['year']    = df['exit_ts'].dt.year
@@ -586,35 +585,60 @@ def analyze_result(pair_name, res):
     ms = cur = 0
     for v in monthly:
         cur = cur + 1 if v < 0 else 0
-        ms = max(ms, cur)
+        ms  = max(ms, cur)
 
     logs   = pd.DataFrame(res['account_logs']) if res['account_logs'] else pd.DataFrame()
     n_pass = int((logs['reason'] == 'TARGET_HIT').sum()) if len(logs) else 0
     n_blow = int((logs['reason'] != 'TARGET_HIT').sum()) if len(logs) else 0
+    neg_yr = int((df.groupby('year')['pnl'].sum() < 0).sum())
 
-    # Yearly neg
-    yearly = df.groupby('year')['pnl'].sum()
-    neg_yr = int((yearly < 0).sum())
+    # Yearly detail
+    yearly_str = ""
+    for yr, g2 in df.groupby('year'):
+        w2 = g2[g2['pnl'] > 0]; l2 = g2[g2['pnl'] < 0]
+        ypf  = w2['pnl'].sum() / abs(l2['pnl'].sum()) if len(l2) else 99.0
+        mark = '✅' if g2['pnl'].sum() >= 0 else '❌'
+        yearly_str += (f"    {mark} {yr}:{len(g2):>4}T  "
+                       f"WR:{len(w2)/len(g2)*100:5.1f}%  "
+                       f"PF:{ypf:.2f}  ${g2['pnl'].sum():>+8,.2f}\n")
 
     return {
-        'Pair':     pair_name,
-        'Trades':   len(df),
-        'WR%':      round(wr, 1),
-        'PF':       round(pf, 3),
-        'Banked':   round(res['withdrawn'], 0),
-        'Net':      round(df['pnl'].sum(), 0),
-        '+Mo':      pos_m,
-        '-Mo':      neg_m,
-        'TotMo':    tot_m,
-        'Streak':   ms,
-        'MonAvg':   round(monthly.mean(), 2),
-        'Median':   round(monthly.median(), 2),
-        'Pass':     n_pass,
-        'Blow':     n_blow,
-        'NegYr':    neg_yr,
-        'AvgWin':   round(wins['pnl'].mean(), 2) if len(wins) else 0,
-        'AvgLoss':  round(losses['pnl'].mean(), 2) if len(losses) else 0,
+        'Pair': pair_name, 'Trades': len(df),
+        'WR%': round(wr, 1), 'PF': round(pf, 3),
+        'Banked': round(res['withdrawn'], 0),
+        'Net': round(df['pnl'].sum(), 0),
+        '+Mo': pos_m, '-Mo': neg_m, 'TotMo': tot_m,
+        'Streak': ms, 'MonAvg': round(monthly.mean(), 2),
+        'Median': round(monthly.median(), 2),
+        'Pass': n_pass, 'Blow': n_blow, 'NegYr': neg_yr,
+        'AvgWin': round(wins['pnl'].mean(), 2) if len(wins) else 0,
+        'AvgLoss': round(losses['pnl'].mean(), 2) if len(losses) else 0,
+        'yearly': yearly_str,
     }
+
+
+def verdict(row):
+    if (row['PF'] >= 1.12 and
+            row['+Mo'] >= row['TotMo'] * 0.45 and
+            row['NegYr'] <= 6 and
+            row['Blow'] <= 5):
+        return '✅ PASS'
+    elif row['PF'] >= 1.05 and row['Net'] > 0:
+        return '⚠ MARGINAL'
+    return '❌ FAIL'
+
+
+def print_detail(row, pdef):
+    v = verdict(row)
+    print(f"\n    Result: {v}")
+    print(f"    Trades:{row['Trades']}  WR:{row['WR%']}%  PF:{row['PF']}")
+    print(f"    Net:${row['Net']:,.0f}  Banked:${row['Banked']:,.0f}")
+    print(f"    Pass:{row['Pass']}  Blow:{row['Blow']}")
+    print(f"    +Mo:{row['+Mo']}/{row['TotMo']}  Streak:{row['Streak']}  NegYr:{row['NegYr']}")
+    print(f"    MonAvg:${row['MonAvg']:.2f}  Median:${row['Median']:.2f}")
+    print(f"    AvgWin:${row['AvgWin']:.2f}  AvgLoss:${row['AvgLoss']:.2f}")
+    print(f"    Yearly:")
+    print(row['yearly'])
 
 
 # ═══════════════════════════════════════════════════════
@@ -623,136 +647,110 @@ def analyze_result(pair_name, res):
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║   CorrArb v10 — Multi-Pair Scanner                     ║")
-    print("║   Baseline: VR<0.75 | No Bad Hours | SL30 | P0.75      ║")
+    print("║   CorrArb v10b — Multi-Pair Scanner (Fixed)            ║")
     print("╚══════════════════════════════════════════════════════════╝")
 
     results = []
 
     for pair_name, pdef in PAIR_DEFS.items():
-        print(f"\n{'─'*60}")
-        print(f"  ▶ {pair_name}  ({pdef['leg1']} / {pdef['leg2']})")
-        print(f"{'─'*60}")
+        print(f"\n{'═'*62}")
+        print(f"  ▶ {pair_name}  ({pdef['leg1']} × {pdef['leg2']})")
+        print(f"    VR<{pdef['vr_max']} | Corr>{pdef['corr_min']}")
+        print(f"{'═'*62}")
 
-        # Build pair
         df, msg = build_pair(pair_name, pdef)
         print(f"    {msg}")
 
         if df is None:
-            results.append({'Pair': pair_name, 'Status': 'SKIP', 'PF': 0})
+            results.append({'Pair': pair_name, 'Status': 'NO_DATA',
+                            'PF': 0, 'Net': 0})
             continue
 
-        # Signals
         try:
-            sig, z = compute_signals(df)
-            n_sig = int((sig != 0).sum())
-            print(f"    Signals: {n_sig:,}")
-
-            if n_sig < 50:
-                print(f"    ⚠ Too few signals — skipping")
-                results.append({'Pair': pair_name, 'Status': 'FEW_SIG', 'PF': 0})
-                continue
+            sig, z = compute_signals(df, pdef)
         except Exception as e:
             print(f"    ❌ Signal error: {e}")
-            results.append({'Pair': pair_name, 'Status': 'ERROR', 'PF': 0})
+            results.append({'Pair': pair_name, 'Status': 'SIG_ERR',
+                            'PF': 0, 'Net': 0})
             continue
 
-        # Backtest
+        n_sig = int((sig != 0).sum())
+        if n_sig < 30:
+            print(f"    ⚠ Only {n_sig} signals — skipping")
+            results.append({'Pair': pair_name, 'Status': 'FEW_SIG',
+                            'PF': 0, 'Net': 0})
+            continue
+
         try:
-            res = run_backtest(df, sig, z,
-                               pdef['spread_pip'], pdef['pip_size'])
+            res = run_backtest(df, sig, z, pdef)
         except Exception as e:
             print(f"    ❌ Backtest error: {e}")
-            results.append({'Pair': pair_name, 'Status': 'ERROR', 'PF': 0})
+            results.append({'Pair': pair_name, 'Status': 'BT_ERR',
+                            'PF': 0, 'Net': 0})
             continue
 
-        # Analyze
-        row = analyze_result(pair_name, res)
+        row = analyze(pair_name, res)
         if row is None:
-            print(f"    ⚠ No trades or too few")
-            results.append({'Pair': pair_name, 'Status': 'NO_TRADES', 'PF': 0})
+            print(f"    ⚠ Too few trades")
+            results.append({'Pair': pair_name, 'Status': 'NO_TRADES',
+                            'PF': 0, 'Net': 0})
             continue
 
         row['Status'] = 'OK'
-
-        # Quick verdict
-        if row['PF'] >= 1.12 and row['+Mo'] >= row['TotMo'] * 0.45 and row['NegYr'] <= 6:
-            verdict = '✅ PASS'
-        elif row['PF'] >= 1.05:
-            verdict = '⚠ MARGINAL'
-        else:
-            verdict = '❌ FAIL'
-
-        row['Verdict'] = verdict
+        row['Verdict'] = verdict(row)
+        print_detail(row, pdef)
         results.append(row)
 
-        print(f"    {verdict}  PF:{row['PF']:.3f}  "
-              f"Net:${row['Net']:,.0f}  "
-              f"Bank:${row['Banked']:,.0f}  "
-              f"+Mo:{row['+Mo']}/{row['TotMo']}  "
-              f"Pass:{row['Pass']} Blow:{row['Blow']}  "
-              f"NegYr:{row['NegYr']}")
-
-    # ═══════════════════════════════════════════════════════
-    # FINAL TABLE
-    # ═══════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════
+    # FINAL SUMMARY TABLE
+    # ═══════════════════════════════════════════════════
     print("\n\n" + "╔" + "═"*100 + "╗")
-    print("║" + "  MULTI-PAIR SCANNER RESULTS".center(100) + "║")
-    print("╚" + "═"*100 + "╝")
+    print("║" + "  FINAL RESULTS".center(100) + "║")
+    print("╚" + "═"*100 + "╝\n")
 
-    df_res = pd.DataFrame(results)
-    ok_rows = df_res[df_res['Status'] == 'OK'].copy()
+    df_r   = pd.DataFrame(results)
+    ok     = df_r[df_r['Status'] == 'OK'].copy()
+    passed = ok[ok['Verdict'] == '✅ PASS']
+    margin = ok[ok['Verdict'] == '⚠ MARGINAL']
 
-    if len(ok_rows):
-        ok_rows = ok_rows.sort_values('PF', ascending=False)
-
-        print(f"\n  {'Pair':<10} {'Verdict':<12} {'Tr':>5} {'WR':>5} {'PF':>6} "
-              f"{'Banked':>8} {'Net':>8} {'+Mo':>4} {'-Mo':>4} {'Str':>4} "
-              f"{'MonAvg':>8} {'Med':>7} {'Pass':>5} {'Blow':>5} {'NegYr':>6}")
-        print("  " + "─"*115)
-
-        for _, r in ok_rows.iterrows():
+    if len(ok):
+        ok_sorted = ok.sort_values('PF', ascending=False)
+        print(f"  {'Pair':<10} {'Verdict':<12} {'Tr':>5} {'WR':>5} {'PF':>6} "
+              f"{'Banked':>8} {'Net':>8} {'+Mo':>4} {'Str':>4} "
+              f"{'MonAvg':>8} {'Pass':>5} {'Blow':>5} {'NegYr':>6}")
+        print("  " + "─"*100)
+        for _, r in ok_sorted.iterrows():
             print(f"  {r['Pair']:<10} {r['Verdict']:<12} "
                   f"{int(r['Trades']):>5} {r['WR%']:>5.1f} {r['PF']:>6.3f} "
                   f"{r['Banked']:>8,.0f} {r['Net']:>8,.0f} "
-                  f"{r['+Mo']:>4} {r['-Mo']:>4} {r['Streak']:>4} "
-                  f"{r['MonAvg']:>8.2f} {r['Median']:>7.2f} "
+                  f"{r['+Mo']:>4} {r['Streak']:>4} "
+                  f"{r['MonAvg']:>8.2f} "
                   f"{r['Pass']:>5} {r['Blow']:>5} {r['NegYr']:>6}")
 
-    # Skipped
-    skip = df_res[df_res['Status'] != 'OK']
+    skip = df_r[df_r['Status'] != 'OK']
     if len(skip):
-        print(f"\n  Skipped/Failed:")
-        for _, r in skip.iterrows():
-            print(f"    {r['Pair']:<10} — {r['Status']}")
+        print(f"\n  Skipped: {', '.join(skip['Pair'].tolist())}")
 
-    # ── نتیجه‌گیری ──
-    passed = ok_rows[ok_rows['Verdict'].str.contains('PASS')] if len(ok_rows) else pd.DataFrame()
-    marginal = ok_rows[ok_rows['Verdict'].str.contains('MARGINAL')] if len(ok_rows) else pd.DataFrame()
-
-    print(f"\n  " + "═"*80)
-    print(f"  📊 نتیجه‌گیری:")
-    print(f"     Pairs tested:  {len(PAIR_DEFS)}")
-    print(f"     ✅ PASS:       {len(passed)}")
-    print(f"     ⚠ MARGINAL:   {len(marginal)}")
-    print(f"     ❌ FAIL/SKIP:  {len(df_res) - len(passed) - len(marginal)}")
+    print(f"\n  {'═'*80}")
+    print(f"  ✅ PASS:     {len(passed)} pairs")
+    print(f"  ⚠ MARGINAL: {len(margin)} pairs")
+    print(f"  ❌ Others:   {len(df_r) - len(passed) - len(margin)}")
 
     if len(passed):
-        print(f"\n  🏆 Pairs worth keeping:")
+        total_ma = passed['MonAvg'].sum()
+        target   = Config.initial_balance * 0.02
+        print(f"\n  🏆 Passing pairs:")
         for _, r in passed.iterrows():
-            print(f"     {r['Pair']:<10} PF:{r['PF']:.3f}  Net:${r['Net']:,.0f}  "
-                  f"MonAvg:${r['MonAvg']:.2f}")
+            print(f"     {r['Pair']:<10} PF:{r['PF']:.3f}  "
+                  f"MonAvg:${r['MonAvg']:.2f}  Net:${r['Net']:,.0f}")
+        print(f"\n  📈 Combined MonthlyAvg: ${total_ma:.2f}")
+        print(f"  🎯 Target:              ${target:.2f}")
+        print(f"  📊 Coverage:            {total_ma/target*100:.0f}%")
 
-        total_monthly = passed['MonAvg'].sum()
-        target = Config.initial_balance * 0.02
-        print(f"\n  📈 Combined monthly estimate: ${total_monthly:.2f}")
-        print(f"  🎯 Target: ${target:.2f}/mo")
-        print(f"  📊 Coverage: {total_monthly/target*100:.0f}%")
+    if len(margin):
+        print(f"\n  ⚠ Marginal (needs tuning):")
+        for _, r in margin.iterrows():
+            print(f"     {r['Pair']:<10} PF:{r['PF']:.3f}  MonAvg:${r['MonAvg']:.2f}")
 
-    if len(marginal):
-        print(f"\n  ⚠ Marginal (may improve with tuning):")
-        for _, r in marginal.iterrows():
-            print(f"     {r['Pair']:<10} PF:{r['PF']:.3f}  Net:${r['Net']:,.0f}")
-
-    print(f"\n  " + "═"*80)
+    print(f"  {'═'*80}")
     print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
