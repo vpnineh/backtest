@@ -1,12 +1,10 @@
 """
-CorrArb v9e — Partial Sweep
-===========================
+CorrArb v9f — Z-Exit-Partial Sweep
+=====================================
 Baseline:
-  ✅ AUDNZD only
-  ✅ No TimeStop
-  ✅ SL = 30 pips
+  No TimeStop | SL=30 | Partial=0.75
 Sweep:
-  partial_ratio = 0.00 / 0.25 / 0.50 / 0.75
+  z_exit_partial = 0.25 / 0.50 / 0.75 / 1.00 / 1.25
 """
 
 import pandas as pd
@@ -40,7 +38,7 @@ class Config:
 
     z_fast_period      = 96
     z_entry            = 2.1
-    z_exit_partial     = 0.5
+    z_exit_partial     = 0.50   # ← sweep این
     z_exit_full        = 0.0
     z_stop_margin      = 4.0
     min_net_profit_usd = 15.0
@@ -52,10 +50,10 @@ class Config:
     trade_days         = [0, 1, 2, 3, 4]
     max_trades_day     = 2
 
-    sl_pips            = 30.0     # ← fixed from v9d result
+    sl_pips            = 30.0   # fixed
     tp_pips            = 90.0
-    partial_ratio      = 0.50     # ← sweep this
-    use_time_stop      = False    # ← fixed OFF
+    partial_ratio      = 0.75   # fixed from v9e
+    use_time_stop      = False  # fixed
 
     atr_period         = 14
     atr_ma_period      = 96
@@ -80,7 +78,8 @@ def load_raw_zip(pattern):
     frames = []
     for p in paths:
         with zipfile.ZipFile(p) as z:
-            csv_name = next((f for f in z.namelist() if f.lower().endswith('.csv')), None)
+            csv_name = next(
+                (f for f in z.namelist() if f.lower().endswith('.csv')), None)
             if not csv_name:
                 continue
             with z.open(csv_name) as f:
@@ -122,7 +121,11 @@ def load_audnzd():
 # INDICATORS + SIGNALS
 # ═══════════════════════════════════════════════════════
 def calc_atr(h, l, c, period=14):
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 
@@ -148,16 +151,18 @@ def compute_signals(df):
     vr        = calc_vr(log_r, C.vr_k, C.vr_period)
     regime_ok = vr < C.vr_max
 
-    atr    = calc_atr(df['h_spread'], df['l_spread'], df['c_spread'], C.atr_period)
+    atr    = calc_atr(df['h_spread'], df['l_spread'],
+                      df['c_spread'], C.atr_period)
     atr_ma = atr.rolling(C.atr_ma_period).mean()
     vol_ok = ((atr > atr_ma * C.atr_min_mult) &
               (atr < atr_ma * C.atr_max_mult))
 
     hour    = pd.Series(df.index.hour, index=df.index)
     dow     = pd.Series(df.index.dayofweek, index=df.index)
-    time_ok = hour.between(C.hour_start, C.hour_end) & dow.isin(C.trade_days)
+    time_ok = (hour.between(C.hour_start, C.hour_end) &
+               dow.isin(C.trade_days))
 
-    sig = pd.Series(0, index=df.index)
+    sig  = pd.Series(0, index=df.index)
     cond = vol_ok & time_ok & corr_ok & regime_ok
     sig[(z < -C.z_entry) & cond] =  1
     sig[(z >  C.z_entry) & cond] = -1
@@ -167,10 +172,10 @@ def compute_signals(df):
 
 
 # ═══════════════════════════════════════════════════════
-# BACKTEST ENGINE
+# BACKTEST
 # ═══════════════════════════════════════════════════════
 def calc_pnl(direction, entry, exit_px, lot, qr):
-    C = Config
+    C     = Config
     gross = direction * (exit_px - entry) * lot * C.lot_size * qr
     return gross - C.commission_per_lot * lot
 
@@ -188,7 +193,7 @@ def new_acc(ts):
     }
 
 
-def run_backtest(df, sig, z, verbose=True):
+def run_backtest(df, sig, z, verbose=False):
     C          = Config
     idx        = df.index.sort_values()
     start_date = idx[C.warmup]
@@ -238,7 +243,6 @@ def run_backtest(df, sig, z, verbose=True):
 
         in_cd = cooldown_til is not None and ts < cooldown_til
 
-        # blown account reset
         if acc['blown']:
             acc_logs.append({
                 'account':  acc_num,
@@ -250,7 +254,8 @@ def run_backtest(df, sig, z, verbose=True):
                 'days':     (ts - acc['start_ts']).days,
             })
             if verbose:
-                print(f"    💥 #{acc_num:>3} | {ts.date()} | Eq:${acc['equity']:>8.2f} | {acc['blown_rsn']}")
+                print(f"    💥 #{acc_num:>3} | {ts.date()} | "
+                      f"Eq:${acc['equity']:>8.2f} | {acc['blown_rsn']}")
             cooldown_til = ts + pd.Timedelta(days=C.cooldown_days)
             acc_num   += 1
             acc        = new_acc(ts)
@@ -263,12 +268,11 @@ def run_backtest(df, sig, z, verbose=True):
         if in_cd:
             continue
 
-        monthly_stressed = (acc['equity'] - month_eq) < C.monthly_loss_threshold
+        m_stressed = (acc['equity'] - month_eq) < C.monthly_loss_threshold
 
-        # open pending signal
         if pending != 0 and pos is None and day_trades < C.max_trades_day:
             sv   = pending
-            risk = C.risk_base_pct * (0.5 if monthly_stressed else 1.0)
+            risk = C.risk_base_pct * (0.5 if m_stressed else 1.0)
             if acc['consec_loss'] >= C.consec_loss_n:
                 risk = max(risk * C.risk_reduce, C.risk_min_pct)
 
@@ -293,33 +297,32 @@ def run_backtest(df, sig, z, verbose=True):
 
         pending = 0
 
-        # floating DD check
         flt = 0.0
         if pos is not None:
-            flt = calc_pnl(pos['dir'], pos['entry'], c_[bar], pos['lot_rem'], qr_[bar])
+            flt = calc_pnl(pos['dir'], pos['entry'],
+                           c_[bar], pos['lot_rem'], qr_[bar])
 
         cur_eq    = acc['equity'] + flt
         daily_lim = day_eq * (1 - C.max_daily_loss_pct)
 
         if cur_eq <= daily_lim or cur_eq <= FLOOR:
-            rsn = "DailyDD" if cur_eq <= daily_lim else "TotalDD"
-            acc['blown'] = True
+            rsn              = "DailyDD" if cur_eq <= daily_lim else "TotalDD"
+            acc['blown']     = True
             acc['blown_rsn'] = rsn
             if pos is not None:
-                pnl = calc_pnl(pos['dir'], pos['entry'], c_[bar], pos['lot_rem'], qr_[bar])
+                pnl = calc_pnl(pos['dir'], pos['entry'],
+                               c_[bar], pos['lot_rem'], qr_[bar])
                 acc['equity'] += pnl
-                tr = {
+                all_trades.append({
                     'dir': pos['dir'], 'lot': pos['lot_rem'],
                     'entry': pos['entry'], 'exit': c_[bar],
                     'entry_ts': pos['entry_ts'], 'exit_ts': ts,
                     'pnl': pnl, 'status': 'BLOWN',
-                }
-                all_trades.append(tr)
-                acc['trades'].append(tr)
+                })
+                acc['trades'].append(all_trades[-1])
                 pos = None
             continue
 
-        # exit logic
         if pos is not None:
             cp = c_[bar]
             d  = pos['dir']
@@ -327,27 +330,25 @@ def run_backtest(df, sig, z, verbose=True):
             zn = zz_[bar]
             lr = pos['lot_rem']
 
-            # partial
-            if C.partial_ratio > 0 and (not pos['partial_done']) and (not np.isnan(zn)):
-                partial_trigger = ((d == 1 and zn >= -C.z_exit_partial) or
-                                   (d == -1 and zn <=  C.z_exit_partial))
-                if partial_trigger:
+            # partial exit
+            if not pos['partial_done'] and not np.isnan(zn):
+                if ((d == 1 and zn >= -C.z_exit_partial) or
+                        (d == -1 and zn <=  C.z_exit_partial)):
                     p_lot = round(lr * C.partial_ratio, 2)
                     if p_lot >= C.min_lot:
                         p_pnl = calc_pnl(d, ep, cp, p_lot, qr_[bar])
                         if p_pnl > 0:
                             acc['equity'] += p_pnl
-                            tr = {
+                            all_trades.append({
                                 'dir': d, 'lot': p_lot,
                                 'entry': ep, 'exit': cp,
                                 'entry_ts': pos['entry_ts'], 'exit_ts': ts,
                                 'pnl': p_pnl, 'status': 'Partial',
-                            }
-                            all_trades.append(tr)
-                            acc['trades'].append(tr)
+                            })
+                            acc['trades'].append(all_trades[-1])
                             pos['lot_rem']      = round(lr - p_lot, 2)
                             pos['partial_done'] = True
-                            pos['sl']           = pos['entry']  # move to BE
+                            pos['sl']           = pos['entry']
                             lr = pos['lot_rem']
                             if lr < C.min_lot:
                                 pos = None
@@ -363,7 +364,6 @@ def run_backtest(df, sig, z, verbose=True):
                 hit_ze = (not np.isnan(zn) and
                           ((d == 1 and zn >= -C.z_exit_full) or
                            (d == -1 and zn <=  C.z_exit_full)))
-
                 if hit_ze and pnl_now < C.min_net_profit_usd and not pos['partial_done']:
                     hit_ze = False
 
@@ -373,18 +373,20 @@ def run_backtest(df, sig, z, verbose=True):
                           (d == -1 and cp <= pos['tp']))
 
                 if hit_ze or hit_zs or hit_sl or hit_tp:
-                    xp = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
-                    st = ('SL' if hit_sl else ('TP' if hit_tp else ('Z-Stop' if hit_zs else 'Z-Exit')))
+                    xp = (pos['sl'] if hit_sl else
+                          pos['tp'] if hit_tp else cp)
+                    st = ('SL'     if hit_sl else
+                          'TP'     if hit_tp else
+                          'Z-Stop' if hit_zs else 'Z-Exit')
                     fpnl = calc_pnl(d, ep, xp, lr, qr_[bar])
                     acc['equity'] += fpnl
-                    tr = {
+                    all_trades.append({
                         'dir': d, 'lot': lr,
                         'entry': ep, 'exit': xp,
                         'entry_ts': pos['entry_ts'], 'exit_ts': ts,
                         'pnl': fpnl, 'status': st,
-                    }
-                    all_trades.append(tr)
-                    acc['trades'].append(tr)
+                    })
+                    acc['trades'].append(all_trades[-1])
                     pos = None
 
                     if fpnl > 0:
@@ -392,7 +394,6 @@ def run_backtest(df, sig, z, verbose=True):
                     else:
                         acc['consec_loss'] += 1
 
-        # target hit
         if acc['equity'] >= TARGET and pos is None:
             w  = acc['equity'] - C.initial_balance
             withdrawn += w
@@ -408,7 +409,8 @@ def run_backtest(df, sig, z, verbose=True):
                 'days':     dt,
             })
             if verbose:
-                print(f"    💰 #{acc_num:>3} | {ts.date()} | ${w:>7.2f} | Bank:${withdrawn:>9.2f} | {dt}d | {nt}T")
+                print(f"    💰 #{acc_num:>3} | {ts.date()} | ${w:>7.2f} | "
+                      f"Bank:${withdrawn:>9.2f} | {dt}d | {nt}T")
             acc_num   += 1
             acc        = new_acc(ts)
             day_eq     = month_eq = acc['equity']
@@ -416,7 +418,6 @@ def run_backtest(df, sig, z, verbose=True):
             pending    = 0
             continue
 
-        # new signal
         if (pos is None and not acc['blown'] and not in_cd
                 and day_trades < C.max_trades_day
                 and sg_[bar] != 0):
@@ -432,168 +433,121 @@ def run_backtest(df, sig, z, verbose=True):
 
 
 # ═══════════════════════════════════════════════════════
-# REPORT
+# SWEEP
 # ═══════════════════════════════════════════════════════
-def print_report(res, label):
-    if not res['all_trades']:
-        print(f"  ❌ {label}: No trades")
-        return
-
-    df = pd.DataFrame(res['all_trades'])
-    df['exit_ts']  = pd.to_datetime(df['exit_ts'])
-    df['entry_ts'] = pd.to_datetime(df['entry_ts'])
-    df['month']    = df['exit_ts'].dt.to_period('M')
-    df['year']     = df['exit_ts'].dt.year
-
-    wins   = df[df['pnl'] > 0]
-    losses = df[df['pnl'] < 0]
-    wr     = len(wins) / len(df) * 100
-    pf     = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) else float('inf')
-
-    ci = res['common_idx']
-    all_months = pd.period_range(
-        start=ci[Config.warmup].to_period('M'),
-        end=ci[-1].to_period('M'),
-        freq='M'
-    )
-    monthly = df.groupby('month')['pnl'].sum().reindex(all_months, fill_value=0.0)
-
-    logs    = res['account_logs']
-    df_acc  = pd.DataFrame(logs) if logs else pd.DataFrame()
-    targets = df_acc[df_acc['reason'] == 'TARGET_HIT'] if len(df_acc) else pd.DataFrame()
-    blowns  = df_acc[df_acc['reason'] != 'TARGET_HIT'] if len(df_acc) else pd.DataFrame()
-
-    partial_df = df[df['status'] == 'Partial']
-    sl_df      = df[df['status'] == 'SL']
-
-    print("\n" + "═"*68)
-    print(f"  {label}")
-    print("═"*68)
-    print(f"  Trades:        {len(df):>6,}  |  WR: {wr:.1f}%  |  PF: {pf:.3f}")
-    print(f"  Avg Win:      ${wins['pnl'].mean():>7.2f}  |  Avg Loss: ${losses['pnl'].mean():>7.2f}")
-    print(f"  Net PnL:      ${df['pnl'].sum():>10,.2f}")
-    print(f"  Banked:       ${res['withdrawn']:>10,.2f}  |  Equity: ${res['final_equity']:>8,.2f}")
-    print(f"  Passed: {len(targets):>3}  |  Blown: {len(blowns):>3}")
-    print(f"  Months: +{int((monthly>0).sum())} / -{int((monthly<0).sum())} / 0:{int((monthly==0).sum())}  Avg:${monthly.mean():.2f}/mo")
-    print(f"  Best: ${monthly.max():,.2f}  |  Worst: ${monthly.min():,.2f}")
-    print(f"  Partial exits: {len(partial_df):>5}  |  Avg Partial: ${partial_df['pnl'].mean():.2f}" if len(partial_df) else "  Partial exits: 0")
-    print(f"  SL exits:      {len(sl_df):>5}  |  Avg SL loss: ${sl_df['pnl'].mean():.2f}" if len(sl_df) else "  SL exits: 0")
-    print("-"*68)
-    print("  By Exit:")
-    g = df.groupby('status')['pnl'].agg(['count', 'mean', 'sum'])
-    for st, row in g.sort_values('sum').iterrows():
-        mark = '▲' if row['sum'] >= 0 else '▼'
-        print(f"    {st:<10} {int(row['count']):>5}  avg:${row['mean']:>8.2f}  total:${row['sum']:>10,.2f}  {mark}")
-    print("═"*68)
-
-
-# ═══════════════════════════════════════════════════════
-# PARTIAL SWEEP
-# ═══════════════════════════════════════════════════════
-def run_partial_sweep(df, sig, z):
-    partial_values = [0.00, 0.25, 0.50, 0.75]
+def run_sweep(df, sig, z):
+    values  = [0.25, 0.50, 0.75, 1.00, 1.25]
     summary = []
 
-    print("\n" + "╔" + "═"*66 + "╗")
-    print("║" + "  PARTIAL SWEEP — No TimeStop | SL = 30".center(66) + "║")
-    print("╚" + "═"*66 + "╝")
+    print("\n╔" + "═"*62 + "╗")
+    print("║" + "  Z-EXIT-PARTIAL SWEEP | SL=30 | Partial=0.75".center(62) + "║")
+    print("╚" + "═"*62 + "╝")
 
-    for pr in partial_values:
-        Config.partial_ratio = pr
-
-        print(f"\n{'─'*68}")
-        print(f"  ▶ Partial Ratio = {pr:.2f}")
-        print(f"{'─'*68}")
-
-        res = run_backtest(df, sig, z, verbose=True)
-        print_report(res, f"Partial={pr:.2f} | NoTimeStop | SL=30")
+    for zep in values:
+        Config.z_exit_partial = zep
+        res = run_backtest(df, sig, z, verbose=False)
 
         dft = pd.DataFrame(res['all_trades'])
+        if not len(dft):
+            continue
+
         dft['exit_ts'] = pd.to_datetime(dft['exit_ts'])
         dft['month']   = dft['exit_ts'].dt.to_period('M')
 
         wins   = dft[dft['pnl'] > 0]['pnl']
         losses = dft[dft['pnl'] < 0]['pnl']
-        pf     = wins.sum() / abs(losses.sum()) if len(losses) else float('inf')
+        pf     = wins.sum() / abs(losses.sum()) if len(losses) else 99.0
 
         ci = res['common_idx']
         all_months = pd.period_range(
             start=ci[Config.warmup].to_period('M'),
-            end=ci[-1].to_period('M'),
-            freq='M'
-        )
-        monthly = dft.groupby('month')['pnl'].sum().reindex(all_months, fill_value=0.0)
+            end=ci[-1].to_period('M'), freq='M')
+        monthly = (dft.groupby('month')['pnl'].sum()
+                   .reindex(all_months, fill_value=0.0))
 
-        logs    = res['account_logs']
-        df_acc  = pd.DataFrame(logs) if logs else pd.DataFrame()
-        n_pass  = int((df_acc['reason'] == 'TARGET_HIT').sum()) if len(df_acc) else 0
-        n_blow  = int((df_acc['reason'] != 'TARGET_HIT').sum()) if len(df_acc) else 0
+        logs   = res['account_logs']
+        df_acc = pd.DataFrame(logs) if logs else pd.DataFrame()
+        n_pass = int((df_acc['reason'] == 'TARGET_HIT').sum()) if len(df_acc) else 0
+        n_blow = int((df_acc['reason'] != 'TARGET_HIT').sum()) if len(df_acc) else 0
 
-        part_df = dft[dft['status'] == 'Partial']
-        zexit_df = dft[dft['status'] == 'Z-Exit']
+        p_df  = dft[dft['status'] == 'Partial']
+        ze_df = dft[dft['status'] == 'Z-Exit']
         sl_df = dft[dft['status'] == 'SL']
 
+        # سال‌های منفی
+        neg_years = int((dft.groupby(dft['exit_ts'].dt.year)['pnl'].sum() < 0).sum())
+
         summary.append({
-            'Partial':      pr,
+            'ZExitPartial': zep,
             'Trades':       len(dft),
             'WR%':          round((dft['pnl'] > 0).mean() * 100, 1),
             'PF':           round(pf, 3),
             'Banked':       round(res['withdrawn'], 0),
             'NetPnL':       round(dft['pnl'].sum(), 0),
-            '+Months':      int((monthly > 0).sum()),
-            '-Months':      int((monthly < 0).sum()),
-            'MonthAvg':     round(monthly.mean(), 2),
-            'Passed':       n_pass,
-            'Blown':        n_blow,
-            'PartialCnt':   int(len(part_df)),
-            'PartialSum':   round(part_df['pnl'].sum(), 0) if len(part_df) else 0,
-            'ZExitSum':     round(zexit_df['pnl'].sum(), 0) if len(zexit_df) else 0,
-            'SLCount':      int(len(sl_df)),
-            'AvgSLLoss':    round(sl_df['pnl'].mean(), 2) if len(sl_df) else 0,
+            '+Mo':          int((monthly > 0).sum()),
+            '-Mo':          int((monthly < 0).sum()),
+            'MonAvg':       round(monthly.mean(), 2),
+            'Pass':         n_pass,
+            'Blow':         n_blow,
+            'NegYears':     neg_years,
+            'PartCnt':      len(p_df),
+            'PartAvg':      round(p_df['pnl'].mean(), 2) if len(p_df) else 0,
+            'ZExitAvg':     round(ze_df['pnl'].mean(), 2) if len(ze_df) else 0,
+            'SLAvg':        round(sl_df['pnl'].mean(), 2) if len(sl_df) else 0,
         })
 
-    print("\n\n" + "╔" + "═"*72 + "╗")
-    print("║" + "  FINAL COMPARISON TABLE".center(72) + "║")
-    print("╚" + "═"*72 + "╝")
+        print(f"  z_exit_partial={zep:.2f} | PF={pf:.3f} | "
+              f"Bank=${res['withdrawn']:,.0f} | "
+              f"+Mo={int((monthly>0).sum())} | "
+              f"Pass={n_pass} Blow={n_blow}")
 
-    df_sum = pd.DataFrame(summary)
-    best_pf     = df_sum['PF'].idxmax()
-    best_banked = df_sum['Banked'].idxmax()
-    best_months = df_sum['+Months'].idxmax()
+    # ── جدول نهایی ──
+    print("\n\n╔" + "═"*78 + "╗")
+    print("║" + "  FINAL COMPARISON".center(78) + "║")
+    print("╚" + "═"*78 + "╝")
 
-    print(f"\n {'Partial':>7}  {'Trades':>6}  {'WR%':>5}  {'PF':>5}  {'Banked':>8}  {'NetPnL':>8}  {'+Mo':>4}  {'-Mo':>4}  {'MonAvg':>7}  {'Pass':>4}  {'Blow':>4}  {'Part$':>8}  {'ZExit$':>8}")
-    print(" " + "─"*110)
+    df_s = pd.DataFrame(summary)
+    bp   = df_s['PF'].idxmax()
+    bb   = df_s['Banked'].idxmax()
+    bm   = df_s['+Mo'].idxmax()
+    bn   = df_s['NetPnL'].idxmax()
 
-    for i, row in df_sum.iterrows():
+    print(f"\n {'ZEP':>5}  {'Tr':>5}  {'WR':>5}  {'PF':>5}  "
+          f"{'Banked':>8}  {'Net':>8}  {'+Mo':>4}  {'-Mo':>4}  "
+          f"{'MonAvg':>7}  {'Pass':>4}  {'Blow':>4}  {'NegYr':>6}  "
+          f"{'PrtAvg':>7}  {'ZEAvg':>7}")
+    print("  " + "─"*105)
+
+    for i, r in df_s.iterrows():
         flags = []
-        if i == best_pf:
-            flags.append('◀ Best PF')
-        if i == best_banked:
-            flags.append('◀ Best Bank')
-        if i == best_months:
-            flags.append('◀ Best Months')
-        flag_str = '  '.join(flags)
+        if i == bp: flags.append('◀PF')
+        if i == bb: flags.append('◀Bank')
+        if i == bm: flags.append('◀+Mo')
+        if i == bn: flags.append('◀Net')
 
-        print(f" {row['Partial']:>7.2f}  {int(row['Trades']):>6}  {row['WR%']:>5.1f}  {row['PF']:>5.3f}  "
-              f"{row['Banked']:>8,.0f}  {row['NetPnL']:>8,.0f}  {row['+Months']:>4}  {row['-Months']:>4}  "
-              f"{row['MonthAvg']:>7.2f}  {row['Passed']:>4}  {row['Blown']:>4}  "
-              f"{row['PartialSum']:>8,.0f}  {row['ZExitSum']:>8,.0f}  {flag_str}")
+        print(f" {r['ZExitPartial']:>5.2f}  {int(r['Trades']):>5}  "
+              f"{r['WR%']:>5.1f}  {r['PF']:>5.3f}  "
+              f"{r['Banked']:>8,.0f}  {r['NetPnL']:>8,.0f}  "
+              f"{r['+Mo']:>4}  {r['-Mo']:>4}  "
+              f"{r['MonAvg']:>7.2f}  {r['Pass']:>4}  {r['Blow']:>4}  "
+              f"{r['NegYears']:>6}  "
+              f"{r['PartAvg']:>7.2f}  {r['ZExitAvg']:>7.2f}  "
+              f"{'  '.join(flags)}")
 
-    print("\n" + "─"*72)
+    print("\n" + "─"*78)
+    print(f" ✅ Best PF:     z_exit_partial = {df_s.loc[bp,'ZExitPartial']:.2f}")
+    print(f" ✅ Best Bank:   z_exit_partial = {df_s.loc[bb,'ZExitPartial']:.2f}")
+    print(f" ✅ Best +Month: z_exit_partial = {df_s.loc[bm,'ZExitPartial']:.2f}")
+    print(f" ✅ Best Net:    z_exit_partial = {df_s.loc[bn,'ZExitPartial']:.2f}")
+    print("─"*78)
     print(" توضیح:")
-    print(" Partial = نسبت حجم خروج partial")
-    print(" PF      = Profit Factor")
-    print(" Banked  = مجموع برداشت از حساب‌های پاس‌شده")
-    print(" Part$   = مجموع سود خروج‌های Partial")
-    print(" ZExit$  = مجموع سود خروج‌های Z-Exit")
-    print("─"*72)
+    print(" ZEP    = z_exit_partial (هرچه بزرگتر = partial دیرتر)")
+    print(" NegYr  = سال‌های منفی از 16 سال")
+    print(" PrtAvg = میانگین سود هر partial exit")
+    print(" ZEAvg  = میانگین سود هر Z-Exit")
+    print("─"*78)
 
-    print(f"\n ✅ بهترین PF:      Partial = {df_sum.loc[best_pf, 'Partial']:.2f}")
-    print(f" ✅ بیشترین Bank:   Partial = {df_sum.loc[best_banked, 'Partial']:.2f}")
-    print(f" ✅ بیشترین +Month: Partial = {df_sum.loc[best_months, 'Partial']:.2f}")
-    print("─"*72)
-
-    return df_sum
+    return df_s
 
 
 # ═══════════════════════════════════════════════════════
@@ -602,13 +556,14 @@ def run_partial_sweep(df, sig, z):
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════╗")
-    print("║   CorrArb v9e — Partial Sweep (SL30 / NoTimeStop)  ║")
+    print("║  CorrArb v9f — Z-Exit-Partial Sweep                ║")
+    print("║  Baseline: No TimeStop | SL=30 | Partial=0.75      ║")
     print("╚══════════════════════════════════════════════════════╝")
 
-    df = load_audnzd()
+    df     = load_audnzd()
     sig, z = compute_signals(df)
     print(f"  Signals: {(sig != 0).sum():,}")
 
-    summary = run_partial_sweep(df, sig, z)
+    summary = run_sweep(df, sig, z)
 
-    print(f"\n  ✅ Done in {(datetime.now() - t0).total_seconds():.1f}s")
+    print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
