@@ -566,7 +566,7 @@ def print_report(res, title):
 
     logs   = pd.DataFrame(res['account_logs']) if res['account_logs'] else pd.DataFrame()
     n_pass = int((logs['reason'] == 'TARGET_HIT').sum()) if len(logs) else 0
-    n_blow = int((logs['reason'] != 'TARGET_HIT'].sum()) if len(logs) else 0
+    n_blow = int((logs['reason'] != 'TARGET_HIT').sum()) if len(logs) else 0
     neg_yr = int((df.groupby('year')['pnl'].sum() < 0).sum())
 
     m_std  = monthly.std()
