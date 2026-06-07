@@ -1,31 +1,24 @@
 """
-CorrArb v15 — Realistic + Robust
-===================================
-اصلاحات نسبت به v13/v14b:
+CorrArb v15b — Balanced Realistic
+====================================
+اصلاح v15 که خراب شد:
 
-1. Spread واقع‌بینانه:
-   - spread_stress_mult در ساعات پرنوسان (open/close بازارها)
-   - spread استاتیک در ساعات آرام
+مشکلات v15:
+  1. VR fast (period=60) خیلی aggressive → سیگنال AUDNZD از 1701 به 482 افتاد
+  2. stress_spread روی ساعات session open اعمال می‌شد → entry cost خیلی بالا
+  3. swap_pips_day خیلی بالا بود → partial profit را می‌خورد
 
-2. Swap/Rollover cost روزانه
-
-3. Regime filter قوی‌تر:
-   - VR دو بازه‌ای (fast + slow)
-   - ATR blow-out filter (اگر ATR خیلی بالا رفت → stop)
-
-4. GBP exposure limit:
-   - حداکثر یک GBP pair هم‌زمان باز
-
-5. Risk parameters محافظه‌کارانه‌تر:
-   - z_entry = 2.3 (از 2.1)
-   - max_daily_loss = 4% (از 5%)
-   - max_total_dd = 8% (از 10%)
-   - max_trades_day = 1 (از 2)
-   - min_net_profit = 25 (از 15)
-
-6. Risk Control از v14b حفظ شده (dd_levels)
-
-7. Rolling PF filter بهبودیافته
+اصلاحات v15b:
+  1. VR fast → period=120، threshold شل‌تر (1.25x به جای 1.15x)
+  2. stress_spread فقط اول session (ساعت اول) → نه کل ساعات پرنوسان
+  3. swap واقع‌بینانه‌تر: نیمی از مقدار قبل، و فقط روی positions > 4 شبانه
+  4. ATR blowout از 2.8 به 3.2 (شل‌تر)
+  5. z_entry به 2.2 (بین v13=2.1 و v15=2.3)
+  6. بقیه تغییرات مثبت v15 حفظ شد:
+     - GBP exposure limit (فقط یک GBP pair هم‌زمان)
+     - Risk Control از v14b (dd_levels)
+     - max_daily=4%, max_total_dd=8%
+     - max_trades_day=1
 """
 
 import pandas as pd
@@ -36,14 +29,11 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 
-# ═══════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════
 class GlobalConfig:
     initial_balance    = 5_000.0
-    profit_target_pct  = 0.04       # v15: از 0.05 به 0.04 (pass سریع‌تر)
-    max_daily_loss_pct = 0.04       # v15: از 0.05 به 0.04 (فاند strict)
-    max_total_dd_pct   = 0.08       # v15: از 0.10 به 0.08
+    profit_target_pct  = 0.04
+    max_daily_loss_pct = 0.04
+    max_total_dd_pct   = 0.08
     commission_per_lot = 7.0
     lot_size           = 100_000
     max_lot            = 3.0
@@ -51,44 +41,49 @@ class GlobalConfig:
     warmup             = 500
     consec_loss_n      = 2
     risk_reduce        = 0.5
-    cooldown_days      = 7          # v15: از 10 به 7
-    monthly_loss_threshold = -200.0 # v15: از -250 به -200
+    cooldown_days      = 7
+    monthly_loss_threshold = -200.0
 
-    hour_start   = 3                # v15: از 2 به 3 (اول لندن کمی صبر)
-    hour_end     = 18               # v15: از 19 به 18
-    bad_hours    = {4, 5, 7, 9, 12, 13, 17, 18, 20}  # v15: ساعت‌های NFP/FOMC اضافه
+    hour_start   = 2
+    hour_end     = 19
+    bad_hours    = {4, 5, 7, 9, 13, 18, 20}   # v15b: برگشت به v13 — بدون over-filter
     trade_days   = [0, 1, 2, 3, 4]
+    max_trades_day = 1
 
-    max_trades_day     = 1          # v15: از 2 به 1
     z_fast_period      = 96
-    z_entry            = 2.3        # v15: از 2.1 به 2.3 (سیگنال باکیفیت‌تر)
+    z_entry            = 2.2        # v15b: بین v13(2.1) و v15(2.3)
     z_exit_partial     = 0.50
     z_exit_full        = 0.0
-    z_stop_margin      = 3.5        # v15: از 4.0 به 3.5 (زودتر cut)
-    min_net_profit_usd = 25.0       # v15: از 15 به 25
+    z_stop_margin      = 3.8        # v15b: بین v13(4.0) و v15(3.5)
+    min_net_profit_usd = 20.0       # v15b: بین v13(15) و v15(25)
     partial_ratio      = 0.75
     atr_period         = 14
     atr_ma_period      = 96
-    atr_max_mult       = 2.5        # v15: از 3.0 به 2.5 (ریژیم volatile بسته‌تر)
+    atr_max_mult       = 2.8        # v15b: شل‌تر از v15(2.5)
     atr_min_mult       = 0.5
-    atr_blowout_mult   = 2.8        # v15: جدید — اگر ATR از MA بیشتر از این بود → no trade
-    vr_period          = 200
-    vr_period_fast     = 60         # v15: جدید — VR سریع
-    vr_k               = 4
-    corr_period        = 96
+    atr_blowout_mult   = 3.2        # v15b: شل‌تر از v15(2.8)
 
-    # ── Slippage واقع‌بینانه‌تر ──
-    slippage_pips_normal = 0.8      # v15: از 0.5 به 0.8
-    slippage_pips_stress = 2.5      # v15: جدید — در ساعات پرنوسان
+    vr_period      = 200
+    vr_period_fast = 120            # v15b: از 60 به 120 — کمتر noise-sensitive
+    vr_fast_mult   = 1.25           # v15b: از 1.15 به 1.25 — threshold شل‌تر
+    vr_k           = 4
+    corr_period    = 96
 
-    # ── Stress hours: باز/بسته شدن بازارها و اعلام‌های مهم ──
-    stress_hours = {0, 1, 8, 13, 14, 21, 22, 23}  # Sydney open, London open, NY open/close
+    # stress spread: فقط اول باز شدن session‌ها (ساعت اول)
+    # نه کل ساعات‌شان
+    stress_hours = {0, 7, 12}      # v15b: فقط Sydney open, London open, NY open
 
-    # ── Risk Control (از v14b) ──
+    slippage_normal = 0.7
+    slippage_stress = 1.5           # v15b: کمتر از v15(2.5)
+
+    # swap: فقط اگر بیش از 4 شب نگه داشته شد اعمال کن
+    swap_min_nights = 4
+
+    # Risk Control
     dd_levels = [
-        (0.03, 0.80),   # 3% DD → risk * 0.80
-        (0.05, 0.60),   # 5% DD → risk * 0.60
-        (0.07, 0.35),   # 7% DD → risk * 0.35
+        (0.03, 0.80),
+        (0.05, 0.60),
+        (0.07, 0.35),
     ]
     rolling_pf_n    = 40
     rolling_pf_bad  = 0.85
@@ -99,59 +94,59 @@ PAIR_CFG = {
     'AUDNZD': {
         'leg1': 'AUDUSD', 'leg2': 'NZDUSD',
         'formula': 'div', 'quote': 'leg2',
-        'spread_pip': 2.5,          # آرام
-        'spread_pip_stress': 6.0,   # v15: در ساعات پرنوسان
-        'swap_pips_day': -0.3,      # v15: swap روزانه (تقریبی)
+        'spread_pip': 2.5,
+        'spread_pip_stress': 5.0,   # v15b: کمتر از v15(6.0)
+        'swap_pips_day': -0.15,     # v15b: نیمی از v15
         'pip_size': 0.0001,
-        'vr_max': 0.70,             # v15: سخت‌گیرانه‌تر (از 0.75)
-        'corr_min': 0.82,           # v15: سخت‌گیرانه‌تر (از 0.80)
-        'risk_pct': 0.012,          # v15: کمی کمتر (از 0.015)
+        'vr_max': 0.73,             # v15b: شل‌تر از v15(0.70)
+        'corr_min': 0.80,           # v15b: برگشت به v13
+        'risk_pct': 0.013,
         'risk_min': 0.004,
-        'sl_pips': 32.0,
-        'tp_pips': 96.0,            # نسبت 1:3
+        'sl_pips': 30.0,
+        'tp_pips': 90.0,
     },
     'AUDCAD': {
         'leg1': 'AUDUSD', 'leg2': 'USDCAD',
         'formula': 'mul', 'quote': 'inv_leg2',
         'spread_pip': 2.5,
-        'spread_pip_stress': 7.0,
-        'swap_pips_day': -0.5,
+        'spread_pip_stress': 6.0,
+        'swap_pips_day': -0.25,
         'pip_size': 0.0001,
-        'vr_max': 0.80,
-        'corr_min': 0.58,
-        'risk_pct': 0.009,          # v15: از 0.010
+        'vr_max': 0.83,
+        'corr_min': 0.55,
+        'risk_pct': 0.009,
         'risk_min': 0.003,
-        'sl_pips': 26.0,
-        'tp_pips': 78.0,
+        'sl_pips': 25.0,
+        'tp_pips': 75.0,
     },
     'GBPCAD': {
         'leg1': 'GBPUSD', 'leg2': 'USDCAD',
         'formula': 'mul', 'quote': 'inv_leg2',
         'spread_pip': 4.0,
-        'spread_pip_stress': 12.0,  # v15: GBPCAD در stress خیلی wide می‌شود
-        'swap_pips_day': -0.8,
+        'spread_pip_stress': 9.0,   # v15b: کمتر از v15(12.0)
+        'swap_pips_day': -0.40,
         'pip_size': 0.0001,
-        'vr_max': 0.83,
-        'corr_min': 0.48,
-        'risk_pct': 0.007,          # v15: از 0.008
+        'vr_max': 0.85,
+        'corr_min': 0.45,
+        'risk_pct': 0.007,
         'risk_min': 0.002,
-        'sl_pips': 30.0,
-        'tp_pips': 90.0,
-        'gbp_pair': True,           # v15: تگ برای GBP limit
+        'sl_pips': 28.0,
+        'tp_pips': 84.0,
+        'gbp_pair': True,
     },
     'GBPCHF': {
         'leg1': 'GBPUSD', 'leg2': 'USDCHF',
         'formula': 'div', 'quote': 'inv_leg2',
         'spread_pip': 3.0,
-        'spread_pip_stress': 10.0,
-        'swap_pips_day': -0.6,
+        'spread_pip_stress': 8.0,
+        'swap_pips_day': -0.30,
         'pip_size': 0.0001,
-        'vr_max': 0.85,
-        'corr_min': 0.42,
-        'risk_pct': 0.006,          # v15: از 0.007
+        'vr_max': 0.88,
+        'corr_min': 0.40,
+        'risk_pct': 0.006,
         'risk_min': 0.002,
-        'sl_pips': 36.0,
-        'tp_pips': 108.0,
+        'sl_pips': 35.0,
+        'tp_pips': 105.0,
         'gbp_pair': True,
     },
 }
@@ -287,23 +282,21 @@ def compute_signals(df, pcfg):
                .corr(df['c_leg2'].pct_change()))
     corr_ok = corr.abs() > pcfg['corr_min']
 
-    # v15: دو VR (slow + fast) — هر دو باید ok باشند
     vr_slow = calc_vr(log_r, G.vr_k, G.vr_period)
     vr_fast = calc_vr(log_r, G.vr_k, G.vr_period_fast)
-    regime_ok = (vr_slow < pcfg['vr_max']) & (vr_fast < pcfg['vr_max'] * 1.15)
+    # v15b: threshold شل‌تر برای fast VR
+    regime_ok = (vr_slow < pcfg['vr_max']) & (vr_fast < pcfg['vr_max'] * G.vr_fast_mult)
 
     atr    = calc_atr(df['h_spread'], df['l_spread'], df['c_spread'], G.atr_period)
     atr_ma = atr.rolling(G.atr_ma_period).mean()
-
-    # v15: blowout filter — اگر ATR خیلی بالا رفت کلاً بست
     vol_ok = (
         (atr > atr_ma * G.atr_min_mult) &
         (atr < atr_ma * G.atr_max_mult) &
-        (atr < atr_ma * G.atr_blowout_mult)   # فیلتر blowout
+        (atr < atr_ma * G.atr_blowout_mult)
     )
 
-    hour   = pd.Series(df.index.hour, index=df.index)
-    dow    = pd.Series(df.index.dayofweek, index=df.index)
+    hour    = pd.Series(df.index.hour, index=df.index)
+    dow     = pd.Series(df.index.dayofweek, index=df.index)
     time_ok = (
         hour.between(G.hour_start, G.hour_end) &
         (~hour.isin(G.bad_hours)) &
@@ -319,20 +312,16 @@ def compute_signals(df, pcfg):
 
 
 # ═══════════════════════════════════════════════════════
-# RISK MULTIPLIER (بهبودیافته از v14b)
+# RISK MULTIPLIER
 # ═══════════════════════════════════════════════════════
 def get_risk_mult(equity, peak, pnl_hist, month_pnl, month_threshold):
     G = GlobalConfig
     mult = 1.0
-
-    # DD از peak
     if peak > 0:
         dd = (peak - equity) / peak
         for dd_thresh, dd_mult in G.dd_levels:
             if dd >= dd_thresh:
                 mult = min(mult, dd_mult)
-
-    # Rolling PF
     if len(pnl_hist) >= G.rolling_pf_n // 2:
         recent = pnl_hist[-G.rolling_pf_n:]
         wins   = sum(p for p in recent if p > 0)
@@ -340,23 +329,22 @@ def get_risk_mult(equity, peak, pnl_hist, month_pnl, month_threshold):
         rpf    = wins / losses if losses > 0 else 1.5
         if rpf < G.rolling_pf_bad:
             mult *= G.rolling_pf_mult
-
-    # Monthly stress
     if month_pnl < month_threshold:
-        mult *= 0.50   # v15: از 0.60 به 0.50
-
-    return max(mult, 0.15)   # v15: از 0.20 به 0.15
+        mult *= 0.50
+    return max(mult, 0.15)
 
 
 # ═══════════════════════════════════════════════════════
-# PNL (با swap)
+# PNL
 # ═══════════════════════════════════════════════════════
 def pnl_calc(d, entry, xp, lot, qr, pip, swap_pips=0.0, bars_held=0):
     G = GlobalConfig
     gross = d * (xp - entry) * lot * G.lot_size * qr
-    # تعداد شب‌های نگه‌داشته شده (هر 96 بار = 1 روز در 15min)
     nights = bars_held // 96
-    swap_cost = abs(swap_pips) * nights * lot * G.lot_size * qr * pip
+    # v15b: swap فقط اگر بیش از swap_min_nights نگه داشته شده
+    swap_cost = 0.0
+    if nights > G.swap_min_nights:
+        swap_cost = abs(swap_pips) * nights * lot * G.lot_size * qr * pip
     return gross - G.commission_per_lot * lot - swap_cost
 
 
@@ -384,14 +372,12 @@ def run_portfolio(pair_data):
     for name, (df, sig, z, atr, atr_ma, pcfg) in pair_data.items():
         df_r = df.reindex(cidx).ffill()
         pa[name] = {
-            'o':      df_r['o_spread'].values.astype(float),
-            'c':      df_r['c_spread'].values.astype(float),
-            'qr':     df_r['quote_rate'].values.astype(float),
-            'sig':    sig.reindex(cidx).fillna(0).values.astype(int),
-            'z':      z.reindex(cidx).fillna(np.nan).values.astype(float),
-            'atr':    atr.reindex(cidx).ffill().values.astype(float),
-            'atr_ma': atr_ma.reindex(cidx).ffill().values.astype(float),
-            'cfg':    pcfg,
+            'o':   df_r['o_spread'].values.astype(float),
+            'c':   df_r['c_spread'].values.astype(float),
+            'qr':  df_r['quote_rate'].values.astype(float),
+            'sig': sig.reindex(cidx).fillna(0).values.astype(int),
+            'z':   z.reindex(cidx).fillna(np.nan).values.astype(float),
+            'cfg': pcfg,
         }
 
     FLOOR  = G.initial_balance * (1 - G.max_total_dd_pct)
@@ -421,8 +407,7 @@ def run_portfolio(pair_data):
         ts        = cidx[bar]
         cur_date  = ts.date()
         cur_month = (ts.year, ts.month)
-        cur_hour  = ts.hour
-        is_stress = cur_hour in G.stress_hours
+        is_stress = ts.hour in G.stress_hours
 
         if cur_date != prev_date:
             day_eq = acc['equity']
@@ -443,7 +428,6 @@ def run_portfolio(pair_data):
 
         in_cd = cooldown_til is not None and ts < cooldown_til
 
-        # blown
         if acc['blown']:
             acc_logs.append({
                 'reason': acc['blown_rsn'],
@@ -467,13 +451,12 @@ def run_portfolio(pair_data):
         if in_cd:
             continue
 
-        # Risk multiplier
         month_pnl = acc['equity'] - month_eq
         risk_mult = get_risk_mult(
             acc['equity'], acc['peak'], pnl_hist,
             month_pnl, G.monthly_loss_threshold)
 
-        # v15: GBP exposure limit
+        # GBP exposure limit
         gbp_open = sum(
             1 for n in pair_data
             if positions[n] is not None and pair_data[n][5].get('gbp_pair', False)
@@ -486,7 +469,6 @@ def run_portfolio(pair_data):
             if (pending[name] != 0 and positions[name] is None
                     and day_trades[name] < G.max_trades_day):
 
-                # v15: GBP limit
                 if pcfg.get('gbp_pair', False) and gbp_open >= 1:
                     pending[name] = 0
                     continue
@@ -495,9 +477,8 @@ def run_portfolio(pair_data):
                 pip = pcfg['pip_size']
                 qr  = a['qr'][bar]
 
-                # v15: spread واقع‌بینانه
                 sp = pcfg['spread_pip_stress'] if is_stress else pcfg['spread_pip']
-                sl = G.slippage_pips_stress if is_stress else G.slippage_pips_normal
+                sl = G.slippage_stress if is_stress else G.slippage_normal
 
                 risk = pcfg['risk_pct'] * risk_mult
                 if acc['consec_loss'] >= G.consec_loss_n:
@@ -522,7 +503,7 @@ def run_portfolio(pair_data):
                     gbp_open += 1
             pending[name] = 0
 
-        # float (بدون swap در float — فقط در close)
+        # float
         total_float = sum(
             (p['dir'] * (pa[n]['c'][bar] - p['entry'])
              * p['lot_rem'] * GlobalConfig.lot_size * pa[n]['qr'][bar]
@@ -538,10 +519,10 @@ def run_portfolio(pair_data):
             for name in pair_data:
                 pos = positions[name]
                 if pos is None: continue
-                bars_held = bar - pos['entry_bar']
+                bh = bar - pos['entry_bar']
                 pnl = pnl_calc(pos['dir'], pos['entry'], pa[name]['c'][bar],
                                pos['lot_rem'], pa[name]['qr'][bar], pos['pip'],
-                               pos['swap_pips'], bars_held)
+                               pos['swap_pips'], bh)
                 acc['equity'] += pnl
                 all_trades.append({'pair': name, 'pnl': pnl,
                                    'status': 'BLOWN', 'exit_ts': ts})
@@ -553,13 +534,12 @@ def run_portfolio(pair_data):
         for name in pair_data:
             pos = positions[name]
             if pos is None: continue
-            a    = pa[name]; pcfg = a['cfg']
-            cp   = a['c'][bar]; d = pos['dir']
-            ep   = pos['entry']; zn = a['z'][bar]
-            lr   = pos['lot_rem']; qr = a['qr'][bar]; pip = pos['pip']
-            bh   = bar - pos['entry_bar']
+            a   = pa[name]; pcfg = a['cfg']
+            cp  = a['c'][bar]; d = pos['dir']
+            ep  = pos['entry']; zn = a['z'][bar]
+            lr  = pos['lot_rem']; qr = a['qr'][bar]; pip = pos['pip']
+            bh  = bar - pos['entry_bar']
 
-            # partial exit
             if not pos['partial_done'] and not np.isnan(zn):
                 if ((d == 1 and zn >= -G.z_exit_partial) or
                         (d == -1 and zn <= G.z_exit_partial)):
@@ -575,7 +555,7 @@ def run_portfolio(pair_data):
                             acc['trades'].append(all_trades[-1])
                             pos['lot_rem'] = round(lr - p_lot, 2)
                             pos['partial_done'] = True
-                            pos['sl'] = pos['entry']   # breakeven SL
+                            pos['sl'] = pos['entry']
                             lr = pos['lot_rem']
                             if lr < G.min_lot:
                                 positions[name] = None; continue
@@ -596,9 +576,9 @@ def run_portfolio(pair_data):
             hit_tp = (d == 1 and cp >= pos['tp']) or (d == -1 and cp <= pos['tp'])
 
             if hit_ze or hit_zs or hit_sl or hit_tp:
-                xp  = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
-                st  = ('SL' if hit_sl else 'TP' if hit_tp else
-                       'Z-Stop' if hit_zs else 'Z-Exit')
+                xp   = pos['sl'] if hit_sl else (pos['tp'] if hit_tp else cp)
+                st   = ('SL' if hit_sl else 'TP' if hit_tp else
+                        'Z-Stop' if hit_zs else 'Z-Exit')
                 fpnl = pnl_calc(d, ep, xp, lr, qr, pip, pos['swap_pips'], bh)
                 acc['equity'] += fpnl
                 pnl_hist.append(fpnl)
@@ -627,7 +607,6 @@ def run_portfolio(pair_data):
             prev_date = cur_date; prev_month = cur_month
             continue
 
-        # signals
         for name in pair_data:
             a = pa[name]
             if (positions[name] is None and not acc['blown'] and not in_cd
@@ -709,22 +688,22 @@ def print_report(res, title):
         print(f"    {mark} {yr}:{len(g):>4}T  WR:{len(w2)/len(g)*100:5.1f}%"
               f"  PF:{ypf:.2f}  ${g['pnl'].sum():>+8,.2f}")
     print("-" * 70)
-
     target_mo = GlobalConfig.initial_balance * 0.02
     above     = int((monthly >= target_mo).sum())
     print(f"  🎯 هدف $100/ماه: {above}/{tot_m} ({above/tot_m*100:.0f}%)")
     print(f"  📊 میانگین: ${monthly.mean():.2f} → {monthly.mean()/target_mo*100:.0f}% از هدف")
     print("═" * 70)
 
-    monthly.to_csv('monthly_v15.csv', header=['pnl'])
-    pd.DataFrame(res['eq_curve']).to_csv('equity_v15.csv', index=False)
-    print("  📊 monthly_v15.csv + equity_v15.csv saved")
+    monthly.to_csv('monthly_v15b.csv', header=['pnl'])
+    pd.DataFrame(res['eq_curve']).to_csv('equity_v15b.csv', index=False)
+    print("  📊 monthly_v15b.csv + equity_v15b.csv saved")
 
     print("\n  📈 مقایسه نسخه‌ها:")
     rows = [
-        ("v13 بدون RiskCtrl",  91, 59, 3, 10, "—"),
-        ("v14b با RiskCtrl",   68, 56, 3,  2, "0.94"),
-        (f"v15 Realistic",
+        ("v13  بدون RiskCtrl",  91, 59, 3, 10, "—"),
+        ("v14b با RiskCtrl",    68, 56, 3,  2, "0.94"),
+        ("v15  خراب!",          -7, 42,12,  6, "-0.33"),
+        (f"v15b Balanced",
          round(monthly.mean()), round(pos_m / tot_m * 100),
          neg_yr, n_blow, f"{sharpe:.2f}"),
     ]
@@ -741,16 +720,16 @@ def print_report(res, title):
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  CorrArb v15 — Realistic + Robust                          ║")
+    print("║  CorrArb v15b — Balanced Realistic                         ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
-    print("  تغییرات نسبت به v13/v14b:")
-    print("  • Spread stress در ساعات پرنوسان")
-    print("  • Swap/Rollover cost روزانه")
-    print("  • VR filter دوگانه (fast + slow)")
-    print("  • ATR blowout filter")
-    print("  • GBP exposure: حداکثر 1 pair هم‌زمان")
-    print("  • z_entry=2.3 | max_dd=8% | max_daily=4% | max_trades=1")
+    print("  اصلاحات v15b (نسبت به v15 خراب):")
+    print("  • VR fast: period 60→120، threshold 1.15→1.25")
+    print("  • stress_hours: فقط 3 ساعت اول session (نه 8 ساعت)")
+    print("  • swap: فقط >4 شب، نصف مقدار قبل")
+    print("  • ATR blowout: 2.8→3.2 (شل‌تر)")
+    print("  • z_entry: 2.3→2.2")
+    print("  • GBP limit + Risk Control از v14b حفظ شد")
     print()
 
     pair_data = {}
@@ -766,5 +745,5 @@ if __name__ == "__main__":
 
     print()
     res = run_portfolio(pair_data)
-    print_report(res, "v15 — Quad Realistic (AUDNZD+AUDCAD+GBPCAD+GBPCHF)")
+    print_report(res, "v15b — Quad Balanced Realistic")
     print(f"\n  ✅ Done in {(datetime.now()-t0).total_seconds():.1f}s")
