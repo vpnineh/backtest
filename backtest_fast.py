@@ -1,14 +1,19 @@
+#!/usr/bin/env python3
 """
-=============================================================================
-  FAST VECTORIZED BACKTEST ENGINE
-  Liquidity Sweep + SMC Strategy
+============================================================================
+  ASIAN RANGE LIQUIDITY TRAP - PROP FIRM BACKTEST
   
-  بهینه‌سازی‌ها:
-  - تمام محاسبات با NumPy vectorized
-  - Pre-compute همه سطوح، سویینگ‌ها، FVG و سیگنال‌ها
-  - لوپ فقط روی سیگنال‌ها (نه همه کندل‌ها)
-  - اجرا: چند ثانیه به جای چند ساعت
-=============================================================================
+  Strategy:
+  - Define Asian session range (00:00-07:00 UTC)
+  - Wait for London/NY to sweep Asian High or Low
+  - Enter on rejection (close back inside range)
+  - TP = 2R, SL = beyond sweep candle
+  
+  Target: 5%+ monthly profit, <5% daily DD, <10% total DD
+  
+  Data: HistData M1 CSVs in ./data/
+  Format: 20200102 170000;1.12122;1.12124;1.12119;1.12120;0
+============================================================================
 """
 
 import pandas as pd
@@ -17,914 +22,858 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-import yaml
 import os
-import time as time_module
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
-from tabulate import tabulate
-import warnings
-warnings.filterwarnings('ignore')
+import sys
+import time as timer
+from datetime import datetime
+
+# ================================================================
+# CONFIG (همه تنظیمات اینجاست - نیازی به فایل خارجی نیست)
+# ================================================================
+
+CONFIG = {
+    # Data
+    'data_dir': './data',
+    'symbols': ['EURUSD', 'GBPUSD'],
+    'years': list(range(2010, 2026)),
+    
+    # Account
+    'initial_balance': 100_000,
+    
+    # Risk
+    'risk_per_trade': 0.005,      # 0.5% per trade
+    'max_daily_loss_pct': 0.04,   # 4% daily limit (prop = 5%, ما محتاط‌تر)
+    'max_total_dd_pct': 0.08,     # 8% total limit (prop = 10%, ما محتاط‌تر)
+    'max_trades_per_day': 2,      # حداکثر ۲ ترید در روز
+    
+    # Strategy
+    'asian_start_hour': 0,        # شروع آسیا UTC
+    'asian_end_hour': 7,          # پایان آسیا UTC
+    'trade_start_hour': 7,        # شروع ترید (لندن)
+    'trade_end_hour': 16,         # پایان ترید
+    'rr_ratio': 2.0,              # Risk:Reward = 1:2
+    'sl_buffer_pips': 2,          # بافر SL
+    'min_asian_range_pips': 15,   # حداقل رنج آسیا (فیلتر بازار مرده)
+    'max_asian_range_pips': 80,   # حداکثر رنج آسیا (فیلتر بازار وحشی)
+    'sweep_min_pips': 2,          # حداقل نفوذ به سطح
+    'cooldown_bars': 16,          # فاصله بین تریدها (بار ۱۵ دقیقه = ۴ ساعت)
+    'max_trade_duration': 80,     # حداکثر مدت ترید (بار ۱۵ دقیقه = ۲۰ ساعت)
+    
+    # Costs
+    'spread_pips': 1.2,
+    'slippage_pips': 0.3,
+    'commission_per_lot': 7.0,
+    
+    # Days
+    'skip_monday_before': 9,      # دوشنبه قبل ۹ UTC ترید نکن
+    'skip_friday_after': 14,      # جمعه بعد ۱۴ UTC ترید نکن
+    
+    # Output
+    'output_dir': './results',
+}
+
+# ================================================================
+# PIP DEFINITIONS
+# ================================================================
+
+PIP_INFO = {
+    'EURUSD': {'pip': 0.0001, 'pip_val': 10.0},
+    'GBPUSD': {'pip': 0.0001, 'pip_val': 10.0},
+    'USDJPY': {'pip': 0.01,   'pip_val': 6.7},
+    'XAUUSD': {'pip': 0.10,   'pip_val': 10.0},
+    'XAGUSD': {'pip': 0.001,  'pip_val': 50.0},
+    'USDCHF': {'pip': 0.0001, 'pip_val': 10.0},
+    'USDCAD': {'pip': 0.0001, 'pip_val': 7.5},
+    'AUDUSD': {'pip': 0.0001, 'pip_val': 10.0},
+    'NZDUSD': {'pip': 0.0001, 'pip_val': 10.0},
+    'EURGBP': {'pip': 0.0001, 'pip_val': 12.5},
+    'AUDNZD': {'pip': 0.0001, 'pip_val': 6.0},
+}
 
 
-# ============================
-# DATA LOADER (Fast)
-# ============================
+# ================================================================
+# DATA LOADER
+# ================================================================
 
-def load_histdata(filepath: str) -> pd.DataFrame:
-    """بارگذاری سریع CSV"""
-    try:
-        df = pd.read_csv(filepath, sep=';', header=None,
-                         names=['DateTime','Open','High','Low','Close','Volume'])
-        df['DateTime'] = df['DateTime'].str.strip()
-        
-        # Try common formats
-        for fmt in ['%Y%m%d %H%M%S', '%Y.%m.%d %H:%M', '%m/%d/%Y %H:%M']:
-            try:
-                df['DateTime'] = pd.to_datetime(df['DateTime'], format=fmt)
-                break
-            except:
-                continue
-        else:
-            df['DateTime'] = pd.to_datetime(df['DateTime'], 
-                                             format='mixed', dayfirst=False)
-        
-        df.set_index('DateTime', inplace=True)
-        df.sort_index(inplace=True)
-        df = df[~df.index.duplicated(keep='first')]
-        df = df[df.index.dayofweek < 5]  # Remove weekends
-        return df[['Open','High','Low','Close','Volume']].dropna()
-    except Exception as e:
-        print(f"  [ERROR] {filepath}: {e}")
-        return pd.DataFrame()
-
-
-def load_all_data(data_dir: str, symbol: str, years: list) -> pd.DataFrame:
-    """بارگذاری همه سال‌ها"""
+def load_m1_data(data_dir, symbol, years):
+    """Load all M1 CSV files for a symbol"""
+    print(f"\n  Loading {symbol}...")
     frames = []
+    
     for year in years:
         fp = os.path.join(data_dir, f"DAT_ASCII_{symbol}_M1_{year}.csv")
-        if os.path.exists(fp):
-            print(f"  Loading {year}...", end=" ")
-            df = load_histdata(fp)
-            if not df.empty:
-                print(f"{len(df):,} rows")
-                frames.append(df)
-            else:
-                print("empty")
-        else:
-            print(f"  {year} not found, skipping")
+        if not os.path.exists(fp):
+            continue
+        
+        try:
+            df = pd.read_csv(fp, sep=';', header=None,
+                             names=['DT', 'Open', 'High', 'Low', 'Close', 'Vol'])
+            df['DT'] = df['DT'].str.strip()
+            
+            # Try formats
+            parsed = False
+            for fmt in ['%Y%m%d %H%M%S', '%Y.%m.%d %H:%M']:
+                try:
+                    df['DT'] = pd.to_datetime(df['DT'], format=fmt)
+                    parsed = True
+                    break
+                except:
+                    pass
+            
+            if not parsed:
+                df['DT'] = pd.to_datetime(df['DT'], format='mixed')
+            
+            df.set_index('DT', inplace=True)
+            frames.append(df[['Open', 'High', 'Low', 'Close']])
+            print(f"    {year}: {len(df):>10,} bars")
+        except Exception as e:
+            print(f"    {year}: ERROR - {e}")
     
-    if frames:
-        combined = pd.concat(frames).sort_index()
-        combined = combined[~combined.index.duplicated(keep='first')]
-        print(f"  Total: {len(combined):,} M1 candles")
-        return combined
-    return pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    
+    combined = pd.concat(frames).sort_index()
+    combined = combined[~combined.index.duplicated(keep='first')]
+    combined = combined[combined.index.dayofweek < 5]  # weekdays only
+    combined.dropna(inplace=True)
+    
+    print(f"    TOTAL: {len(combined):,} M1 bars")
+    print(f"    Range: {combined.index[0]} → {combined.index[-1]}")
+    
+    return combined
 
 
-def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """Resample سریع"""
-    rule = f'{minutes}min'
-    return df.resample(rule).agg({
-        'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'
+def resample_m15(df_m1):
+    """M1 → M15"""
+    return df_m1.resample('15min').agg({
+        'Open': 'first', 'High': 'max',
+        'Low': 'min', 'Close': 'last'
     }).dropna()
 
 
-# ============================
-# VECTORIZED INDICATORS
-# ============================
+# ================================================================
+# ASIAN RANGE CALCULATOR
+# ================================================================
 
-def find_swing_highs_vec(highs: np.ndarray, lookback: int = 10) -> np.ndarray:
-    """شناسایی Vectorized سویینگ‌ها - برمی‌گرداند boolean array"""
-    n = len(highs)
-    is_swing = np.zeros(n, dtype=bool)
-    half = lookback // 2
-    
-    for i in range(half, n - half):
-        window = highs[i-half:i+half+1]
-        if highs[i] == window.max() and np.sum(window == highs[i]) == 1:
-            is_swing[i] = True
-    return is_swing
-
-
-def find_swing_lows_vec(lows: np.ndarray, lookback: int = 10) -> np.ndarray:
-    n = len(lows)
-    is_swing = np.zeros(n, dtype=bool)
-    half = lookback // 2
-    
-    for i in range(half, n - half):
-        window = lows[i-half:i+half+1]
-        if lows[i] == window.min() and np.sum(window == lows[i]) == 1:
-            is_swing[i] = True
-    return is_swing
-
-
-def compute_daily_levels(df_m1: pd.DataFrame) -> pd.DataFrame:
-    """محاسبه PDH/PDL برای هر روز - Vectorized"""
-    daily = df_m1.resample('1D').agg({'High':'max','Low':'min'}).dropna()
-    daily.columns = ['DayHigh','DayLow']
-    
-    # Shift by 1 day = Previous Day High/Low
-    daily['PDH'] = daily['DayHigh'].shift(1)
-    daily['PDL'] = daily['DayLow'].shift(1)
-    daily.dropna(inplace=True)
-    return daily[['PDH','PDL']]
-
-
-def detect_fvg_vectorized(open_arr, high_arr, low_arr, close_arr, 
-                           min_gap: float) -> Tuple[np.ndarray, np.ndarray,
-                                                      np.ndarray, np.ndarray]:
+def compute_asian_ranges(df_m1, asian_start, asian_end):
     """
-    Vectorized FVG detection
-    Returns: bullish_fvg_mask, bearish_fvg_mask, fvg_top, fvg_bottom
+    Vectorized: for each trading day, compute Asian session High/Low/Mid
+    Returns dict: date → (asian_high, asian_low, asian_mid)
     """
-    n = len(open_arr)
-    bull_fvg = np.zeros(n, dtype=bool)
-    bear_fvg = np.zeros(n, dtype=bool)
-    fvg_top = np.zeros(n)
-    fvg_bot = np.zeros(n)
+    # Filter Asian session bars
+    hours = df_m1.index.hour
+    asian_mask = (hours >= asian_start) & (hours < asian_end)
+    asian_data = df_m1[asian_mask].copy()
+    asian_data['Date'] = asian_data.index.date
     
-    # Bullish FVG: candle[i] low > candle[i-2] high
-    if n > 2:
-        gap_bull = low_arr[2:] - high_arr[:-2]
-        mask_bull = gap_bull >= min_gap
-        bull_fvg[2:] = mask_bull
-        fvg_top[2:] = np.where(mask_bull, low_arr[2:], 0)
-        fvg_bot[2:] = np.where(mask_bull, high_arr[:-2], 0)
-        
-        # Bearish FVG: candle[i-2] low > candle[i] high
-        gap_bear = low_arr[:-2] - high_arr[2:]
-        mask_bear = gap_bear >= min_gap
-        bear_fvg[2:] = mask_bear
-        # For bearish: top = candle[i-2] low, bottom = candle[i] high
-        fvg_top[2:] = np.where(mask_bear, low_arr[:-2], fvg_top[2:])
-        fvg_bot[2:] = np.where(mask_bear, high_arr[2:], fvg_bot[2:])
-    
-    return bull_fvg, bear_fvg, fvg_top, fvg_bot
-
-
-# ============================
-# SIGNAL GENERATOR (Vectorized pre-compute)
-# ============================
-
-def generate_signals(df_htf: pd.DataFrame, df_mtf: pd.DataFrame,
-                     df_m1: pd.DataFrame, daily_levels: pd.DataFrame,
-                     config: dict, pip_size: float) -> pd.DataFrame:
-    """
-    تولید سیگنال‌ها بصورت Vectorized
-    خروجی: DataFrame با ستون‌های signal, direction, entry, sl, tp
-    """
-    cfg = config['strategy']
-    rr = config['risk']['reward_to_risk']
-    sl_buffer = cfg['sl_buffer_pips'] * pip_size
-    sweep_thresh = cfg['sweep_threshold_pips'] * pip_size
-    
-    print("  [1/5] Computing swing points...")
-    t0 = time_module.time()
-    
-    # Swing points on HTF
-    htf_swing_highs = find_swing_highs_vec(df_htf['High'].values, 
-                                            cfg['swing_lookback'])
-    htf_swing_lows = find_swing_lows_vec(df_htf['Low'].values, 
-                                          cfg['swing_lookback'])
-    
-    # Get swing prices
-    swing_high_prices = df_htf['High'].values.copy()
-    swing_high_prices[~htf_swing_highs] = np.nan
-    
-    swing_low_prices = df_htf['Low'].values.copy()
-    swing_low_prices[~htf_swing_lows] = np.nan
-    
-    print(f"      Swing Highs: {htf_swing_highs.sum()}, "
-          f"Swing Lows: {htf_swing_lows.sum()} "
-          f"({time_module.time()-t0:.1f}s)")
-    
-    print("  [2/5] Computing FVGs on MTF...")
-    t0 = time_module.time()
-    
-    bull_fvg, bear_fvg, fvg_top, fvg_bot = detect_fvg_vectorized(
-        df_mtf['Open'].values, df_mtf['High'].values,
-        df_mtf['Low'].values, df_mtf['Close'].values,
-        cfg['fvg_min_size_pips'] * pip_size
+    # Group by date
+    daily_asian = asian_data.groupby('Date').agg(
+        AH=('High', 'max'),
+        AL=('Low', 'min')
     )
-    print(f"      Bullish FVGs: {bull_fvg.sum()}, "
-          f"Bearish FVGs: {bear_fvg.sum()} ({time_module.time()-t0:.1f}s)")
+    daily_asian['AM'] = (daily_asian['AH'] + daily_asian['AL']) / 2
+    daily_asian['AR'] = daily_asian['AH'] - daily_asian['AL']
     
-    print("  [3/5] Mapping daily levels to MTF...")
-    t0 = time_module.time()
-    
-    # Map PDH/PDL to MTF bars
-    mtf_dates = df_mtf.index.date
-    mtf_pdh = np.full(len(df_mtf), np.nan)
-    mtf_pdl = np.full(len(df_mtf), np.nan)
-    
-    daily_dict = {}
-    for dt, row in daily_levels.iterrows():
-        daily_dict[dt.date()] = (row['PDH'], row['PDL'])
-    
-    for i, d in enumerate(mtf_dates):
-        if d in daily_dict:
-            mtf_pdh[i], mtf_pdl[i] = daily_dict[d]
-    
-    # Forward fill
-    mask = np.isnan(mtf_pdh)
-    idx = np.where(~mask, np.arange(len(mtf_pdh)), 0)
-    np.maximum.accumulate(idx, out=idx)
-    mtf_pdh = mtf_pdh[idx]
-    mtf_pdl = mtf_pdl[idx]
-    
-    print(f"      Done ({time_module.time()-t0:.1f}s)")
-    
-    print("  [4/5] Detecting sweeps & generating signals...")
-    t0 = time_module.time()
-    
-    highs = df_mtf['High'].values
-    lows = df_mtf['Low'].values
-    opens = df_mtf['Open'].values
-    closes = df_mtf['Close'].values
-    times = df_mtf.index
-    hours = df_mtf.index.hour
-    
-    # Session filter
-    london_start = cfg['london_start']
-    london_end = cfg['london_end']
-    ny_start = cfg['newyork_start']
-    ny_end = cfg['newyork_end']
-    
-    in_session = ((hours >= london_start) & (hours < london_end)) | \
-                 ((hours >= ny_start) & (hours < ny_end))
-    
-    # ========== SWEEP DETECTION (Vectorized) ==========
-    
-    # Sweep PDH (bearish): High > PDH + threshold AND Close < PDH
-    sweep_pdh = (highs > mtf_pdh + sweep_thresh) & (closes < mtf_pdh)
-    
-    # Sweep PDL (bullish): Low < PDL - threshold AND Close > PDL
-    sweep_pdl = (lows < mtf_pdl - sweep_thresh) & (closes > mtf_pdl)
-    
-    # Rolling swing high/low for recent levels
-    # Use rolling max/min of confirmed swing points
-    window = 50
-    
-    # Reindex HTF swings to MTF timeframe
-    htf_sh_series = pd.Series(swing_high_prices, index=df_htf.index).dropna()
-    htf_sl_series = pd.Series(swing_low_prices, index=df_htf.index).dropna()
-    
-    # Map nearest HTF swing to MTF
-    recent_swing_high = np.full(len(df_mtf), np.nan)
-    recent_swing_low = np.full(len(df_mtf), np.nan)
-    
-    sh_idx = 0
-    sl_idx = 0
-    sh_vals = htf_sh_series.values
-    sh_times = htf_sh_series.index
-    sl_vals = htf_sl_series.values
-    sl_times = htf_sl_series.index
-    
-    for i in range(len(df_mtf)):
-        ct = times[i]
-        # Update recent swing high
-        while sh_idx < len(sh_times) and sh_times[sh_idx] <= ct:
-            sh_idx += 1
-        if sh_idx > 0:
-            # Use last 3 swing highs, take max
-            start = max(0, sh_idx - 3)
-            recent_swing_high[i] = np.max(sh_vals[start:sh_idx])
-        
-        while sl_idx < len(sl_times) and sl_times[sl_idx] <= ct:
-            sl_idx += 1
-        if sl_idx > 0:
-            start = max(0, sl_idx - 3)
-            recent_swing_low[i] = np.min(sl_vals[start:sl_idx])
-    
-    # Also sweep swing highs/lows
-    valid_sh = ~np.isnan(recent_swing_high)
-    valid_sl = ~np.isnan(recent_swing_low)
-    
-    sweep_sh = valid_sh & (highs > recent_swing_high + sweep_thresh) & \
-               (closes < recent_swing_high)
-    sweep_sl = valid_sl & (lows < recent_swing_low - sweep_thresh) & \
-               (closes > recent_swing_low)
-    
-    # Combined sweep signals
-    any_sweep_high = sweep_pdh | sweep_sh  # Bearish setup
-    any_sweep_low = sweep_pdl | sweep_sl   # Bullish setup
-    
-    # ========== MARKET STRUCTURE (Simple version) ==========
-    # Bullish bias: close > rolling 50-period high midpoint
-    # Bearish bias: close < rolling 50-period low midpoint
-    
-    rolling_mid = (pd.Series(highs).rolling(window).max().values + 
-                   pd.Series(lows).rolling(window).min().values) / 2
-    
-    bullish_bias = closes > rolling_mid
-    bearish_bias = closes < rolling_mid
-    
-    # ========== COMBINE INTO SIGNALS ==========
-    
-    # SHORT signal: sweep high + bearish bias + in session
-    short_signal = any_sweep_high & bearish_bias & in_session
-    
-    # LONG signal: sweep low + bullish bias + in session
-    long_signal = any_sweep_low & bullish_bias & in_session
-    
-    # Remove conflicting signals (both at same bar)
-    conflict = short_signal & long_signal
-    short_signal = short_signal & ~conflict
-    long_signal = long_signal & ~conflict
-    
-    # ========== COMPUTE ENTRY/SL/TP ==========
-    
-    n = len(df_mtf)
-    signal = np.zeros(n, dtype=int)  # 1=long, -1=short
-    entry_prices = np.zeros(n)
-    sl_prices = np.zeros(n)
-    tp_prices = np.zeros(n)
-    
-    signal[long_signal] = 1
-    signal[short_signal] = -1
-    
-    # Long trades
-    long_mask = signal == 1
-    entry_prices[long_mask] = closes[long_mask]
-    
-    # SL = recent swing low - buffer (or PDL - buffer)
-    sl_long = np.where(valid_sl[long_mask], 
-                       recent_swing_low[long_mask], 
-                       mtf_pdl[long_mask])
-    sl_long = np.minimum(sl_long, lows[long_mask]) - sl_buffer
-    sl_prices[long_mask] = sl_long
-    
-    sl_dist_long = entry_prices[long_mask] - sl_prices[long_mask]
-    tp_prices[long_mask] = entry_prices[long_mask] + sl_dist_long * rr
-    
-    # Short trades
-    short_mask = signal == -1
-    entry_prices[short_mask] = closes[short_mask]
-    
-    sl_short = np.where(valid_sh[short_mask],
-                        recent_swing_high[short_mask],
-                        mtf_pdh[short_mask])
-    sl_short = np.maximum(sl_short, highs[short_mask]) + sl_buffer
-    sl_prices[short_mask] = sl_short
-    
-    sl_dist_short = sl_prices[short_mask] - entry_prices[short_mask]
-    tp_prices[short_mask] = entry_prices[short_mask] - sl_dist_short * rr
-    
-    # ========== FILTER BAD SIGNALS ==========
-    
-    # Remove signals with SL too small or too large
-    sl_dist = np.abs(entry_prices - sl_prices)
-    sl_pips = sl_dist / pip_size
-    
-    valid_sl_size = (sl_pips >= 3) & (sl_pips <= 80)
-    signal = np.where(valid_sl_size, signal, 0)
-    
-    # ========== MINIMUM SPACING (cooldown) ==========
-    
-    min_spacing = 4  # bars
-    signal_indices = np.where(signal != 0)[0]
-    
-    if len(signal_indices) > 1:
-        filtered = [signal_indices[0]]
-        for idx in signal_indices[1:]:
-            if idx - filtered[-1] >= min_spacing:
-                filtered.append(idx)
-        
-        clean_signal = np.zeros(n, dtype=int)
-        for idx in filtered:
-            clean_signal[idx] = signal[idx]
-        signal = clean_signal
-    
-    total_signals = np.sum(signal != 0)
-    longs = np.sum(signal == 1)
-    shorts = np.sum(signal == -1)
-    
-    print(f"      Signals: {total_signals} "
-          f"(Long: {longs}, Short: {shorts}) "
-          f"({time_module.time()-t0:.1f}s)")
-    
-    # Build result DataFrame
-    signals_df = pd.DataFrame({
-        'signal': signal,
-        'entry': entry_prices,
-        'sl': sl_prices,
-        'tp': tp_prices
-    }, index=df_mtf.index)
-    
-    return signals_df
+    return daily_asian.to_dict('index')
 
 
-# ============================
-# FAST TRADE SIMULATOR
-# ============================
+# ================================================================
+# CORE STRATEGY
+# ================================================================
 
-def simulate_trades(df_mtf: pd.DataFrame, signals_df: pd.DataFrame,
-                    config: dict, pip_size: float, 
-                    symbol: str) -> Dict:
+def run_backtest(df_m15, asian_ranges, symbol, cfg):
     """
-    شبیه‌سازی سریع معاملات
-    فقط روی سیگنال‌ها لوپ می‌زنیم + بررسی خروج در بارهای بعدی
+    Main backtest loop on M15 data
+    Only loops through trading hours, skips everything else
     """
-    print("  [5/5] Simulating trades...")
-    t0 = time_module.time()
+    pip = PIP_INFO[symbol]['pip']
+    pip_val = PIP_INFO[symbol]['pip_val']
     
-    initial_balance = config['account']['initial_balance']
-    balance = initial_balance
-    peak_balance = initial_balance
-    risk_pct = config['risk']['risk_per_trade']
-    commission_per_lot = config['execution']['commission_per_lot']
-    spread = config['execution']['spread_pips'] * pip_size
-    slippage = config['execution']['slippage_pips'] * pip_size
-    rr = config['risk']['reward_to_risk']
-    max_daily_dd = config['risk']['max_daily_loss']
-    prop_max_dd = config['prop_rules']['max_total_drawdown']
-    breakeven_1r = config['strategy']['breakeven_at_1r']
-    pip_value = 10.0  # per standard lot per pip
+    balance = cfg['initial_balance']
+    initial_balance = balance
+    peak_balance = balance
     
-    # Get signal bars
-    sig_mask = signals_df['signal'].values != 0
-    sig_indices = np.where(sig_mask)[0]
+    spread_cost = cfg['spread_pips'] * pip
+    slip_cost = cfg['slippage_pips'] * pip
+    total_entry_cost = spread_cost + slip_cost
     
-    if len(sig_indices) == 0:
-        print("      No signals to simulate")
-        return {'trades': [], 'equity_curve': [], 'balance': balance}
-    
-    highs = df_mtf['High'].values
-    lows = df_mtf['Low'].values
-    closes = df_mtf['Close'].values
-    times = df_mtf.index
-    n_bars = len(df_mtf)
+    rr = cfg['rr_ratio']
+    risk_pct = cfg['risk_per_trade']
+    sl_buffer = cfg['sl_buffer_pips'] * pip
+    min_range = cfg['min_asian_range_pips'] * pip
+    max_range = cfg['max_asian_range_pips'] * pip
+    sweep_min = cfg['sweep_min_pips'] * pip
+    cooldown = cfg['cooldown_bars']
+    max_duration = cfg['max_trade_duration']
+    commission = cfg['commission_per_lot']
+    max_trades_day = cfg['max_trades_per_day']
+    max_daily_loss = cfg['max_daily_loss_pct']
+    max_total_dd = cfg['max_total_dd_pct']
     
     trades = []
-    equity_curve = []
-    daily_pnl = {}
-    account_blown = False
+    equity_points = []
     
-    # For each signal, simulate forward
-    for sig_idx in sig_indices:
-        if account_blown:
+    # Pre-extract arrays for speed
+    highs = df_m15['High'].values
+    lows = df_m15['Low'].values
+    opens = df_m15['Open'].values
+    closes = df_m15['Close'].values
+    times = df_m15.index
+    hours = df_m15.index.hour
+    dates = df_m15.index.date
+    dows = df_m15.index.dayofweek
+    n = len(df_m15)
+    
+    # State
+    last_trade_bar = -cooldown
+    current_date = None
+    day_start_balance = balance
+    day_trades = 0
+    day_pnl = 0.0
+    blown = False
+    
+    i = 0
+    while i < n - 1:
+        if blown:
             break
         
-        direction = signals_df['signal'].values[sig_idx]  # 1 or -1
-        entry = signals_df['entry'].values[sig_idx]
-        sl = signals_df['sl'].values[sig_idx]
-        tp = signals_df['tp'].values[sig_idx]
-        entry_time = times[sig_idx]
+        dt = dates[i]
+        hour = hours[i]
+        dow = dows[i]
         
-        # Apply spread/slippage
-        if direction == 1:
-            entry += spread/2 + slippage
-        else:
-            entry -= spread/2 + slippage
+        # ---- Daily Reset ----
+        if dt != current_date:
+            # Save daily equity
+            if current_date is not None:
+                equity_points.append({
+                    'date': current_date,
+                    'balance': balance,
+                    'day_pnl': day_pnl,
+                    'day_trades': day_trades
+                })
+            
+            current_date = dt
+            day_start_balance = balance
+            day_trades = 0
+            day_pnl = 0.0
         
-        # Position sizing
-        sl_pips = abs(entry - sl) / pip_size
-        if sl_pips <= 0:
+        # ---- Skip conditions ----
+        # Not in trading hours
+        if hour < cfg['trade_start_hour'] or hour >= cfg['trade_end_hour']:
+            i += 1
             continue
         
+        # Monday morning
+        if dow == 0 and hour < cfg['skip_monday_before']:
+            i += 1
+            continue
+        
+        # Friday afternoon
+        if dow == 4 and hour >= cfg['skip_friday_after']:
+            i += 1
+            continue
+        
+        # Cooldown
+        if i - last_trade_bar < cooldown:
+            i += 1
+            continue
+        
+        # Max trades per day
+        if day_trades >= max_trades_day:
+            i += 1
+            continue
+        
+        # Daily loss limit
+        if day_pnl <= -day_start_balance * max_daily_loss:
+            i += 1
+            continue
+        
+        # Total DD check
+        dd_pct = (peak_balance - balance) / initial_balance
+        if dd_pct >= max_total_dd:
+            blown = True
+            break
+        
+        # ---- Get Asian Range for today ----
+        if dt not in asian_ranges:
+            i += 1
+            continue
+        
+        ar = asian_ranges[dt]
+        a_high = ar['AH']
+        a_low = ar['AL']
+        a_mid = ar['AM']
+        a_range = ar['AR']
+        
+        # Filter: range too small or too big
+        if a_range < min_range or a_range > max_range:
+            i += 1
+            continue
+        
+        # ---- SIGNAL DETECTION ----
+        bar_high = highs[i]
+        bar_low = lows[i]
+        bar_close = closes[i]
+        bar_open = opens[i]
+        
+        body = abs(bar_close - bar_open)
+        upper_wick = bar_high - max(bar_close, bar_open)
+        lower_wick = min(bar_close, bar_open) - bar_low
+        
+        signal = 0  # 1=long, -1=short
+        entry = 0.0
+        sl = 0.0
+        tp = 0.0
+        
+        # ---- SHORT SETUP ----
+        # Price swept Asian High + closed back below it + rejection
+        if (bar_high > a_high + sweep_min and 
+            bar_close < a_high and
+            upper_wick > body * 0.5 and
+            bar_close < bar_open):  # bearish candle
+            
+            signal = -1
+            entry = bar_close - total_entry_cost
+            sl = bar_high + sl_buffer
+            sl_dist = sl - entry
+            
+            if sl_dist > 0:
+                tp = entry - sl_dist * rr
+                # Adjust TP: don't target below Asian Low
+                # (let it ride to at least Asian Mid)
+                tp = min(tp, a_low)
+                tp = min(tp, entry - sl_dist * 1.5)  # minimum 1.5R
+        
+        # ---- LONG SETUP ----
+        # Price swept Asian Low + closed back above it + rejection
+        elif (bar_low < a_low - sweep_min and
+              bar_close > a_low and
+              lower_wick > body * 0.5 and
+              bar_close > bar_open):  # bullish candle
+            
+            signal = 1
+            entry = bar_close + total_entry_cost
+            sl = bar_low - sl_buffer
+            sl_dist = entry - sl
+            
+            if sl_dist > 0:
+                tp = entry + sl_dist * rr
+                tp = max(tp, a_high)
+                tp = max(tp, entry + sl_dist * 1.5)
+        
+        if signal == 0:
+            i += 1
+            continue
+        
+        # ---- VALIDATE ----
+        sl_pips = abs(entry - sl) / pip
+        if sl_pips < 3 or sl_pips > 50:
+            i += 1
+            continue
+        
+        # ---- POSITION SIZE ----
         risk_amount = balance * risk_pct
-        lot_size = risk_amount / (sl_pips * pip_value)
+        lot_size = risk_amount / (sl_pips * pip_val)
         lot_size = max(0.01, round(lot_size, 2))
-        commission = commission_per_lot * lot_size
+        trade_commission = commission * lot_size
         
-        # Check daily limit
-        day_key = str(entry_time.date())
-        if day_key in daily_pnl:
-            if daily_pnl[day_key] <= -balance * max_daily_dd:
-                continue
-        
-        # Simulate forward - find exit
-        current_sl = sl
-        hit_breakeven = False
+        # ---- SIMULATE FORWARD ----
         exit_price = None
         exit_time = None
         exit_type = None
         
-        max_forward = min(sig_idx + 500, n_bars)  # Max 500 bars forward
-        
-        for j in range(sig_idx + 1, max_forward):
-            bar_high = highs[j]
-            bar_low = lows[j]
+        for j in range(i + 1, min(i + max_duration, n)):
+            bh = highs[j]
+            bl = lows[j]
             
-            if direction == 1:  # LONG
-                # Breakeven check
-                if breakeven_1r and not hit_breakeven:
-                    one_r = abs(entry - sl)
-                    if bar_high >= entry + one_r:
-                        current_sl = entry + 2 * pip_size
-                        hit_breakeven = True
-                
-                # SL hit
-                if bar_low <= current_sl:
-                    exit_price = current_sl
+            if signal == 1:  # LONG
+                if bl <= sl:
+                    exit_price = sl
                     exit_time = times[j]
-                    if hit_breakeven and abs(current_sl - entry) < 5 * pip_size:
-                        exit_type = 'BE'
-                    else:
-                        exit_type = 'SL'
+                    exit_type = 'SL'
                     break
-                
-                # TP hit
-                if bar_high >= tp:
+                if bh >= tp:
                     exit_price = tp
                     exit_time = times[j]
                     exit_type = 'TP'
                     break
-            
             else:  # SHORT
-                if breakeven_1r and not hit_breakeven:
-                    one_r = abs(sl - entry)
-                    if bar_low <= entry - one_r:
-                        current_sl = entry - 2 * pip_size
-                        hit_breakeven = True
-                
-                if bar_high >= current_sl:
-                    exit_price = current_sl
+                if bh >= sl:
+                    exit_price = sl
                     exit_time = times[j]
-                    if hit_breakeven and abs(current_sl - entry) < 5 * pip_size:
-                        exit_type = 'BE'
-                    else:
-                        exit_type = 'SL'
+                    exit_type = 'SL'
                     break
-                
-                if bar_low <= tp:
+                if bl <= tp:
                     exit_price = tp
                     exit_time = times[j]
                     exit_type = 'TP'
                     break
         
-        # If no exit found, close at last bar
+        # Timeout - close at market
         if exit_price is None:
-            exit_price = closes[max_forward - 1]
-            exit_time = times[max_forward - 1]
+            j_last = min(i + max_duration, n) - 1
+            exit_price = closes[j_last]
+            exit_time = times[j_last]
             exit_type = 'TIMEOUT'
         
-        # Calculate PnL
-        if direction == 1:
-            pnl_pips = (exit_price - entry) / pip_size
+        # ---- CALCULATE PNL ----
+        if signal == 1:
+            pnl_pips = (exit_price - entry) / pip
         else:
-            pnl_pips = (entry - exit_price) / pip_size
+            pnl_pips = (entry - exit_price) / pip
         
-        pnl = (pnl_pips * pip_value * lot_size) - commission
-        r_multiple = pnl / risk_amount if risk_amount > 0 else 0
+        pnl_money = (pnl_pips * pip_val * lot_size) - trade_commission
+        r_multiple = pnl_money / risk_amount if risk_amount > 0 else 0
         
-        balance += pnl
+        # ---- UPDATE STATE ----
+        balance += pnl_money
         peak_balance = max(peak_balance, balance)
-        
-        # Track daily PnL
-        if day_key not in daily_pnl:
-            daily_pnl[day_key] = 0
-        daily_pnl[day_key] += pnl
-        
-        # Check prop rules
-        total_dd_pct = (peak_balance - balance) / initial_balance
-        if total_dd_pct >= prop_max_dd:
-            account_blown = True
+        day_pnl += pnl_money
+        day_trades += 1
+        last_trade_bar = i
         
         trades.append({
             'symbol': symbol,
-            'direction': 'LONG' if direction == 1 else 'SHORT',
-            'entry_time': entry_time,
-            'exit_time': exit_time,
+            'direction': 'LONG' if signal == 1 else 'SHORT',
+            'entry_time': str(times[i]),
+            'exit_time': str(exit_time),
             'entry_price': round(entry, 5),
             'exit_price': round(exit_price, 5),
             'sl': round(sl, 5),
             'tp': round(tp, 5),
-            'lot_size': lot_size,
-            'pnl': round(pnl, 2),
+            'sl_pips': round(sl_pips, 1),
+            'lots': lot_size,
+            'pnl': round(pnl_money, 2),
             'pnl_pips': round(pnl_pips, 1),
-            'r_multiple': round(r_multiple, 2),
+            'r': round(r_multiple, 2),
             'exit_type': exit_type,
+            'asian_high': round(a_high, 5),
+            'asian_low': round(a_low, 5),
+            'asian_range_pips': round(a_range / pip, 1),
             'balance': round(balance, 2)
         })
         
-        equity_curve.append({
-            'time': exit_time,
-            'balance': balance
+        # Jump past cooldown
+        i = last_trade_bar + cooldown
+        continue
+    
+    # Final equity point
+    if current_date is not None:
+        equity_points.append({
+            'date': current_date,
+            'balance': balance,
+            'day_pnl': day_pnl,
+            'day_trades': day_trades
         })
     
-    print(f"      Trades executed: {len(trades)} ({time_module.time()-t0:.1f}s)")
-    if account_blown:
-        print(f"      ⚠️  Account blown!")
-    
-    return {
-        'trades': trades,
-        'equity_curve': equity_curve,
-        'balance': balance,
-        'peak_balance': peak_balance,
-        'blown': account_blown
-    }
+    return trades, equity_points, blown
 
 
-# ============================
-# RESULTS & REPORTING
-# ============================
+# ================================================================
+# REPORTING
+# ================================================================
 
-def print_results(results: Dict, config: dict):
-    """چاپ نتایج کامل"""
-    trades = results['trades']
-    if not trades:
-        print("\n  ❌ No trades executed!")
-        return
+def print_report(all_trades, initial_balance):
+    """Print comprehensive results"""
+    if not all_trades:
+        print("\n  NO TRADES EXECUTED!")
+        return None
     
-    initial = config['account']['initial_balance']
-    final = results['balance']
+    df = pd.DataFrame(all_trades)
+    final = df['balance'].iloc[-1]
+    total = len(df)
     
-    df_trades = pd.DataFrame(trades)
+    wins = df[df['pnl'] > 0]
+    losses = df[df['pnl'] <= 0]
     
-    total = len(df_trades)
-    wins = df_trades[df_trades['pnl'] > 0]
-    losses = df_trades[df_trades['pnl'] < 0]
+    wr = len(wins) / total * 100
+    net = df['pnl'].sum()
+    ret = (final - initial_balance) / initial_balance * 100
     
-    win_rate = len(wins) / total * 100
-    total_pnl = df_trades['pnl'].sum()
-    total_pips = df_trades['pnl_pips'].sum()
+    avg_w = wins['pnl'].mean() if len(wins) else 0
+    avg_l = losses['pnl'].mean() if len(losses) else 0
+    avg_r = df['r'].mean()
     
-    avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
-    avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0
-    avg_win_pips = wins['pnl_pips'].mean() if len(wins) > 0 else 0
-    avg_loss_pips = losses['pnl_pips'].mean() if len(losses) > 0 else 0
-    avg_r = df_trades['r_multiple'].mean()
+    gp = wins['pnl'].sum() if len(wins) else 0
+    gl = abs(losses['pnl'].sum()) if len(losses) else 1
+    pf = gp / gl if gl > 0 else 999
     
-    gross_profit = wins['pnl'].sum() if len(wins) > 0 else 0
-    gross_loss = abs(losses['pnl'].sum()) if len(losses) > 0 else 1
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-    
-    return_pct = (final - initial) / initial * 100
-    
-    # Max drawdown from equity curve
-    balances = [initial] + [t['balance'] for t in trades]
-    peak = initial
-    max_dd = 0
-    max_dd_pct = 0
-    for b in balances:
-        if b > peak:
-            peak = b
-        dd = peak - b
-        dd_pct = dd / peak * 100
-        if dd_pct > max_dd_pct:
-            max_dd = dd
-            max_dd_pct = dd_pct
+    # Max DD
+    bals = [initial_balance] + list(df['balance'])
+    pk = initial_balance
+    mdd = mdd_p = 0
+    for b in bals:
+        if b > pk:
+            pk = b
+        dd = pk - b
+        ddp = dd / pk * 100
+        if ddp > mdd_p:
+            mdd, mdd_p = dd, ddp
     
     # Consecutive
-    max_cw = max_cl = cw = cl = 0
-    for _, t in df_trades.iterrows():
+    mcw = mcl = cw = cl = 0
+    for _, t in df.iterrows():
         if t['pnl'] > 0:
-            cw += 1; cl = 0
-            max_cw = max(max_cw, cw)
+            cw += 1; cl = 0; mcw = max(mcw, cw)
         else:
-            cl += 1; cw = 0
-            max_cl = max(max_cl, cl)
+            cl += 1; cw = 0; mcl = max(mcl, cl)
     
-    # Exit type breakdown
-    exit_counts = df_trades['exit_type'].value_counts()
+    # Exit types
+    exits = df['exit_type'].value_counts().to_dict()
+    
+    # Direction split
+    longs = df[df['direction'] == 'LONG']
+    shorts = df[df['direction'] == 'SHORT']
     
     print(f"\n{'='*70}")
     print(f"{'BACKTEST RESULTS':^70}")
+    print(f"{'Asian Range Liquidity Trap Strategy':^70}")
     print(f"{'='*70}")
     
     stats = [
-        ["Initial Balance", f"${initial:,.2f}"],
+        ["Period", f"{df['entry_time'].iloc[0][:10]} → {df['entry_time'].iloc[-1][:10]}"],
+        ["Symbols", ', '.join(df['symbol'].unique())],
+        ["", ""],
+        ["Initial Balance", f"${initial_balance:,.0f}"],
         ["Final Balance", f"${final:,.2f}"],
-        ["Net P&L", f"${total_pnl:,.2f}"],
-        ["Return", f"{return_pct:+.2f}%"],
+        ["Net P&L", f"${net:,.2f}"],
+        ["Return", f"{ret:+.2f}%"],
         ["", ""],
         ["Total Trades", total],
-        ["Win Rate", f"{win_rate:.1f}%"],
-        ["Wins / Losses", f"{len(wins)} / {len(losses)}"],
+        ["Win Rate", f"{wr:.1f}%"],
+        ["Wins", len(wins)],
+        ["Losses", len(losses)],
         ["", ""],
-        ["Avg Win", f"${avg_win:,.2f} ({avg_win_pips:.1f} pips)"],
-        ["Avg Loss", f"${avg_loss:,.2f} ({avg_loss_pips:.1f} pips)"],
-        ["Avg R-Multiple", f"{avg_r:.2f}R"],
-        ["Profit Factor", f"{profit_factor:.2f}"],
-        ["Total Pips", f"{total_pips:,.1f}"],
+        ["Avg Win", f"${avg_w:,.2f}"],
+        ["Avg Loss", f"${avg_l:,.2f}"],
+        ["Avg R", f"{avg_r:+.2f}R"],
+        ["Profit Factor", f"{pf:.2f}"],
+        ["Total Pips", f"{df['pnl_pips'].sum():+,.1f}"],
+        ["Avg Pips/Trade", f"{df['pnl_pips'].mean():+.1f}"],
         ["", ""],
-        ["Max Drawdown", f"${max_dd:,.2f} ({max_dd_pct:.2f}%)"],
-        ["Max Consec Wins", max_cw],
-        ["Max Consec Losses", max_cl],
+        ["Longs", f"{len(longs)} (WR: {len(longs[longs['pnl']>0])/max(1,len(longs))*100:.0f}%)"],
+        ["Shorts", f"{len(shorts)} (WR: {len(shorts[shorts['pnl']>0])/max(1,len(shorts))*100:.0f}%)"],
+        ["", ""],
+        ["Max Drawdown", f"${mdd:,.2f} ({mdd_p:.2f}%)"],
+        ["Max Consec Wins", mcw],
+        ["Max Consec Losses", mcl],
         ["", ""],
     ]
     
-    for exit_type, count in exit_counts.items():
-        stats.append([f"Exit: {exit_type}", count])
+    for k, v in exits.items():
+        stats.append([f"Exit: {k}", v])
     
     stats.extend([
         ["", ""],
         ["═══ PROP FIRM CHECK ═══", ""],
-        ["Phase 1 Target (8%)", 
-         "✅ PASSED" if return_pct >= 8 else f"❌ FAILED ({return_pct:.1f}%)"],
-        ["Max DD < 10%", 
-         "✅ OK" if max_dd_pct < 10 else f"❌ VIOLATED ({max_dd_pct:.1f}%)"],
-        ["Account Status", 
-         "❌ BLOWN" if results.get('blown') else "✅ ALIVE"],
+        ["Max DD < 10%", f"{'✅ OK' if mdd_p < 10 else '❌ FAIL'} ({mdd_p:.1f}%)"],
+        ["Max DD < 5% (daily)", "Check below"],
     ])
     
     print(tabulate(stats, headers=["Metric", "Value"], tablefmt="fancy_grid"))
     
-    # Monthly breakdown
-    print(f"\n{'MONTHLY BREAKDOWN':^70}")
-    print("-" * 70)
+    # ---- MONTHLY BREAKDOWN ----
+    df['entry_dt'] = pd.to_datetime(df['entry_time'])
+    df['year'] = df['entry_dt'].dt.year
+    df['month'] = df['entry_dt'].dt.month
+    df['ym'] = df['entry_dt'].dt.to_period('M')
     
-    df_trades['month'] = pd.to_datetime(df_trades['exit_time']).dt.to_period('M')
-    monthly = df_trades.groupby('month').agg(
-        trades=('pnl', 'count'),
-        wins=('pnl', lambda x: (x > 0).sum()),
+    monthly = df.groupby('ym').agg(
+        n=('pnl', 'count'),
+        w=('pnl', lambda x: (x > 0).sum()),
         pnl=('pnl', 'sum'),
         pips=('pnl_pips', 'sum')
     ).reset_index()
+    monthly['wr'] = (monthly['w'] / monthly['n'] * 100).round(0)
+    monthly['pnl_pct'] = (monthly['pnl'] / initial_balance * 100).round(2)
     
-    monthly['wr'] = (monthly['wins'] / monthly['trades'] * 100).round(0)
+    print(f"\n{'MONTHLY BREAKDOWN':^70}")
+    print("-" * 70)
     
     rows = []
-    for _, m in monthly.iterrows():
-        rows.append([
-            str(m['month']), m['trades'], f"{m['wr']:.0f}%",
-            f"{m['pips']:+.0f}", f"${m['pnl']:+,.0f}"
-        ])
+    months_above_5 = 0
+    months_positive = 0
+    total_months = len(monthly)
     
-    print(tabulate(rows, 
-                   headers=["Month", "Trades", "WR%", "Pips", "P&L"],
+    for _, m in monthly.iterrows():
+        flag = "✅" if m['pnl_pct'] >= 5 else ("➖" if m['pnl_pct'] > 0 else "❌")
+        rows.append([
+            str(m['ym']), m['n'], f"{m['wr']:.0f}%",
+            f"{m['pips']:+.0f}", f"${m['pnl']:+,.0f}",
+            f"{m['pnl_pct']:+.1f}%", flag
+        ])
+        if m['pnl_pct'] >= 5:
+            months_above_5 += 1
+        if m['pnl_pct'] > 0:
+            months_positive += 1
+    
+    print(tabulate(rows,
+                   headers=["Month", "#", "WR", "Pips", "P&L", "%", "5%?"],
                    tablefmt="simple"))
     
-    return df_trades
+    print(f"\n  Months ≥ 5%: {months_above_5}/{total_months} ({months_above_5/total_months*100:.0f}%)")
+    print(f"  Months > 0%: {months_positive}/{total_months} ({months_positive/total_months*100:.0f}%)")
+    print(f"  Avg Monthly: {monthly['pnl_pct'].mean():.2f}%")
+    print(f"  Worst Month: {monthly['pnl_pct'].min():.2f}%")
+    print(f"  Best Month:  {monthly['pnl_pct'].max():.2f}%")
+    
+    # ---- YEARLY ----
+    yearly = df.groupby('year').agg(
+        n=('pnl', 'count'),
+        w=('pnl', lambda x: (x > 0).sum()),
+        pnl=('pnl', 'sum'),
+        pips=('pnl_pips', 'sum')
+    ).reset_index()
+    yearly['wr'] = (yearly['w'] / yearly['n'] * 100).round(0)
+    yearly['pct'] = (yearly['pnl'] / initial_balance * 100).round(1)
+    
+    print(f"\n{'YEARLY BREAKDOWN':^70}")
+    print("-" * 70)
+    rows = []
+    for _, y in yearly.iterrows():
+        rows.append([
+            int(y['year']), int(y['n']), f"{y['wr']:.0f}%",
+            f"{y['pips']:+.0f}", f"${y['pnl']:+,.0f}", f"{y['pct']:+.1f}%"
+        ])
+    print(tabulate(rows,
+                   headers=["Year", "#", "WR", "Pips", "P&L", "%"],
+                   tablefmt="simple"))
+    
+    return df
 
 
-def save_results(df_trades: pd.DataFrame, results: Dict, 
-                 config: dict):
-    """ذخیره نتایج"""
-    output_dir = config['output']['output_directory']
+def save_results(df, equity_points, initial_balance, output_dir):
+    """Save all output files"""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save trades CSV
-    csv_path = os.path.join(output_dir, "trades.csv")
-    df_trades.to_csv(csv_path, index=False)
-    print(f"\n  💾 Trades saved: {csv_path}")
+    # 1. Trades CSV
+    fp = os.path.join(output_dir, "trades.csv")
+    df.to_csv(fp, index=False)
+    print(f"\n  💾 Trades: {fp}")
     
-    # Equity Curve
-    initial = config['account']['initial_balance']
-    fig, axes = plt.subplots(2, 1, figsize=(16, 10),
+    # 2. Equity Curve
+    bals = [initial_balance] + list(df['balance'])
+    t0 = pd.to_datetime(df['entry_time'].iloc[0])
+    trade_times = [t0] + list(pd.to_datetime(df['exit_time']))
+    
+    fig, axes = plt.subplots(2, 1, figsize=(18, 10),
                               gridspec_kw={'height_ratios': [3, 1]})
     
-    balances = [initial] + list(df_trades['balance'])
-    times = [df_trades['entry_time'].iloc[0]] + list(df_trades['exit_time'])
-    times = pd.to_datetime(times)
-    
-    axes[0].plot(times, balances, color='#2196F3', linewidth=1.5)
-    axes[0].axhline(y=initial, color='gray', ls='--', alpha=0.5, 
-                     label='Initial')
-    axes[0].axhline(y=initial * 1.08, color='green', ls='--', alpha=0.5,
-                     label='Target 8%')
-    axes[0].axhline(y=initial * 0.90, color='red', ls='--', alpha=0.5,
-                     label='Max DD 10%')
-    axes[0].fill_between(times, initial * 0.90, min(balances) * 0.99,
-                          alpha=0.1, color='red')
-    axes[0].set_title('Equity Curve - Liquidity Sweep + SMC', 
+    axes[0].plot(trade_times, bals, '#1976D2', lw=1.2, label='Balance')
+    axes[0].axhline(initial_balance, color='gray', ls='--', alpha=.5, label='Start')
+    axes[0].axhline(initial_balance * 1.08, color='green', ls='--', alpha=.4,
+                     label='+8% Target')
+    axes[0].axhline(initial_balance * 0.90, color='red', ls='--', alpha=.4,
+                     label='-10% Max DD')
+    axes[0].set_title('Equity Curve - Asian Range Liquidity Trap',
                        fontsize=14, fontweight='bold')
     axes[0].set_ylabel('Balance ($)')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc='upper left')
+    axes[0].grid(True, alpha=.25)
     
-    # Drawdown
-    peak = np.maximum.accumulate(balances)
-    dd = (np.array(peak) - np.array(balances)) / np.array(peak) * 100
-    axes[1].fill_between(times, dd, color='red', alpha=0.4)
+    peak_arr = np.maximum.accumulate(bals)
+    dd = (np.array(peak_arr) - np.array(bals)) / np.array(peak_arr) * 100
+    axes[1].fill_between(trade_times, dd, color='#E53935', alpha=.4)
     axes[1].set_ylabel('Drawdown %')
     axes[1].set_xlabel('Date')
-    axes[1].grid(True, alpha=0.3)
     axes[1].invert_yaxis()
+    axes[1].grid(True, alpha=.25)
     
     plt.tight_layout()
-    eq_path = os.path.join(output_dir, "equity_curve.png")
-    plt.savefig(eq_path, dpi=150, bbox_inches='tight')
+    fp = os.path.join(output_dir, "equity_curve.png")
+    plt.savefig(fp, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  📈 Equity curve: {eq_path}")
+    print(f"  📈 Equity: {fp}")
     
-    # Monthly Heatmap
-    df_trades['exit_dt'] = pd.to_datetime(df_trades['exit_time'])
-    df_trades['year'] = df_trades['exit_dt'].dt.year
-    df_trades['month_num'] = df_trades['exit_dt'].dt.month
+    # 3. Monthly Heatmap
+    df['entry_dt'] = pd.to_datetime(df['entry_time'])
+    df['yr'] = df['entry_dt'].dt.year
+    df['mo'] = df['entry_dt'].dt.month
     
-    pivot = df_trades.groupby(['year', 'month_num'])['pnl'].sum().reset_index()
-    pivot_table = pivot.pivot(index='year', columns='month_num', values='pnl')
-    pivot_table.columns = ['Jan','Feb','Mar','Apr','May','Jun',
-                            'Jul','Aug','Sep','Oct','Nov','Dec'][:len(pivot_table.columns)]
+    piv = df.groupby(['yr', 'mo'])['pnl'].sum().reset_index()
+    pt = piv.pivot(index='yr', columns='mo', values='pnl').fillna(0)
     
-    fig, ax = plt.subplots(figsize=(14, max(3, len(pivot_table) * 1.2)))
-    sns.heatmap(pivot_table, annot=True, fmt='.0f', cmap='RdYlGn',
-                center=0, ax=ax, linewidths=1,
-                cbar_kws={'label': 'P&L ($)'})
+    mnames = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun',
+              7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'}
+    pt.columns = [mnames.get(c, c) for c in pt.columns]
+    
+    fig, ax = plt.subplots(figsize=(16, max(4, len(pt) * 0.8)))
+    sns.heatmap(pt, annot=True, fmt='.0f', cmap='RdYlGn', center=0,
+                ax=ax, linewidths=.5, cbar_kws={'label': 'P&L ($)'})
     ax.set_title('Monthly P&L Heatmap', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    hm_path = os.path.join(output_dir, "monthly_heatmap.png")
-    plt.savefig(hm_path, dpi=150, bbox_inches='tight')
+    fp = os.path.join(output_dir, "monthly_heatmap.png")
+    plt.savefig(fp, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  🗓️  Monthly heatmap: {hm_path}")
+    print(f"  🗓️  Heatmap: {fp}")
     
-    # R-Distribution
-    fig, ax = plt.subplots(figsize=(12, 5))
-    colors = ['#4CAF50' if r > 0 else '#F44336' for r in df_trades['r_multiple']]
-    ax.bar(range(len(df_trades)), df_trades['r_multiple'], color=colors, 
-           alpha=0.7, width=1.0)
-    ax.axhline(y=0, color='black', lw=0.5)
-    ax.axhline(y=df_trades['r_multiple'].mean(), color='blue', ls='--',
-               label=f"Avg: {df_trades['r_multiple'].mean():.2f}R")
+    # 4. R Distribution
+    fig, ax = plt.subplots(figsize=(14, 5))
+    colors = ['#43A047' if r > 0 else '#E53935' for r in df['r']]
+    ax.bar(range(len(df)), df['r'], color=colors, alpha=.7, width=1)
+    ax.axhline(0, color='black', lw=.5)
+    avg_r = df['r'].mean()
+    ax.axhline(avg_r, color='blue', ls='--', alpha=.7,
+               label=f'Avg R: {avg_r:+.2f}')
     ax.set_title('R-Multiple per Trade', fontsize=14, fontweight='bold')
     ax.set_xlabel('Trade #')
     ax.set_ylabel('R')
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=.25)
     plt.tight_layout()
-    r_path = os.path.join(output_dir, "r_distribution.png")
-    plt.savefig(r_path, dpi=150, bbox_inches='tight')
+    fp = os.path.join(output_dir, "r_distribution.png")
+    plt.savefig(fp, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  📊 R-distribution: {r_path}")
+    print(f"  📊 R-Dist: {fp}")
+    
+    # 5. Win Rate by Hour
+    df['entry_hour'] = df['entry_dt'].dt.hour
+    hourly = df.groupby('entry_hour').agg(
+        n=('pnl', 'count'),
+        wr=('pnl', lambda x: (x > 0).mean() * 100),
+        avg_pnl=('pnl', 'mean')
+    ).reset_index()
+    
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bars = ax.bar(hourly['entry_hour'], hourly['wr'],
+                  color=['#43A047' if w > 50 else '#E53935' for w in hourly['wr']],
+                  alpha=.7)
+    ax.axhline(50, color='gray', ls='--', alpha=.5)
+    ax.set_title('Win Rate by Entry Hour (UTC)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Hour')
+    ax.set_ylabel('Win Rate %')
+    ax.set_xticks(hourly['entry_hour'])
+    ax.grid(True, alpha=.25)
+    
+    for bar, n in zip(bars, hourly['n']):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                f'n={int(n)}', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    fp = os.path.join(output_dir, "winrate_by_hour.png")
+    plt.savefig(fp, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  🕐 Hourly WR: {fp}")
+    
+    # 6. Monthly % bar chart
+    df['ym'] = df['entry_dt'].dt.to_period('M')
+    m_pnl = df.groupby('ym')['pnl'].sum()
+    m_pct = m_pnl / initial_balance * 100
+    
+    fig, ax = plt.subplots(figsize=(20, 6))
+    colors = ['#43A047' if p >= 5 else ('#FFC107' if p > 0 else '#E53935')
+              for p in m_pct]
+    ax.bar(range(len(m_pct)), m_pct.values, color=colors, alpha=.8)
+    ax.axhline(5, color='green', ls='--', alpha=.5, label='5% target')
+    ax.axhline(0, color='black', lw=.5)
+    ax.set_title('Monthly Return %', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Return %')
+    ax.set_xlabel('Month')
+    
+    # X labels (every 6 months)
+    labels = [str(p) for p in m_pct.index]
+    step = max(1, len(labels) // 20)
+    ax.set_xticks(range(0, len(labels), step))
+    ax.set_xticklabels([labels[i] for i in range(0, len(labels), step)],
+                        rotation=45, ha='right', fontsize=8)
+    ax.legend()
+    ax.grid(True, alpha=.25)
+    
+    plt.tight_layout()
+    fp = os.path.join(output_dir, "monthly_returns.png")
+    plt.savefig(fp, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Monthly %: {fp}")
 
 
-# ============================
+# ================================================================
 # MAIN
-# ============================
+# ================================================================
 
 def main():
-    total_start = time_module.time()
+    start_time = timer.time()
     
     print("=" * 70)
-    print("  ⚡ FAST VECTORIZED BACKTEST ENGINE")
-    print("  Liquidity Sweep + Smart Money Concepts")
+    print("  ASIAN RANGE LIQUIDITY TRAP - PROP FIRM BACKTEST")
+    print("  2010-2025 | EURUSD + GBPUSD")
     print("=" * 70)
     
-    # Load config
-    with open("config.yml", 'r') as f:
-        config = yaml.safe_load(f)
+    cfg = CONFIG
+    initial = cfg['initial_balance']
     
-    initial = config['account']['initial_balance']
-    print(f"\n  Balance: ${initial:,}")
-    print(f"  Risk/Trade: {config['risk']['risk_per_trade']*100}%")
-    print(f"  R:R: 1:{config['risk']['reward_to_risk']}")
+    print(f"\n  💰 Balance: ${initial:,}")
+    print(f"  ⚡ Risk: {cfg['risk_per_trade']*100}% per trade")
+    print(f"  🎯 R:R = 1:{cfg['rr_ratio']}")
+    print(f"  📏 Asian Range: {cfg['min_asian_range_pips']}-{cfg['max_asian_range_pips']} pips")
+    print(f"  🕐 Trade: {cfg['trade_start_hour']}:00-{cfg['trade_end_hour']}:00 UTC")
     
     all_trades = []
-    final_balance = initial
+    all_equity = []
+    blown = False
+    running_balance = initial
     
-    for symbol in config['data']['symbols']:
-        print(f"\n{'━'*70}")
-        print(f"  📊 {symbol}")
-        print(f"{'━'*70}")
+    for symbol in cfg['symbols']:
+        if blown:
+            print(f"\n  ⚠️ Account blown, skipping {symbol}")
+            break
         
-        pip_size = {'EURUSD': 0.0001, 'GBPUSD': 0.0001, 
-                    'XAUUSD': 0.10}.get(symbol, 0.0001)
+        print(f"\n{'━' * 70}")
+        print(f"  {symbol}")
+        print(f"{'━' * 70}")
         
-        # Load data
-        df_m1 = load_all_data(config['data']['directory'], symbol, 
-                               config['data']['years'])
-        if df_m1.empty:
+        if symbol not in PIP_INFO:
+            print(f"  Skip: no pip info")
             continue
         
-        # Build timeframes
-        print(f"\n  Building timeframes...")
-        t0 = time_module.time()
+        # Load M1 data
+        t0 = timer.time()
+        df_m1 = load_m1_data(cfg['data_dir'], symbol, cfg['years'])
+        if df_m1.empty:
+            print("  No data!")
+            continue
+        print(f"  Load time: {timer.time()-t0:.1f}s")
         
-        cfg_s = config['strategy']
-        df_htf = resample(df_m1, cfg_s['htf_minutes'])
-        df_mtf = resample(df_m1, cfg_s['mtf_minutes'])
+        # Resample to M15
+        t0 = timer.time()
+        df_m15 = resample_m15(df_m1)
+        print(f"  M15 bars: {len(df_m15):,} ({timer.time()-t0:.1f}s)")
         
-        print(f"    HTF ({cfg_s['htf_minutes']}min): {len(df_htf):,}")
-        print(f"    MTF ({cfg_s['mtf_minutes']}min): {len(df_mtf):,}")
-        print(f"    ({time_module.time()-t0:.1f}s)")
+        # Compute Asian ranges
+        t0 = timer.time()
+        asian_ranges = compute_asian_ranges(
+            df_m1, cfg['asian_start_hour'], cfg['asian_end_hour']
+        )
+        print(f"  Asian ranges: {len(asian_ranges)} days ({timer.time()-t0:.1f}s)")
         
-        # Daily levels
-        print(f"\n  Computing daily levels...")
-        daily_levels = compute_daily_levels(df_m1)
-        print(f"    {len(daily_levels)} days")
+        # Update config with running balance for multi-symbol
+        cfg_run = dict(cfg)
+        cfg_run['initial_balance'] = running_balance
         
-        # Generate signals
-        print(f"\n  Generating signals...")
-        signals = generate_signals(df_htf, df_mtf, df_m1, daily_levels,
-                                    config, pip_size)
+        # Run backtest
+        t0 = timer.time()
+        trades, equity, blown = run_backtest(df_m15, asian_ranges, symbol, cfg_run)
+        print(f"  Backtest: {len(trades)} trades ({timer.time()-t0:.1f}s)")
         
-        # Simulate trades
-        results = simulate_trades(df_mtf, signals, config, pip_size, symbol)
+        if trades:
+            all_trades.extend(trades)
+            running_balance = trades[-1]['balance']
         
-        if results['trades']:
-            all_trades.extend(results['trades'])
-            final_balance = results['balance']
+        all_equity.extend(equity)
+        
+        if blown:
+            print(f"  ⚠️ ACCOUNT BLOWN!")
     
-    # Final report
+    # Report
     if all_trades:
-        results_combined = {
-            'trades': all_trades,
-            'balance': final_balance,
-            'blown': any(t.get('blown', False) for t in [results])
-        }
-        
-        df_all = print_results(results_combined, config)
-        save_results(df_all, results_combined, config)
+        df = print_report(all_trades, initial)
+        if df is not None:
+            save_results(df, all_equity, initial, cfg['output_dir'])
     else:
-        print("\n  ❌ No trades across all symbols!")
+        print("\n  ❌ NO TRADES!")
     
-    elapsed = time_module.time() - total_start
-    print(f"\n  ⏱️  Total runtime: {elapsed:.1f}s ({elapsed/60:.1f}min)")
-    print(f"{'='*70}")
+    elapsed = timer.time() - start_time
+    print(f"\n  ⏱️ Total time: {elapsed:.1f}s ({elapsed/60:.1f}min)")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
