@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v1.0
+PropBot Backtester v1.1
 ══════════════════════════════════════════════════════════════
-Realistic walk-forward backtest — zero lookahead, zero overfitting
-Strategy : EMA20/50 crossover + RSI14 filter + ATR14 SL/TP
-Timeframe : H1  (resampled on-the-fly from M1)
-Data      : HistData M1  (CSV / ZIP — auto-detected)
-Split     : Train 2010-2019  |  Out-of-sample (OOS) 2020-2025
+Walk-forward backtest — zero lookahead, zero overfitting
+Strategy  : EMA20/50 trend + RSI14 filter + ATR14 SL/TP
+Timeframe : H4  (resampled from M1 — better signal quality)
+Pairs     : EURUSD, GBPUSD, XAUUSD, USDCAD, AUDUSD
+            (trend-following works on these; range pairs excluded)
+Split     : Train 2010-2019  |  OOS test 2020-2025
 Costs     : Realistic spread + 0.5 pip slippage per side
+Fix v1.1  : auto-detect CSV separator | UTC-aware timestamps
 ══════════════════════════════════════════════════════════════
 """
 
-import os, sys, glob, zipfile, io, csv, json, argparse, textwrap
+import sys, zipfile, io, csv, json, argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -21,91 +23,103 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-#  FIXED PARAMETERS  —  set once, never tuned on test data
+#  PAIRS — only where trend-following has structural edge
+#  Excluded:  EURGBP (too range-bound)
+#             AUDNZD (low volatility / choppy)
+#             NZDUSD (correlated + less liquid)
+#             USDCHF (correlated w/ EURUSD, adds no info)
+#             XAGUSD (extreme spread kills edge)
+# ─────────────────────────────────────────────────────────────
+TARGET_PAIRS = ["EURUSD", "GBPUSD", "XAUUSD", "USDCAD", "AUDUSD"]
+
+# ─────────────────────────────────────────────────────────────
+#  FIXED PARAMETERS — set once, never tuned on test data
 # ─────────────────────────────────────────────────────────────
 CFG = dict(
-    ema_fast      = 20,       # EMA fast period
-    ema_slow      = 50,       # EMA slow period
-    rsi_period    = 14,       # RSI period
-    rsi_lo        = 40,       # RSI lower bound for entry
-    rsi_hi        = 60,       # RSI upper bound for entry
-    atr_period    = 14,       # ATR period
-    atr_sl_mult   = 1.5,      # SL = ATR × 1.5
-    rr            = 1.8,      # Risk:Reward (TP = SL × 1.8)
-    risk_pct      = 0.01,     # 1 % of equity per trade
-    max_open      = 2,        # max simultaneous positions
-    daily_dd_lim  = 0.03,     # 3 % daily loss limit → freeze
-    max_dd_kill   = 0.07,     # 7 % total DD → kill bot
-    session_open  = 7,        # UTC hour sessions open
-    session_close = 21,       # UTC hour sessions close
-    initial_bal   = 10_000.0, # starting balance ($)
-    slippage_pip  = 0.5,      # slippage per side (pips)
-    min_atr_mult  = 0.5,      # min ATR relative to spread (quality filter)
+    ema_fast      = 20,
+    ema_slow      = 50,
+    rsi_period    = 14,
+    rsi_lo        = 40,    # RSI entry zone low
+    rsi_hi        = 60,    # RSI entry zone high
+    atr_period    = 14,
+    atr_sl_mult   = 1.5,   # SL = 1.5 × ATR
+    rr            = 1.8,   # TP = SL × 1.8
+    risk_pct      = 0.01,  # 1% equity per trade
+    max_open      = 2,
+    daily_dd_lim  = 0.03,  # 3% daily → freeze
+    max_dd_kill   = 0.07,  # 7% total → kill
+    session_open  = 7,     # UTC
+    session_close = 21,    # UTC
+    initial_bal   = 10_000.0,
+    slippage_pip  = 0.5,
+    timeframe     = "4h",  # H4 — better trend quality than H1
 )
 
-# Realistic bid-ask spread in pips
 SPREAD_PIPS = dict(
     EURUSD=1.2, GBPUSD=1.5, AUDUSD=1.4,
-    NZDUSD=2.0, USDCAD=1.8, USDCHF=1.8,
-    EURGBP=1.5, AUDNZD=2.5,
-    XAUUSD=30,  XAGUSD=3.0,
+    USDCAD=1.8, XAUUSD=30,
 )
 
-# One pip in price units
 PIP_SIZE = dict(
     EURUSD=1e-4, GBPUSD=1e-4, AUDUSD=1e-4,
-    NZDUSD=1e-4, USDCAD=1e-4, USDCHF=1e-4,
-    EURGBP=1e-4, AUDNZD=1e-4,
-    XAUUSD=0.01, XAGUSD=0.001,
+    USDCAD=1e-4, XAUUSD=0.01,
 )
 
-TRAIN_END  = pd.Timestamp("2019-12-31")
-TEST_START = pd.Timestamp("2020-01-01")
+# ── FIX: tz-aware timestamps for comparison with UTC index ──
+TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
+TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
 # ─────────────────────────────────────────────────────────────
-#  DATA LOADING
+#  DATA LOADING  — auto-detects semicolon or comma
 # ─────────────────────────────────────────────────────────────
-def _read_csv_bytes(raw: bytes, sep: str) -> pd.DataFrame:
-    """Parse raw CSV bytes into OHLC DataFrame."""
+def _detect_sep(raw: bytes) -> str:
+    """Sample first 300 bytes to detect field separator."""
+    sample = raw[:300].decode("utf-8", errors="replace")
+    return ";" if sample.count(";") > sample.count(",") else ","
+
+
+def _parse_csv(raw: bytes) -> pd.DataFrame:
+    sep = _detect_sep(raw)
     df = pd.read_csv(
-        io.BytesIO(raw), sep=sep, header=None,
+        io.BytesIO(raw),
+        sep=sep,
+        header=None,
         names=["dt", "open", "high", "low", "close", "vol"],
-        dtype={"dt": str, "open": float, "high": float,
-               "low": float, "close": float, "vol": float},
+        dtype={"open": float, "high": float, "low": float,
+               "close": float, "vol": float},
+        on_bad_lines="skip",
     )
-    df["datetime"] = pd.to_datetime(df["dt"], format="%Y%m%d %H%M%S", utc=True)
-    df = df.drop(columns=["dt", "vol"]).set_index("datetime").sort_index()
+    # HistData datetime: "20100103 170000"
+    df["datetime"] = pd.to_datetime(
+        df["dt"].astype(str).str.strip(),
+        format="%Y%m%d %H%M%S",
+        utc=True,
+        errors="coerce",
+    )
+    df = (df.dropna(subset=["datetime"])
+            .drop(columns=["dt", "vol"])
+            .set_index("datetime")
+            .sort_index())
     return df
 
 
 def load_pair(data_dir: Path, pair: str) -> pd.DataFrame:
-    """
-    Load all years for one pair.  Handles:
-      - DAT_ASCII_EURUSD_M1_YYYY.csv  (comma-separated, no header)
-      - HISTDATA_COM_ASCII_XAUUSD_M1YYYY.zip  (zip → semicolon CSV)
-    """
     frames = []
 
-    # ── plain CSV ──
+    # plain CSV  (DAT_ASCII_EURUSD_M1_YYYY.csv)
     for f in sorted(data_dir.glob(f"DAT_ASCII_{pair}_M1_*.csv")):
         try:
-            raw = f.read_bytes()
-            frames.append(_read_csv_bytes(raw, ","))
+            frames.append(_parse_csv(f.read_bytes()))
         except Exception as e:
             print(f"  [WARN] {f.name}: {e}")
 
-    # ── zipped CSV (HistData format) ──
+    # zipped CSV  (HISTDATA_COM_ASCII_XAUUSD_M1YYYY.zip)
     for f in sorted(data_dir.glob(f"HISTDATA_COM_ASCII_{pair}_M1*.zip")):
         try:
             with zipfile.ZipFile(f) as zf:
-                inner = [n for n in zf.namelist() if n.endswith(".csv")]
-                if not inner:
-                    continue
-                raw = zf.read(inner[0])
-                # detect separator
-                sample = raw[:200].decode("utf-8", errors="replace")
-                sep = ";" if ";" in sample else ","
-                frames.append(_read_csv_bytes(raw, sep))
+                inner = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if inner:
+                    frames.append(_parse_csv(zf.read(inner[0])))
         except Exception as e:
             print(f"  [WARN] {f.name}: {e}")
 
@@ -114,268 +128,179 @@ def load_pair(data_dir: Path, pair: str) -> pd.DataFrame:
 
     df = pd.concat(frames).sort_index()
     df = df[~df.index.duplicated(keep="first")]
+    # basic sanity: drop zero/negative prices
+    df = df[(df[["open","high","low","close"]] > 0).all(axis=1)]
     return df
 
 
 # ─────────────────────────────────────────────────────────────
-#  INDICATORS  (pure pandas/numpy — no external ta libs)
+#  INDICATORS  (pure pandas/numpy)
 # ─────────────────────────────────────────────────────────────
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
 
+def _rsi(close: pd.Series, n: int) -> pd.Series:
+    d = close.diff()
+    g = d.clip(lower=0).ewm(com=n-1, adjust=False).mean()
+    l = (-d).clip(lower=0).ewm(com=n-1, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
-def rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_g = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_l = loss.ewm(com=period - 1, adjust=False).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev_c = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_c).abs(),
-        (low  - prev_c).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(com=period - 1, adjust=False).mean()
-
+def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> pd.Series:
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(com=n-1, adjust=False).mean()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     c = CFG
-    df["ema_fast"] = ema(df["close"], c["ema_fast"])
-    df["ema_slow"] = ema(df["close"], c["ema_slow"])
-    df["rsi"]      = rsi(df["close"], c["rsi_period"])
-    df["atr"]      = atr(df["high"], df["low"], df["close"], c["atr_period"])
+    df = df.copy()
+    df["ema_fast"] = _ema(df["close"], c["ema_fast"])
+    df["ema_slow"] = _ema(df["close"], c["ema_slow"])
+    df["rsi"]      = _rsi(df["close"], c["rsi_period"])
+    df["atr"]      = _atr(df["high"], df["low"], df["close"], c["atr_period"])
 
-    # Trend: +1 bullish, -1 bearish (prev bar to avoid lookahead)
-    df["trend"] = np.where(df["ema_fast"] > df["ema_slow"], 1, -1)
+    # trend direction (current bar)
+    df["bull"] = df["ema_fast"] > df["ema_slow"]
 
-    # Signal fires on crossover
-    df["cross_up"]   = (df["trend"] == 1) & (df["trend"].shift(1) == -1)
-    df["cross_down"] = (df["trend"] == -1) & (df["trend"].shift(1) == 1)
+    # entry condition: trend holds + price pulls back into EMA20 ± 0.4×ATR
+    #                 + RSI in neutral zone (not already extended)
+    near = (df["close"] - df["ema_fast"]).abs() <= 0.4 * df["atr"]
+    rsi_ok = df["rsi"].between(c["rsi_lo"], c["rsi_hi"])
 
-    # RSI filter: enter only when RSI is in neutral zone (not overbought/oversold)
-    df["rsi_ok_buy"]  = (df["rsi"] > c["rsi_lo"]) & (df["rsi"] < c["rsi_hi"])
-    df["rsi_ok_sell"] = (df["rsi"] > c["rsi_lo"]) & (df["rsi"] < c["rsi_hi"])
+    raw_long  = df["bull"]  & near & rsi_ok
+    raw_short = ~df["bull"] & near & rsi_ok
 
-    # Pullback to EMA20 (close within 0.5 × ATR of EMA20)
-    df["near_ema"] = (df["close"] - df["ema_fast"]).abs() <= 0.5 * df["atr"]
+    # ── STRICT no-lookahead: signal on bar N → execute on bar N+1 open ──
+    df["sig_long"]  = raw_long.shift(1).fillna(False)
+    df["sig_short"] = raw_short.shift(1).fillna(False)
 
-    # Combined signal (evaluated on bar close → executed next bar open)
-    df["sig_buy"]  = df["trend"] == 1  # in uptrend
-    df["sig_sell"] = df["trend"] == -1 # in downtrend
-
-    # Continuation entry: price pulls back to EMA20 while trend holds
-    df["entry_long"]  = (
-        df["sig_buy"]      &
-        df["near_ema"]     &
-        df["rsi_ok_buy"]   &
-        (df["atr"] > 0)
-    )
-    df["entry_short"] = (
-        df["sig_sell"]     &
-        df["near_ema"]     &
-        df["rsi_ok_sell"]  &
-        (df["atr"] > 0)
-    )
-
-    # Shift 1: signal on bar N → action on bar N+1 (no lookahead)
-    df["entry_long"]  = df["entry_long"].shift(1).fillna(False)
-    df["entry_short"] = df["entry_short"].shift(1).fillna(False)
-
-    return df
+    return df.dropna(subset=["ema_fast","ema_slow","rsi","atr"])
 
 
 # ─────────────────────────────────────────────────────────────
 #  TRADE SIMULATION
 # ─────────────────────────────────────────────────────────────
-class Position:
-    __slots__ = ["pair","direction","open_price","sl","tp",
-                 "open_time","size_usd","pip"]
-
-    def __init__(self, pair, direction, open_price, sl, tp,
-                 open_time, size_usd, pip):
-        self.pair       = pair
-        self.direction  = direction   # 1=long, -1=short
-        self.open_price = open_price
-        self.sl         = sl
-        self.tp         = tp
-        self.open_time  = open_time
-        self.size_usd   = size_usd    # dollars at risk
-        self.pip        = pip
+class Pos:
+    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip"]
+    def __init__(self, d, entry, sl, tp, t0, risk_usd, pip):
+        self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
+        self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
 
 
-def _cost(pair: str) -> float:
-    """Total cost in price units (spread + slippage both sides)."""
-    pip = PIP_SIZE.get(pair, 1e-4)
-    sp  = SPREAD_PIPS.get(pair, 2.0) * pip
-    sl  = CFG["slippage_pip"] * pip * 2   # entry + exit
-    return sp + sl
+def _total_cost(pair: str) -> float:
+    pip  = PIP_SIZE[pair]
+    sp   = SPREAD_PIPS.get(pair, 2.0) * pip
+    slp  = CFG["slippage_pip"] * pip * 2
+    return sp + slp
 
 
-def simulate(df: pd.DataFrame, pair: str) -> tuple[list, list]:
-    """
-    Event-driven bar-by-bar simulation on H1 data.
-    Returns (trades_list, equity_series).
-    """
-    pip   = PIP_SIZE.get(pair, 1e-4)
-    cost  = _cost(pair)
-    c     = CFG
+def simulate(df: pd.DataFrame, pair: str):
+    pip    = PIP_SIZE[pair]
+    cost   = _total_cost(pair)
+    c      = CFG
 
-    equity     = c["initial_bal"]
-    peak_eq    = equity
-    open_pos   : list[Position] = []
-    trades     : list[dict]     = []
-    eq_curve   : list           = []
+    equity   = c["initial_bal"]
+    peak     = equity
+    positions: list[Pos] = []
+    trades   : list[dict] = []
+    eq_curve : list[dict] = []
 
-    day_open_eq = equity
-    last_day    = None
-    bot_killed  = False
+    day_eq   = equity
+    last_day = None
+    frozen   = False   # daily freeze flag
 
     for ts, row in df.iterrows():
-        if bot_killed:
-            break
-
         # ── daily reset ──
-        day = ts.date()
-        if day != last_day:
-            day_open_eq = equity
-            last_day    = day
+        d = ts.date()
+        if d != last_day:
+            day_eq   = equity
+            last_day = d
+            frozen   = False
 
-        # ── session filter ──
-        in_session = c["session_open"] <= ts.hour < c["session_close"]
+        o, h, l = row["open"], row["high"], row["low"]
 
-        bar_open  = row["open"]
-        bar_high  = row["high"]
-        bar_low   = row["low"]
+        # ── check existing positions ──
+        closed = []
+        for pos in positions:
+            res = ep = None
+            if pos.d == 1:
+                if l <= pos.sl: ep, res = pos.sl, "sl"
+                elif h >= pos.tp: ep, res = pos.tp, "tp"
+            else:
+                if h >= pos.sl: ep, res = pos.sl, "sl"
+                elif l <= pos.tp: ep, res = pos.tp, "tp"
 
-        # ── check open positions (SL / TP hit) ──
-        closed_now = []
-        for pos in open_pos:
-            exit_price = None
-            result     = None
+            # force-close at session end
+            if res is None and ts.hour >= c["session_close"]:
+                ep, res = o, "eod"
 
-            if pos.direction == 1:   # long
-                if bar_low <= pos.sl:
-                    exit_price = pos.sl
-                    result = "sl"
-                elif bar_high >= pos.tp:
-                    exit_price = pos.tp
-                    result = "tp"
-            else:                    # short
-                if bar_high >= pos.sl:
-                    exit_price = pos.sl
-                    result = "sl"
-                elif bar_low <= pos.tp:
-                    exit_price = pos.tp
-                    result = "tp"
-
-            # Force-close at session end
-            if result is None and ts.hour >= c["session_close"]:
-                exit_price = bar_open
-                result = "eod"
-
-            if exit_price is not None:
-                price_move = (exit_price - pos.open_price) * pos.direction
-                pnl_pips   = price_move / pos.pip
-                # pnl in $ = (pips_at_risk) * (risk_$) / (sl_pips)
-                sl_pips    = abs(pos.open_price - pos.sl) / pos.pip
-                if sl_pips > 0:
-                    pnl_usd = pnl_pips / sl_pips * pos.size_usd
-                else:
-                    pnl_usd = 0.0
-
-                pnl_usd -= cost / pos.pip * (pos.size_usd / max(sl_pips, 1))
+            if ep is not None:
+                move    = (ep - pos.entry) * pos.d
+                pnl_pip = move / pos.pip
+                sl_pip  = abs(pos.entry - pos.sl) / pos.pip
+                pnl_usd = (pnl_pip / sl_pip * pos.risk_usd) if sl_pip > 0 else 0
+                # deduct cost (spread+slippage) proportional to risk
+                pnl_usd -= (cost / pos.pip) * (pos.risk_usd / max(sl_pip, 1))
                 equity  += pnl_usd
-                peak_eq  = max(peak_eq, equity)
-
+                peak     = max(peak, equity)
                 trades.append(dict(
-                    pair      = pair,
-                    direction = "long" if pos.direction == 1 else "short",
-                    open_time = pos.open_time,
-                    close_time= ts,
-                    open_px   = round(pos.open_price, 5),
-                    close_px  = round(exit_price, 5),
-                    sl_px     = round(pos.sl, 5),
-                    tp_px     = round(pos.tp, 5),
-                    pnl_usd   = round(pnl_usd, 2),
-                    result    = result,
-                    equity    = round(equity, 2),
+                    pair=pair, dir="long" if pos.d==1 else "short",
+                    open_time=pos.t0, close_time=ts,
+                    open_px=round(pos.entry,5), close_px=round(ep,5),
+                    sl=round(pos.sl,5), tp=round(pos.tp,5),
+                    pnl=round(pnl_usd,2), result=res,
+                    equity=round(equity,2),
                 ))
-                closed_now.append(pos)
+                closed.append(pos)
 
-        for p in closed_now:
-            open_pos.remove(p)
+        for p in closed:
+            positions.remove(p)
 
         eq_curve.append({"datetime": ts, "equity": equity})
 
-        # ── daily loss limit ──
-        daily_dd = (day_open_eq - equity) / day_open_eq
-        if daily_dd >= c["daily_dd_lim"]:
-            continue   # freeze for rest of day (handled by daily_dd check each bar)
-
-        # ── total drawdown kill ──
-        total_dd = (peak_eq - equity) / peak_eq
-        if total_dd >= c["max_dd_kill"]:
-            bot_killed = True
-            print(f"  [KILL] {pair} — max DD {total_dd:.1%} hit at {ts}")
+        # ── kill switch ──
+        if (peak - equity) / peak >= c["max_dd_kill"]:
+            print(f"  [KILL] {pair} max DD hit at {ts.date()}")
             break
 
-        # ── open new positions ──
-        if not in_session:
-            continue
-        if len(open_pos) >= c["max_open"]:
-            continue
-        if pd.isna(row.get("atr", np.nan)) or row["atr"] <= 0:
-            continue
+        # ── daily freeze ──
+        if not frozen and (day_eq - equity) / day_eq >= c["daily_dd_lim"]:
+            frozen = True
 
-        atr_val = row["atr"]
-
-        # Quality filter: ATR must be meaningfully larger than cost
-        if atr_val < CFG["min_atr_mult"] * cost:
+        if frozen:
             continue
 
-        sl_dist = atr_val * c["atr_sl_mult"]
-        tp_dist = sl_dist * c["rr"]
-        sl_pips = sl_dist / pip
-        if sl_pips < 1:
+        # ── session guard ──
+        if not (c["session_open"] <= ts.hour < c["session_close"]):
             continue
 
-        if row["entry_long"] and not any(p.direction == 1 for p in open_pos):
-            entry = bar_open + cost / 2   # worse fill (spread)
-            sl    = entry - sl_dist
-            tp    = entry + tp_dist
-            # risk_pct of current equity
-            size  = equity * c["risk_pct"]
-            open_pos.append(Position(pair, 1, entry, sl, tp, ts, size, pip))
+        # ── new entries ──
+        if len(positions) >= c["max_open"]:
+            continue
 
-        elif row["entry_short"] and not any(p.direction == -1 for p in open_pos):
-            entry = bar_open - cost / 2
-            sl    = entry + sl_dist
-            tp    = entry - tp_dist
-            size  = equity * c["risk_pct"]
-            open_pos.append(Position(pair, -1, entry, sl, tp, ts, size, pip))
+        atr_v = row.get("atr", 0)
+        if not (atr_v > 0) or pd.isna(atr_v):
+            continue
 
-    # Close any remaining positions at last bar close
-    last_close = df["close"].iloc[-1] if not df.empty else None
-    for pos in open_pos:
-        if last_close is not None:
-            price_move = (last_close - pos.open_price) * pos.direction
-            pnl_pips   = price_move / pos.pip
-            sl_pips    = abs(pos.open_price - pos.sl) / pos.pip
-            pnl_usd    = (pnl_pips / sl_pips * pos.size_usd) if sl_pips > 0 else 0
-            equity    += pnl_usd
-            trades.append(dict(
-                pair="...", direction="long" if pos.direction==1 else "short",
-                open_time=pos.open_time, close_time=df.index[-1],
-                open_px=round(pos.open_price,5), close_px=round(last_close,5),
-                sl_px=round(pos.sl,5), tp_px=round(pos.tp,5),
-                pnl_usd=round(pnl_usd,2), result="forced", equity=round(equity,2),
-            ))
+        # Quality gate: ATR must dwarf the transaction cost
+        if atr_v < cost * 2:
+            continue
+
+        sl_d = atr_v * c["atr_sl_mult"]
+        tp_d = sl_d  * c["rr"]
+        if sl_d / pip < 5:   # minimum 5-pip SL
+            continue
+
+        has_long  = any(p.d ==  1 for p in positions)
+        has_short = any(p.d == -1 for p in positions)
+
+        if row["sig_long"] and not has_long:
+            entry = o + cost / 2
+            positions.append(Pos(1, entry, entry-sl_d, entry+tp_d,
+                                 ts, equity*c["risk_pct"], pip))
+
+        elif row["sig_short"] and not has_short:
+            entry = o - cost / 2
+            positions.append(Pos(-1, entry, entry+sl_d, entry-tp_d,
+                                 ts, equity*c["risk_pct"], pip))
 
     return trades, eq_curve
 
@@ -383,317 +308,254 @@ def simulate(df: pd.DataFrame, pair: str) -> tuple[list, list]:
 # ─────────────────────────────────────────────────────────────
 #  METRICS
 # ─────────────────────────────────────────────────────────────
-def metrics(trades: list, eq_curve: list, label: str) -> dict:
+def calc_metrics(trades: list, eq_curve: list, label: str) -> dict:
     if not trades:
         return {"label": label, "trades": 0}
 
-    pnls  = [t["pnl_usd"] for t in trades]
-    wins  = [p for p in pnls if p > 0]
-    loss  = [p for p in pnls if p <= 0]
+    pnls = [t["pnl"] for t in trades]
+    wins = [p for p in pnls if p > 0]
+    loss = [p for p in pnls if p <= 0]
 
-    eq    = [e["equity"] for e in eq_curve]
-    eq_s  = pd.Series(eq)
-
-    peak  = eq_s.cummax()
-    dd    = (peak - eq_s) / peak * 100
+    eq_s  = pd.Series([e["equity"] for e in eq_curve])
+    dd    = (eq_s.cummax() - eq_s) / eq_s.cummax() * 100
     max_dd = dd.max()
 
-    gross_profit = sum(wins)
-    gross_loss   = abs(sum(loss))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    net   = sum(pnls)
+    gp    = sum(wins)
+    gl    = abs(sum(loss))
+    pf    = gp / gl if gl > 0 else float("inf")
 
-    net_pnl = sum(pnls)
-    ret_pct = net_pnl / CFG["initial_bal"] * 100
-
-    # Sharpe  (using monthly equity returns, annualised)
-    eq_df = pd.DataFrame(eq_curve).set_index("datetime")["equity"]
+    # Sharpe on monthly returns
+    eq_df   = pd.DataFrame(eq_curve).set_index("datetime")["equity"]
     monthly = eq_df.resample("ME").last().pct_change().dropna()
-    if len(monthly) >= 2 and monthly.std() > 0:
-        sharpe = (monthly.mean() / monthly.std()) * (12 ** 0.5)
-    else:
-        sharpe = 0.0
+    sharpe  = (monthly.mean() / monthly.std() * 12**0.5
+               if len(monthly) >= 3 and monthly.std() > 0 else 0.0)
 
-    # Calmar
-    calmar = (ret_pct / max_dd) if max_dd > 0 else 0.0
+    ret_pct = net / CFG["initial_bal"] * 100
+    calmar  = ret_pct / max_dd if max_dd > 0 else 0.0
 
-    # Consecutive losses
-    consec = max_consec_losses(pnls)
+    # consecutive losses
+    best = cur = 0
+    for p in pnls:
+        cur = cur + 1 if p <= 0 else 0
+        best = max(best, cur)
 
     return dict(
-        label         = label,
-        trades        = len(trades),
-        win_rate      = round(len(wins) / len(trades) * 100, 1),
-        net_pnl       = round(net_pnl, 2),
-        return_pct    = round(ret_pct, 2),
-        profit_factor = round(profit_factor, 2),
-        max_dd_pct    = round(max_dd, 2),
-        sharpe        = round(sharpe, 2),
-        calmar        = round(calmar, 2),
-        avg_win       = round(np.mean(wins), 2) if wins else 0,
-        avg_loss      = round(np.mean(loss), 2) if loss else 0,
-        gross_profit  = round(gross_profit, 2),
-        gross_loss    = round(gross_loss, 2),
-        max_consec_l  = consec,
-        tp_count      = sum(1 for t in trades if t.get("result") == "tp"),
-        sl_count      = sum(1 for t in trades if t.get("result") == "sl"),
-        eod_count     = sum(1 for t in trades if t.get("result") == "eod"),
+        label=label, trades=len(trades),
+        win_rate=round(len(wins)/len(trades)*100, 1),
+        net_pnl=round(net, 2), ret_pct=round(ret_pct, 2),
+        pf=round(pf, 2), max_dd=round(max_dd, 2),
+        sharpe=round(sharpe, 2), calmar=round(calmar, 2),
+        avg_win=round(np.mean(wins),2) if wins else 0,
+        avg_loss=round(np.mean(loss),2) if loss else 0,
+        tp_count=sum(1 for t in trades if t["result"]=="tp"),
+        sl_count=sum(1 for t in trades if t["result"]=="sl"),
+        eod_count=sum(1 for t in trades if t["result"]=="eod"),
+        max_consec_l=best,
     )
 
 
-def max_consec_losses(pnls: list) -> int:
-    best = cur = 0
-    for p in pnls:
-        if p <= 0:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 0
-    return best
-
-
 # ─────────────────────────────────────────────────────────────
-#  RESAMPLE M1 → H1
+#  REPORT
 # ─────────────────────────────────────────────────────────────
-def resample_h1(df: pd.DataFrame) -> pd.DataFrame:
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
-    h1  = df.resample("1h").agg(agg).dropna()
-    return h1
-
-
-# ─────────────────────────────────────────────────────────────
-#  REPORT WRITER
-# ─────────────────────────────────────────────────────────────
-def write_report(all_results: list, out_dir: Path):
+def write_report(results: list, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    lines = []
-    div   = "═" * 70
-
-    lines += [
+    div = "═" * 72
+    lines = [
         div,
-        "  PropBot Backtest Report",
-        f"  Generated : {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"  Strategy  : EMA{CFG['ema_fast']}/{CFG['ema_slow']} + RSI{CFG['rsi_period']} + ATR{CFG['atr_period']}",
-        f"  Risk/trade: {CFG['risk_pct']*100:.0f}%  |  RR: 1:{CFG['rr']}  |  SL mult: {CFG['atr_sl_mult']}×ATR",
-        f"  Session   : {CFG['session_open']}:00–{CFG['session_close']}:00 UTC",
-        f"  Split     : Train 2010-2019  |  OOS Test 2020-2025",
-        div, ""
+        "  PropBot Backtest Report  v1.1",
+        f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"  Strategy : EMA{CFG['ema_fast']}/{CFG['ema_slow']} + RSI{CFG['rsi_period']}"
+        f" + ATR{CFG['atr_period']}  |  TF: {CFG['timeframe'].upper()}",
+        f"  Risk     : {CFG['risk_pct']*100:.0f}%/trade  RR 1:{CFG['rr']}"
+        f"  SL {CFG['atr_sl_mult']}×ATR",
+        f"  Session  : {CFG['session_open']}:00–{CFG['session_close']}:00 UTC"
+        f"  |  DailyDD freeze: {CFG['daily_dd_lim']*100:.0f}%"
+        f"  |  MaxDD kill: {CFG['max_dd_kill']*100:.0f}%",
+        f"  Pairs    : {', '.join(TARGET_PAIRS)}",
+        div, "",
     ]
 
-    for section in ["TRAIN (2010-2019) — In-Sample", "OOS TEST (2020-2025) — Out-of-Sample"]:
-        tag = "train" if "TRAIN" in section else "oos"
-        lines += ["", f"  {'─'*60}", f"  {section}", f"  {'─'*60}"]
+    hdr = (f"  {'Pair':<8} {'Trades':>7} {'WinR':>6} {'NetPnL':>9}"
+           f" {'PF':>5} {'MaxDD':>7} {'Sharpe':>7} {'Calmar':>7}"
+           f" {'TP':>5} {'SL':>5}")
+    sep = "  " + "─" * 70
 
-        section_pnl = 0
-        section_trades = 0
-        pair_rows = []
-
-        for r in all_results:
-            m = r[tag]
+    for section, key in [
+        ("TRAIN  2010–2019  (in-sample)", "train"),
+        ("OOS    2020–2025  (out-of-sample — what counts)", "oos"),
+    ]:
+        lines += ["", f"  ┌── {section} {'─'*(54-len(section))}┐", hdr, sep]
+        total_pnl = total_trades = 0
+        for r in results:
+            m = r[key]
             if m.get("trades", 0) == 0:
+                lines.append(f"  {r['pair']:<8} {'no trades':>7}")
                 continue
-            section_pnl    += m["net_pnl"]
-            section_trades += m["trades"]
-            pair_rows.append(m)
-
-        header = f"  {'Pair':<10} {'Trades':>7} {'Win%':>6} {'NetPnL':>9} {'PF':>6} {'MaxDD':>7} {'Sharpe':>7} {'Calmar':>7}"
-        lines += ["", header, "  " + "─"*68]
-
-        for m in pair_rows:
-            dd_flag = " ⚠" if m["max_dd_pct"] > 6 else ""
+            flag = " ⚠" if m["max_dd"] > 6 else ""
             lines.append(
-                f"  {m['label']:<10} {m['trades']:>7} {m['win_rate']:>5.1f}%"
-                f" {m['net_pnl']:>+9.0f} {m['profit_factor']:>6.2f}"
-                f" {m['max_dd_pct']:>6.1f}% {m['sharpe']:>7.2f} {m['calmar']:>7.2f}{dd_flag}"
+                f"  {m['label']:<8} {m['trades']:>7} {m['win_rate']:>5.1f}%"
+                f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
+                f" {m['max_dd']:>6.1f}% {m['sharpe']:>7.2f} {m['calmar']:>7.2f}"
+                f" {m['tp_count']:>5} {m['sl_count']:>5}{flag}"
             )
+            total_pnl    += m["net_pnl"]
+            total_trades += m["trades"]
 
-        lines += [
-            "  " + "─"*68,
-            f"  {'COMBINED':<10} {section_trades:>7}   {'':>6} {section_pnl:>+9.0f}",
-        ]
+        lines += [sep,
+                  f"  {'TOTAL':<8} {total_trades:>7} {'':>6} {total_pnl:>+9.0f}",
+                  f"  └{'─'*70}┘"]
 
-    lines += ["", div, "  NOTES", div]
     lines += [
-        "  • OOS results are what matter for prop firm evaluation.",
-        "  • Max DD limits: 3% daily (auto-freeze), 7% total (kill-switch).",
-        "  • Spread + slippage deducted every trade (see SPREAD_PIPS config).",
-        "  • All signals use shift(1) — no lookahead bias.",
-        "  • ⚠  = drawdown exceeded 6% — review pair carefully.",
+        "", div, "  METHODOLOGY NOTES", div,
+        "  • H4 bars resampled from M1 — reduces noise vs H1.",
+        "  • Signal computed at bar-close; executed at NEXT bar-open (shift=1).",
+        "  • Spread + 0.5-pip slippage deducted every trade (both sides).",
+        "  • ATR must be ≥ 2× transaction cost — low-volatility bars skipped.",
+        "  • Pairs chosen for structural trend-following suitability only.",
+        "  • ⚠ = OOS max drawdown > 6% — caution before live use on that pair.",
         "",
     ]
 
-    report_path = out_dir / "report.txt"
-    report_path.write_text("\n".join(lines))
-    print("\n".join(lines))
+    txt = "\n".join(lines)
+    print(txt)
+    (out_dir / "report.txt").write_text(txt)
 
-    # ── per-pair trade logs (CSV) ──
-    for r in all_results:
-        pair  = r["pair"]
+    # per-pair trade CSVs
+    for r in results:
         all_t = r["trades_train"] + r["trades_oos"]
         if not all_t:
             continue
-        keys = list(all_t[0].keys())
-        with open(out_dir / f"trades_{pair}.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader()
-            w.writerows(all_t)
+        with open(out_dir / f"trades_{r['pair']}.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(all_t[0].keys()))
+            w.writeheader(); w.writerows(all_t)
 
-    # ── summary JSON (for CI artifact) ──
-    summary = []
-    for r in all_results:
-        summary.append({"pair": r["pair"], "train": r["train"], "oos": r["oos"]})
+    # summary JSON
+    summary = [{"pair": r["pair"], "train": r["train"], "oos": r["oos"]}
+               for r in results]
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    # ── equity CSV (combined) ──
-    all_eq_train, all_eq_oos = [], []
-    for r in all_results:
-        all_eq_train += r.get("eq_train", [])
-        all_eq_oos   += r.get("eq_oos",   [])
+    # equity CSVs
+    for r in results:
+        for tag, key in [("train", "eq_train"), ("oos", "eq_oos")]:
+            rows = r.get(key, [])
+            if not rows:
+                continue
+            with open(out_dir / f"equity_{r['pair']}_{tag}.csv", "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["datetime","equity"])
+                w.writeheader(); w.writerows(rows)
 
-    def save_equity(rows, path):
-        if not rows:
-            return
-        rows.sort(key=lambda x: x["datetime"])
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["datetime","equity"])
-            w.writeheader()
-            w.writerows(rows)
-
-    save_equity(all_eq_train, out_dir / "equity_train.csv")
-    save_equity(all_eq_oos,   out_dir / "equity_oos.csv")
-
-    # ── optional matplotlib chart ──
+    # optional chart
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
+        import matplotlib; matplotlib.use("Agg")
+        import matplotlib.pyplot as plt, matplotlib.dates as mdates
 
-        fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=False)
-        fig.suptitle("PropBot — Equity Curve", fontsize=14, fontweight="bold")
+        fig, axes = plt.subplots(len(results), 2,
+                                 figsize=(16, 4 * len(results)),
+                                 squeeze=False)
+        fig.suptitle("PropBot — Equity Curves per Pair", fontsize=13)
 
-        for ax, rows, title, color in [
-            (axes[0], all_eq_train, "Train 2010-2019", "#2563eb"),
-            (axes[1], all_eq_oos,   "OOS  2020-2025",  "#16a34a"),
-        ]:
-            if rows:
-                rows.sort(key=lambda x: x["datetime"])
-                dts = [r["datetime"] for r in rows]
-                eqs = [r["equity"]   for r in rows]
-                ax.plot(dts, eqs, color=color, linewidth=0.8)
-                ax.axhline(CFG["initial_bal"], color="#9ca3af", linewidth=0.5, linestyle="--")
-                ax.set_title(title)
-                ax.set_ylabel("Equity ($)")
+        for row_i, r in enumerate(results):
+            for col_i, (key, title, color) in enumerate([
+                ("eq_train", "Train 2010-2019", "#2563eb"),
+                ("eq_oos",   "OOS  2020-2025",  "#16a34a"),
+            ]):
+                ax  = axes[row_i][col_i]
+                eq  = r.get(key, [])
+                if eq:
+                    dts = [e["datetime"] for e in eq]
+                    eqs = [e["equity"]   for e in eq]
+                    ax.plot(dts, eqs, color=color, linewidth=0.7)
+                    ax.axhline(CFG["initial_bal"], color="#9ca3af",
+                               linewidth=0.5, linestyle="--")
+                ax.set_title(f"{r['pair']} — {title}", fontsize=9)
+                ax.set_ylabel("Equity ($)", fontsize=8)
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-                ax.grid(True, alpha=0.3)
+                ax.tick_params(labelsize=7)
+                ax.grid(True, alpha=0.25)
 
         plt.tight_layout()
-        plt.savefig(out_dir / "equity_curve.png", dpi=120, bbox_inches="tight")
+        plt.savefig(out_dir / "equity_curve.png", dpi=130, bbox_inches="tight")
         plt.close()
-        print(f"\n  [OK] Equity chart saved → {out_dir/'equity_curve.png'}")
+        print(f"\n  [OK] Chart → {out_dir / 'equity_curve.png'}")
     except ImportError:
-        print("  [INFO] matplotlib not installed — skipping chart")
+        print("  [INFO] matplotlib not found — chart skipped")
 
 
 # ─────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="PropBot Backtester")
-    parser.add_argument("--data-dir",  default=".",        help="Root dir with CSV/ZIP files")
-    parser.add_argument("--out-dir",   default="results",  help="Output directory")
-    parser.add_argument("--pairs",     default="",         help="Comma-separated pair filter (empty=all)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", default="data")
+    p.add_argument("--out-dir",  default="results")
+    args = p.parse_args()
 
     data_dir = Path(args.data_dir)
     out_dir  = Path(args.out_dir)
 
-    # auto-discover pairs
-    known_pairs = [
-        "EURUSD","GBPUSD","AUDUSD","NZDUSD",
-        "USDCAD","USDCHF","EURGBP","AUDNZD",
-        "XAUUSD","XAGUSD",
-    ]
-    if args.pairs:
-        pairs = [p.strip().upper() for p in args.pairs.split(",")]
-    else:
-        # detect from files
-        pairs = []
-        for p in known_pairs:
-            has_csv = bool(list(data_dir.glob(f"DAT_ASCII_{p}_M1_*.csv")))
-            has_zip = bool(list(data_dir.glob(f"HISTDATA_COM_ASCII_{p}_M1*.zip")))
-            if has_csv or has_zip:
-                pairs.append(p)
-        if not pairs:
-            pairs = known_pairs  # try all anyway
+    print(f"\n{'═'*52}")
+    print(f"  PropBot Backtester v1.1")
+    print(f"  Pairs    : {', '.join(TARGET_PAIRS)}")
+    print(f"  Data dir : {data_dir.resolve()}")
+    print(f"{'═'*52}\n")
 
-    if not pairs:
-        print("[ERROR] No data files found. Check --data-dir.")
-        sys.exit(1)
+    results = []
 
-    print(f"\n{'═'*50}")
-    print(f"  PropBot Backtester  |  pairs: {', '.join(pairs)}")
-    print(f"  Data dir: {data_dir.resolve()}")
-    print(f"{'═'*50}\n")
-
-    all_results = []
-
-    for pair in pairs:
-        pip_sz = PIP_SIZE.get(pair)
-        if pip_sz is None:
-            print(f"  [SKIP] {pair} — not in PIP_SIZE table")
-            continue
-
-        print(f"  Loading {pair}...", end=" ", flush=True)
+    for pair in TARGET_PAIRS:
+        print(f"  ── {pair} ──────────────────────────────")
+        print(f"     Loading...", end=" ", flush=True)
         raw = load_pair(data_dir, pair)
 
         if raw.empty:
-            print("no data found — skip")
+            print("NO DATA — check filename in /data folder")
             continue
+        print(f"{len(raw):,} M1 bars  "
+              f"({raw.index[0].date()} → {raw.index[-1].date()})")
 
-        print(f"{len(raw):,} M1 bars ({raw.index[0].date()} → {raw.index[-1].date()})")
+        # resample to configured timeframe
+        tf  = CFG["timeframe"]
+        agg = {"open":"first","high":"max","low":"min","close":"last"}
+        print(f"     Resampling to {tf.upper()}...", end=" ", flush=True)
+        bars = raw.resample(tf).agg(agg).dropna()
+        print(f"{len(bars):,} bars")
 
-        print(f"         Resampling to H1...", end=" ", flush=True)
-        h1 = resample_h1(raw)
-        print(f"{len(h1):,} H1 bars")
-
-        print(f"         Computing indicators...", end=" ", flush=True)
-        h1 = add_indicators(h1)
+        print(f"     Indicators...", end=" ", flush=True)
+        bars = add_indicators(bars)
         print("done")
 
-        train = h1[h1.index.normalize() <= TRAIN_END]
-        oos   = h1[h1.index.normalize() >= TEST_START]
+        train = bars[bars.index <= TRAIN_END]
+        oos   = bars[bars.index >= TEST_START]
+        print(f"     Train: {len(train):,}  |  OOS: {len(oos):,} bars")
 
-        print(f"         Train bars: {len(train):,}  |  OOS bars: {len(oos):,}")
+        print(f"     Simulating TRAIN...", end=" ", flush=True)
+        t_tr, eq_tr = simulate(train, pair)
+        m_tr = calc_metrics(t_tr, eq_tr, pair)
+        print(f"{m_tr.get('trades',0)} trades  "
+              f"WR={m_tr.get('win_rate',0):.1f}%  "
+              f"PnL={m_tr.get('net_pnl',0):+.0f}$")
 
-        print(f"         Simulating TRAIN...", end=" ", flush=True)
-        trades_train, eq_train = simulate(train, pair)
-        m_train = metrics(trades_train, eq_train, pair)
-        print(f"{m_train.get('trades',0)} trades  WR={m_train.get('win_rate',0):.1f}%")
-
-        print(f"         Simulating OOS...",   end=" ", flush=True)
-        trades_oos, eq_oos = simulate(oos, pair)
-        m_oos = metrics(trades_oos, eq_oos, pair)
-        print(f"{m_oos.get('trades',0)} trades  WR={m_oos.get('win_rate',0):.1f}%")
-
-        all_results.append(dict(
-            pair         = pair,
-            train        = m_train,
-            oos          = m_oos,
-            trades_train = trades_train,
-            trades_oos   = trades_oos,
-            eq_train     = eq_train,
-            eq_oos       = eq_oos,
-        ))
+        print(f"     Simulating OOS ...", end=" ", flush=True)
+        t_oo, eq_oo = simulate(oos, pair)
+        m_oo = calc_metrics(t_oo, eq_oo, pair)
+        print(f"{m_oo.get('trades',0)} trades  "
+              f"WR={m_oo.get('win_rate',0):.1f}%  "
+              f"PnL={m_oo.get('net_pnl',0):+.0f}$")
         print()
 
-    if not all_results:
-        print("[ERROR] No pairs processed. Check data directory and file names.")
+        results.append(dict(pair=pair,
+                            train=m_tr, oos=m_oo,
+                            trades_train=t_tr, trades_oos=t_oo,
+                            eq_train=eq_tr, eq_oos=eq_oo))
+
+    if not results:
+        print("[ERROR] No pairs processed.")
         sys.exit(1)
 
-    print("\nWriting report...")
-    write_report(all_results, out_dir)
-    print(f"\n  Results → {out_dir.resolve()}\n")
+    print("Writing report...\n")
+    write_report(results, out_dir)
+    print(f"\n  Done — results in: {out_dir.resolve()}\n")
 
 
 if __name__ == "__main__":
