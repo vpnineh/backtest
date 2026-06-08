@@ -716,4 +716,216 @@ def print_results(results: Dict, config: dict):
         ["Phase 1 Target (8%)", 
          "✅ PASSED" if return_pct >= 8 else f"❌ FAILED ({return_pct:.1f}%)"],
         ["Max DD < 10%", 
-         "✅ OK" if max_dd_pct < 10 else f"❌ 
+         "✅ OK" if max_dd_pct < 10 else f"❌ VIOLATED ({max_dd_pct:.1f}%)"],
+        ["Account Status", 
+         "❌ BLOWN" if results.get('blown') else "✅ ALIVE"],
+    ])
+    
+    print(tabulate(stats, headers=["Metric", "Value"], tablefmt="fancy_grid"))
+    
+    # Monthly breakdown
+    print(f"\n{'MONTHLY BREAKDOWN':^70}")
+    print("-" * 70)
+    
+    df_trades['month'] = pd.to_datetime(df_trades['exit_time']).dt.to_period('M')
+    monthly = df_trades.groupby('month').agg(
+        trades=('pnl', 'count'),
+        wins=('pnl', lambda x: (x > 0).sum()),
+        pnl=('pnl', 'sum'),
+        pips=('pnl_pips', 'sum')
+    ).reset_index()
+    
+    monthly['wr'] = (monthly['wins'] / monthly['trades'] * 100).round(0)
+    
+    rows = []
+    for _, m in monthly.iterrows():
+        rows.append([
+            str(m['month']), m['trades'], f"{m['wr']:.0f}%",
+            f"{m['pips']:+.0f}", f"${m['pnl']:+,.0f}"
+        ])
+    
+    print(tabulate(rows, 
+                   headers=["Month", "Trades", "WR%", "Pips", "P&L"],
+                   tablefmt="simple"))
+    
+    return df_trades
+
+
+def save_results(df_trades: pd.DataFrame, results: Dict, 
+                 config: dict):
+    """ذخیره نتایج"""
+    output_dir = config['output']['output_directory']
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save trades CSV
+    csv_path = os.path.join(output_dir, "trades.csv")
+    df_trades.to_csv(csv_path, index=False)
+    print(f"\n  💾 Trades saved: {csv_path}")
+    
+    # Equity Curve
+    initial = config['account']['initial_balance']
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10),
+                              gridspec_kw={'height_ratios': [3, 1]})
+    
+    balances = [initial] + list(df_trades['balance'])
+    times = [df_trades['entry_time'].iloc[0]] + list(df_trades['exit_time'])
+    times = pd.to_datetime(times)
+    
+    axes[0].plot(times, balances, color='#2196F3', linewidth=1.5)
+    axes[0].axhline(y=initial, color='gray', ls='--', alpha=0.5, 
+                     label='Initial')
+    axes[0].axhline(y=initial * 1.08, color='green', ls='--', alpha=0.5,
+                     label='Target 8%')
+    axes[0].axhline(y=initial * 0.90, color='red', ls='--', alpha=0.5,
+                     label='Max DD 10%')
+    axes[0].fill_between(times, initial * 0.90, min(balances) * 0.99,
+                          alpha=0.1, color='red')
+    axes[0].set_title('Equity Curve - Liquidity Sweep + SMC', 
+                       fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('Balance ($)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Drawdown
+    peak = np.maximum.accumulate(balances)
+    dd = (np.array(peak) - np.array(balances)) / np.array(peak) * 100
+    axes[1].fill_between(times, dd, color='red', alpha=0.4)
+    axes[1].set_ylabel('Drawdown %')
+    axes[1].set_xlabel('Date')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].invert_yaxis()
+    
+    plt.tight_layout()
+    eq_path = os.path.join(output_dir, "equity_curve.png")
+    plt.savefig(eq_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  📈 Equity curve: {eq_path}")
+    
+    # Monthly Heatmap
+    df_trades['exit_dt'] = pd.to_datetime(df_trades['exit_time'])
+    df_trades['year'] = df_trades['exit_dt'].dt.year
+    df_trades['month_num'] = df_trades['exit_dt'].dt.month
+    
+    pivot = df_trades.groupby(['year', 'month_num'])['pnl'].sum().reset_index()
+    pivot_table = pivot.pivot(index='year', columns='month_num', values='pnl')
+    pivot_table.columns = ['Jan','Feb','Mar','Apr','May','Jun',
+                            'Jul','Aug','Sep','Oct','Nov','Dec'][:len(pivot_table.columns)]
+    
+    fig, ax = plt.subplots(figsize=(14, max(3, len(pivot_table) * 1.2)))
+    sns.heatmap(pivot_table, annot=True, fmt='.0f', cmap='RdYlGn',
+                center=0, ax=ax, linewidths=1,
+                cbar_kws={'label': 'P&L ($)'})
+    ax.set_title('Monthly P&L Heatmap', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    hm_path = os.path.join(output_dir, "monthly_heatmap.png")
+    plt.savefig(hm_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  🗓️  Monthly heatmap: {hm_path}")
+    
+    # R-Distribution
+    fig, ax = plt.subplots(figsize=(12, 5))
+    colors = ['#4CAF50' if r > 0 else '#F44336' for r in df_trades['r_multiple']]
+    ax.bar(range(len(df_trades)), df_trades['r_multiple'], color=colors, 
+           alpha=0.7, width=1.0)
+    ax.axhline(y=0, color='black', lw=0.5)
+    ax.axhline(y=df_trades['r_multiple'].mean(), color='blue', ls='--',
+               label=f"Avg: {df_trades['r_multiple'].mean():.2f}R")
+    ax.set_title('R-Multiple per Trade', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Trade #')
+    ax.set_ylabel('R')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    r_path = os.path.join(output_dir, "r_distribution.png")
+    plt.savefig(r_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 R-distribution: {r_path}")
+
+
+# ============================
+# MAIN
+# ============================
+
+def main():
+    total_start = time_module.time()
+    
+    print("=" * 70)
+    print("  ⚡ FAST VECTORIZED BACKTEST ENGINE")
+    print("  Liquidity Sweep + Smart Money Concepts")
+    print("=" * 70)
+    
+    # Load config
+    with open("config.yml", 'r') as f:
+        config = yaml.safe_load(f)
+    
+    initial = config['account']['initial_balance']
+    print(f"\n  Balance: ${initial:,}")
+    print(f"  Risk/Trade: {config['risk']['risk_per_trade']*100}%")
+    print(f"  R:R: 1:{config['risk']['reward_to_risk']}")
+    
+    all_trades = []
+    final_balance = initial
+    
+    for symbol in config['data']['symbols']:
+        print(f"\n{'━'*70}")
+        print(f"  📊 {symbol}")
+        print(f"{'━'*70}")
+        
+        pip_size = {'EURUSD': 0.0001, 'GBPUSD': 0.0001, 
+                    'XAUUSD': 0.10}.get(symbol, 0.0001)
+        
+        # Load data
+        df_m1 = load_all_data(config['data']['directory'], symbol, 
+                               config['data']['years'])
+        if df_m1.empty:
+            continue
+        
+        # Build timeframes
+        print(f"\n  Building timeframes...")
+        t0 = time_module.time()
+        
+        cfg_s = config['strategy']
+        df_htf = resample(df_m1, cfg_s['htf_minutes'])
+        df_mtf = resample(df_m1, cfg_s['mtf_minutes'])
+        
+        print(f"    HTF ({cfg_s['htf_minutes']}min): {len(df_htf):,}")
+        print(f"    MTF ({cfg_s['mtf_minutes']}min): {len(df_mtf):,}")
+        print(f"    ({time_module.time()-t0:.1f}s)")
+        
+        # Daily levels
+        print(f"\n  Computing daily levels...")
+        daily_levels = compute_daily_levels(df_m1)
+        print(f"    {len(daily_levels)} days")
+        
+        # Generate signals
+        print(f"\n  Generating signals...")
+        signals = generate_signals(df_htf, df_mtf, df_m1, daily_levels,
+                                    config, pip_size)
+        
+        # Simulate trades
+        results = simulate_trades(df_mtf, signals, config, pip_size, symbol)
+        
+        if results['trades']:
+            all_trades.extend(results['trades'])
+            final_balance = results['balance']
+    
+    # Final report
+    if all_trades:
+        results_combined = {
+            'trades': all_trades,
+            'balance': final_balance,
+            'blown': any(t.get('blown', False) for t in [results])
+        }
+        
+        df_all = print_results(results_combined, config)
+        save_results(df_all, results_combined, config)
+    else:
+        print("\n  ❌ No trades across all symbols!")
+    
+    elapsed = time_module.time() - total_start
+    print(f"\n  ⏱️  Total runtime: {elapsed:.1f}s ({elapsed/60:.1f}min)")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    main()
