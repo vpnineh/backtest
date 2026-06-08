@@ -27,6 +27,7 @@ on:
       - backtest
     paths:
       - "backtest.py"
+
 jobs:
   backtest:
     name: Run PropBot Backtest
@@ -114,34 +115,29 @@ jobs:
       #        (comment out if you want CI to always pass)
       - name: Validate OOS results
         run: |
-          python - <<'EOF'
+          python - <<'PYVAL'
           import json, sys
           try:
-              with open("results/summary.json") as f:
-                  data = json.load(f)
-          except FileNotFoundError:
-              print("[WARN] summary.json not found — skipping validation")
-              sys.exit(0)
+              data = json.loads(open("results/summary.json").read())
+          except Exception as e:
+              print(f"[WARN] summary.json unreadable: {e}"); sys.exit(0)
 
           issues = []
-          for pair_data in data:
-              oos = pair_data.get("oos", {})
-              pair = pair_data.get("pair", "?")
-              dd = oos.get("max_dd_pct", 0)
-              pf = oos.get("profit_factor", 0)
-              trades = oos.get("trades", 0)
-
-              if trades > 20 and dd > 7:
-                  issues.append(f"  ⚠  {pair}: OOS Max DD = {dd:.1f}% (exceeds 7% prop limit)")
-              if trades > 20 and pf < 0.8:
-                  issues.append(f"  ⚠  {pair}: OOS Profit Factor = {pf:.2f} (very low)")
+          for strat, entries in data.items():
+              for e in entries:
+                  if e.get("period") != "oos": continue
+                  pair, pf, dd, tr = e["pair"], e.get("pf",0), e.get("max_dd",0), e.get("trades",0)
+                  if tr > 10 and pf < 1.0:
+                      issues.append(f"  ✗ {strat} {pair}: OOS PF={pf:.2f} (losing strategy)")
+                  if tr > 10 and dd > 6.5:
+                      issues.append(f"  ⚠ {strat} {pair}: OOS MaxDD={dd:.1f}% (near prop limit)")
 
           if issues:
-              print("\n[WARNING] The following pairs have concerning OOS metrics:")
-              for i in issues:
-                  print(i)
-              print("\n  → Review strategy before live deployment.")
-              # sys.exit(1)  # uncomment to FAIL the CI job on poor results
+              print("
+[WARNING] Issues found:")
+              for i in issues: print(i)
+              print("
+  → Review before live deployment.")
           else:
-              print("[OK] All pairs passed OOS validation checks.")
-          EOF
+              print("[OK] All OOS checks passed.")
+          PYVAL
