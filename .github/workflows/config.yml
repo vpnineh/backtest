@@ -1,0 +1,84 @@
+# ============================
+# BACKTEST CONFIGURATION
+# ============================
+
+# --- Data Settings ---
+data:
+  directory: "./data"
+  symbols:
+    - "EURUSD"
+    - "GBPUSD"
+  years:
+    - 2020
+    - 2021
+    - 2022
+    - 2023
+    - 2024
+    - 2025
+  file_pattern: "DAT_ASCII_{symbol}_M1_{year}.csv"
+
+# --- Account Settings (Prop Firm Simulation) ---
+account:
+  initial_balance: 100000        # سرمایه اولیه (مثلا ۱۰۰ هزار دلار)
+  currency: "USD"
+  leverage: 100
+
+# --- Prop Firm Rules ---
+prop_rules:
+  profit_target_phase1: 0.08     # هدف سود فاز ۱: ۸٪
+  profit_target_phase2: 0.05     # هدف سود فاز ۲: ۵٪
+  max_daily_drawdown: 0.05       # حداکثر دراداون روزانه: ۵٪
+  max_total_drawdown: 0.10       # حداکثر دراداون کل: ۱۰٪
+  min_trading_days: 5            # حداقل روز معاملاتی
+
+# --- Risk Management ---
+risk:
+  risk_per_trade: 0.005          # ریسک هر معامله: ۰.۵٪
+  max_daily_loss: 0.02           # حداکثر ضرر روزانه: ۲٪ (self-imposed)
+  max_concurrent_trades: 2       # حداکثر معاملات همزمان
+  reward_to_risk: 3.0            # نسبت سود به ریسک: ۱:۳
+
+# --- Strategy Parameters ---
+strategy:
+  # تایم‌فریم‌های ساخت کندل از M1
+  htf_minutes: 60                # تایم‌فریم بالا: ۱ ساعته (برای ساختار)
+  mtf_minutes: 15                # تایم‌فریم میانی: ۱۵ دقیقه (برای تاییدیه)
+  ltf_minutes: 5                 # تایم‌فریم پایین: ۵ دقیقه (برای ورود)
+
+  # Liquidity Sweep Parameters
+  swing_lookback: 20             # تعداد کندل‌ها برای شناسایی سویینگ
+  sweep_threshold_pips: 2        # حداقل نفوذ به پشت سطح (پیپ)
+  sweep_max_candles: 3           # حداکثر کندل برای بازگشت بعد از sweep
+
+  # Market Structure
+  structure_lookback: 50         # تعداد کندل برای تشخیص ساختار
+  bos_min_pips: 5                # حداقل حرکت برای BOS
+
+  # FVG (Fair Value Gap)
+  fvg_min_size_pips: 1           # حداقل سایز FVG (پیپ)
+
+  # Session Filter (UTC hours)
+  london_start: 7                # شروع سشن لندن
+  london_end: 12                 # پایان سشن لندن
+  newyork_start: 12              # شروع سشن نیویورک
+  newyork_end: 17                # پایان سشن نیویورک
+  trade_sessions: true           # فقط در سشن‌ها معامله شود
+
+  # SL/TP
+  sl_buffer_pips: 2              # بافر استاپ‌لاس (پشت سویینگ)
+  use_trailing_stop: false       # تریلینگ استاپ
+  breakeven_at_1r: true          # بردن SL به ورود بعد از ۱R سود
+
+# --- Execution ---
+execution:
+  spread_pips: 1.5               # اسپرد شبیه‌سازی
+  slippage_pips: 0.5             # اسلیپیج شبیه‌سازی
+  commission_per_lot: 7.0        # کمیسیون هر لات (رفت و برگشت)
+
+# --- Output ---
+output:
+  save_trades: true
+  save_equity_curve: true
+  save_charts: true
+  output_directory: "./results"
+  detailed_log: true
