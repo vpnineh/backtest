@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: 'Symbol (EURUSD, GBPUSD, XAUUSD, ...)'
+        description: 'Symbol'
         required: false
         default: 'EURUSD'
         type: choice
@@ -52,89 +52,42 @@ jobs:
 
     steps:
 
-      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python setup ────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      # ── 3. Install dependencies ────────────────────────────────────────────
       - name: Install dependencies
+        run: pip install numpy pandas matplotlib
+
+      - name: Create output directory
+        run: mkdir -p backtest_results
+
+      - name: Show available data files
         run: |
-          python -m pip install --upgrade pip
-          pip install numpy pandas matplotlib
+          echo "=== data/ ==="
+          ls -lh data/
 
-      # ── 4. Create required directories ────────────────────────────────────
-      - name: Create directories
-        run: |
-          mkdir -p backtest_results
-          mkdir -p data
-
-      # ── 5. Check data files ────────────────────────────────────────────────
-      - name: Check data files
-        run: |
-          echo "=== Files in data/ ==="
-          ls -lh data/ || echo "data/ is empty"
-          echo ""
-          echo "Expected format:"
-          echo "  DAT_ASCII_EURUSD_M1_2020.csv"
-          echo "  HISTDATA_COM_ASCII_EURUSD_M12020.zip"
-
-      # ── 6. Build CLI arguments ─────────────────────────────────────────────
-      - name: Build run arguments
-        id: args
-        run: |
-          ARGS="--symbol ${{ inputs.symbol }} --timeframe ${{ inputs.timeframe }}"
-
-          if [ "${{ inputs.run_all_symbols }}" = "true" ]; then
-            ARGS="$ARGS --all"
-          fi
-
-          if [ "${{ inputs.walk_forward }}" = "true" ]; then
-            ARGS="$ARGS --wf"
-          fi
-
-          echo "args=$ARGS" >> $GITHUB_OUTPUT
-          echo "Built args: $ARGS"
-
-      # ── 7. Run backtest ────────────────────────────────────────────────────
       - name: Run backtest
         run: |
-          echo "Starting backtest..."
-          echo "Symbol    : ${{ inputs.symbol }}"
-          echo "Timeframe : ${{ inputs.timeframe }}"
-          echo "All Syms  : ${{ inputs.run_all_symbols }}"
-          echo "Walk-Fwd  : ${{ inputs.walk_forward }}"
-          echo "──────────────────────────────────────"
-          python main.py ${{ steps.args.outputs.args }}
+          ARGS="--symbol ${{ inputs.symbol }} --timeframe ${{ inputs.timeframe }}"
+          [ "${{ inputs.run_all_symbols }}" = "true" ] && ARGS="$ARGS --all"
+          [ "${{ inputs.walk_forward }}"   = "true" ] && ARGS="$ARGS --wf"
+          echo "Running: python backtest.py $ARGS"
+          python backtest.py $ARGS
 
-      # ── 8. Show log tail ───────────────────────────────────────────────────
-      - name: Show backtest log
+      - name: Show log
         if: always()
-        run: |
-          echo "=== backtest.log (last 80 lines) ==="
-          tail -n 80 backtest_results/backtest.log || echo "No log file found"
+        run: cat backtest_results/backtest.log || echo "no log"
 
-      # ── 9. Show result files ───────────────────────────────────────────────
-      - name: List result files
-        if: always()
-        run: |
-          echo "=== backtest_results/ ==="
-          ls -lh backtest_results/
-
-      # ── 10. Upload all artifacts ───────────────────────────────────────────
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results-${{ inputs.symbol }}-${{ inputs.timeframe }}-${{ github.run_number }}
-          path: |
-            backtest_results/*.png
-            backtest_results/*.csv
-            backtest_results/*.log
+          name: backtest-${{ inputs.symbol }}-${{ inputs.timeframe }}-run${{ github.run_number }}
+          path: backtest_results/
+          if-no-files-found: warn
           retention-days: 30
