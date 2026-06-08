@@ -1,355 +1,719 @@
-#!/usr/bin/env python3
 """
-PropBot Backtester v10.2 — The Gold Momentum Scalper (High-Frequency)
-══════════════════════════════════════════════════════════════════
-Strategy : Micro-Pullback Breakout on Steep Momentum
-Asset    : XAUUSD (Gold)
-Timeframe: M5 (5-Minute)
-Costs    : Realistic Gold Spread (15 pips) + Slippage
-Logic    : Relaxed Momentum Filter -> Pullback -> Pending Order
-══════════════════════════════════════════════════════════════════
+=============================================================================
+  FAST VECTORIZED BACKTEST ENGINE
+  Liquidity Sweep + SMC Strategy
+  
+  بهینه‌سازی‌ها:
+  - تمام محاسبات با NumPy vectorized
+  - Pre-compute همه سطوح، سویینگ‌ها، FVG و سیگنال‌ها
+  - لوپ فقط روی سیگنال‌ها (نه همه کندل‌ها)
+  - اجرا: چند ثانیه به جای چند ساعت
+=============================================================================
 """
 
-import sys, zipfile, io, csv, json, argparse
-from pathlib import Path
-from datetime import datetime
-import numpy as np
 import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import yaml
+import os
+import time as time_module
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple
+from tabulate import tabulate
 import warnings
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────
-#  ACCOUNT & GOLD COSTS
-# ─────────────────────────────────────────────────────────────
-ACCOUNT = dict(
-    initial_bal  = 5_000.0,
-    risk_pct     = 0.005,
-    max_open     = 1,
-    daily_dd_lim = 0.03,
-    max_dd_kill  = 0.07,
-)
+# ============================
+# DATA LOADER (Fast)
+# ============================
 
-SPREAD_PIPS = dict(XAUUSD=15.0)   
-COMMISSION_PIP = 6.0              
-SLIPPAGE_PIP = 5.0                
-PIP_SIZE = dict(XAUUSD=0.01)
+def load_histdata(filepath: str) -> pd.DataFrame:
+    """بارگذاری سریع CSV"""
+    try:
+        df = pd.read_csv(filepath, sep=';', header=None,
+                         names=['DateTime','Open','High','Low','Close','Volume'])
+        df['DateTime'] = df['DateTime'].str.strip()
+        
+        # Try common formats
+        for fmt in ['%Y%m%d %H%M%S', '%Y.%m.%d %H:%M', '%m/%d/%Y %H:%M']:
+            try:
+                df['DateTime'] = pd.to_datetime(df['DateTime'], format=fmt)
+                break
+            except:
+                continue
+        else:
+            df['DateTime'] = pd.to_datetime(df['DateTime'], 
+                                             format='mixed', dayfirst=False)
+        
+        df.set_index('DateTime', inplace=True)
+        df.sort_index(inplace=True)
+        df = df[~df.index.duplicated(keep='first')]
+        df = df[df.index.dayofweek < 5]  # Remove weekends
+        return df[['Open','High','Low','Close','Volume']].dropna()
+    except Exception as e:
+        print(f"  [ERROR] {filepath}: {e}")
+        return pd.DataFrame()
 
-TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
-TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
-# ─────────────────────────────────────────────────────────────
-#  STRATEGY PARAMS
-# ─────────────────────────────────────────────────────────────
-GOLD_CFG = dict(
-    pairs         = ["XAUUSD"],
-    session_open  = 7,        
-    session_close = 21,       
-    force_close   = 22,       
-    ema_fast      = 9,
-    ema_slow      = 20,
-    momentum_atr  = 0.1,      # 🔴 کاهش شدید فیلتر: اجازه نفس کشیدن به استراتژی 🔴
-    buffer_pip    = 3.0,      # بافر کمتر برای فعال شدن سریع‌تر
-    rr            = 1.0,      
-)
-
-# ─────────────────────────────────────────────────────────────
-#  DATA LOADING
-# ─────────────────────────────────────────────────────────────
-def _detect_sep(raw: bytes) -> str:
-    s = raw[:400].decode("utf-8", errors="replace")
-    return ";" if s.count(";") > s.count(",") else ","
-
-def _parse(raw: bytes) -> pd.DataFrame:
-    sep = _detect_sep(raw)
-    df = pd.read_csv(
-        io.BytesIO(raw), sep=sep, header=None,
-        names=["dt","open","high","low","close","vol"],
-        dtype={"open":float,"high":float,"low":float,"close":float,"vol":float},
-        on_bad_lines="skip",
-    )
-    df["datetime"] = pd.to_datetime(
-        df["dt"].astype(str).str.strip(),
-        format="%Y%m%d %H%M%S", utc=True, errors="coerce",
-    )
-    return (df.dropna(subset=["datetime"])
-              .drop(columns=["dt","vol"])
-              .set_index("datetime")
-              .sort_index())
-
-def load_pair(data_dir: Path, pair: str) -> pd.DataFrame:
+def load_all_data(data_dir: str, symbol: str, years: list) -> pd.DataFrame:
+    """بارگذاری همه سال‌ها"""
     frames = []
-    for f in sorted(data_dir.glob(f"DAT_ASCII_{pair}_M1_*.csv")):
-        try: frames.append(_parse(f.read_bytes()))
-        except Exception: pass
-    for f in sorted(data_dir.glob(f"HISTDATA_COM_ASCII_{pair}_M1*.zip")):
-        try:
-            with zipfile.ZipFile(f) as z:
-                inner = [n for n in z.namelist() if n.lower().endswith(".csv")]
-                if inner: frames.append(_parse(z.read(inner[0])))
-        except Exception: pass
-    if not frames: return pd.DataFrame()
-    df = pd.concat(frames).sort_index()
-    df = df[~df.index.duplicated(keep="first")]
-    df = df[(df[["open","high","low","close"]] > 0).all(axis=1)]
-    return df
-
-def resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    agg = {"open":"first","high":"max","low":"min","close":"last"}
-    return df.resample(tf).agg(agg).dropna()
-
-# ─────────────────────────────────────────────────────────────
-#  INDICATORS
-# ─────────────────────────────────────────────────────────────
-def atr(h, l, c, n):
-    tr = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    return tr.ewm(com=n-1, adjust=False).mean()
-
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-
-# ─────────────────────────────────────────────────────────────
-#  PENDING ORDER TRADE ENGINE
-# ─────────────────────────────────────────────────────────────
-def get_trade_cost(pair: str) -> float:
-    pip = PIP_SIZE[pair]
-    spread = SPREAD_PIPS.get(pair, 15.0)
-    return (spread + COMMISSION_PIP + SLIPPAGE_PIP * 2) * pip
-
-class Pos:
-    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk"]
-    def __init__(self, d, entry, sl, tp, t0, risk_usd, pip, c_cost):
-        self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
-        self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
-        self.c_cost = c_cost
-        self.initial_risk = abs(entry - sl)
-
-def _close_pos(pos, ep, ts, pair):
-    move    = (ep - pos.entry) * pos.d
-    pnl_pip = move / pos.pip
-    sl_pip  = abs(pos.entry - pos.sl) / pos.pip
-    if sl_pip < 1e-5: return 0.0
-    initial_sl_pip = pos.initial_risk / pos.pip
-    pnl_usd = pnl_pip / initial_sl_pip * pos.risk_usd
-    pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / initial_sl_pip)
-    return pnl_usd
-
-def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_hour: int) -> tuple:
-    pip      = PIP_SIZE[pair]
-    acct     = ACCOUNT
-    equity   = acct["initial_bal"]
-    peak     = equity
-    positions: list[Pos] = []
-    trades   : list[dict] = []
-    eq_curve : list[dict] = []
-
-    day_eq, last_day, frozen, killed = equity, None, False, False
-
-    for ts in bars.index:
-        if killed: break
-        row = bars.loc[ts]
-        sig = signals.loc[ts] if ts in signals.index else None
-
-        d = ts.date()
-        if d != last_day: day_eq, last_day, frozen = equity, d, False
-
-        o, h, l = row["open"], row["high"], row["low"]
-
-        closed = []
-        for pos in positions:
-            ep = res = None
-            force_exit = (sig is not None and ts.hour >= force_close_hour and force_close_hour < 23)
-
-            if pos.d == 1:
-                if l <= pos.sl: ep, res = pos.sl, "sl"
-                elif h >= pos.tp: ep, res = pos.tp, "tp"
+    for year in years:
+        fp = os.path.join(data_dir, f"DAT_ASCII_{symbol}_M1_{year}.csv")
+        if os.path.exists(fp):
+            print(f"  Loading {year}...", end=" ")
+            df = load_histdata(fp)
+            if not df.empty:
+                print(f"{len(df):,} rows")
+                frames.append(df)
             else:
-                if h >= pos.sl: ep, res = pos.sl, "sl"
-                elif l <= pos.tp: ep, res = pos.tp, "tp"
-
-            if res is None and force_exit: ep, res = o, "eod"
-
-            if ep is not None:
-                pnl = _close_pos(pos, ep, ts, pair)
-                equity += pnl; peak = max(peak, equity)
-                trades.append(dict(
-                    pair=pair, dir="long" if pos.d==1 else "short",
-                    open_time=str(pos.t0), close_time=str(ts),
-                    open_px=round(pos.entry,2), close_px=round(ep,2),
-                    sl=round(pos.sl,2), tp=round(pos.tp,2),
-                    pnl=round(pnl,2), result=res, equity=round(equity,2),
-                ))
-                closed.append(pos)
-                
-        for p in closed: positions.remove(p)
-        eq_curve.append({"datetime": ts, "equity": equity})
-
-        if (peak - equity) / peak >= acct["max_dd_kill"]:
-            killed = True; break
-        if not frozen and (day_eq - equity) / max(day_eq,1) >= acct["daily_dd_lim"]:
-            frozen = True
-        if frozen or sig is None: continue
-        if len(positions) >= acct["max_open"]: continue
-
-        has_long  = any(p.d== 1 for p in positions)
-        has_short = any(p.d==-1 for p in positions)
-        risk_usd  = equity * acct["risk_pct"]
-        c_cost    = get_trade_cost(pair)
-
-        if sig.get("sig_long") and not has_long:
-            buy_stop = sig["entry_l"]
-            if h >= buy_stop:
-                entry = max(o, buy_stop) + (c_cost / 2)
-                sl = sig["force_sl_l"]
-                tp = entry + (entry - sl) * GOLD_CFG["rr"]  
-                
-                # جلوگیری از اردرهای مایکرو که توسط اسپرد بلعیده می‌شوند
-                if abs(entry - sl) / pip > 15: 
-                    positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
-
-        elif sig.get("sig_short") and not has_short:
-            sell_stop = sig["entry_s"]
-            if l <= sell_stop:
-                entry = min(o, sell_stop) - (c_cost / 2)
-                sl = sig["force_sl_s"]
-                tp = entry - (sl - entry) * GOLD_CFG["rr"]
-                
-                if abs(entry - sl) / pip > 15:
-                    positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
-
-    return trades, eq_curve
-
-# ─────────────────────────────────────────────────────────────
-#  STRATEGY — THE GOLD MOMENTUM SCALPER (M5) - HIGH FREQUENCY
-# ─────────────────────────────────────────────────────────────
-def strategy_gold_momentum(m1: pd.DataFrame, pair: str) -> tuple:
-    cfg = GOLD_CFG; pip = PIP_SIZE[pair]
+                print("empty")
+        else:
+            print(f"  {year} not found, skipping")
     
-    bars = resample(m1, "5min")
-    bars["atr"] = atr(bars["high"], bars["low"], bars["close"], 14)
-    bars["ema_fast"] = ema(bars["close"], cfg["ema_fast"])
-    bars["ema_slow"] = ema(bars["close"], cfg["ema_slow"])
-    
-    in_session = (bars.index.hour >= cfg["session_open"]) & (bars.index.hour < cfg["session_close"])
-    
-    # 1. تعریف شیب تند (Relaxed Momentum)
-    min_dist = bars["atr"] * cfg["momentum_atr"]
-    
-    # اضافه شدن شرطِ: EMA سریع در 3 کندل اخیر صعودی بوده باشد (برای تایید مومنتوم)
-    ema_bull_trend = (bars["ema_fast"] > bars["ema_fast"].shift(1)) & (bars["ema_fast"].shift(1) > bars["ema_fast"].shift(2))
-    ema_bear_trend = (bars["ema_fast"] < bars["ema_fast"].shift(1)) & (bars["ema_fast"].shift(1) < bars["ema_fast"].shift(2))
+    if frames:
+        combined = pd.concat(frames).sort_index()
+        combined = combined[~combined.index.duplicated(keep='first')]
+        print(f"  Total: {len(combined):,} M1 candles")
+        return combined
+    return pd.DataFrame()
 
-    steep_bull = (bars["ema_fast"] > bars["ema_slow"]) & ((bars["ema_fast"] - bars["ema_slow"]) > min_dist) & ema_bull_trend
-    steep_bear = (bars["ema_fast"] < bars["ema_slow"]) & ((bars["ema_slow"] - bars["ema_fast"]) > min_dist) & ema_bear_trend
-    
-    # 2. پیدا کردن اولین کندل اصلاحی
-    # 🔴 اصلاح: هر کندلی که Low آن کوچکتر یا مساوی کندل قبلی باشد یک پولبک محسوب می‌شود
-    pullback_bull = steep_bull.shift(1) & (bars["low"] <= bars["low"].shift(1))
-    pullback_bear = steep_bear.shift(1) & (bars["high"] >= bars["high"].shift(1))
-    
-    # اطمینان از اینکه کندل فعلی هنوز در جهت روند بسته شده یا حداقل خیلی خلاف آن نرفته است
-    first_pullback_bull = pullback_bull & in_session & (bars["close"] > bars["ema_slow"])
-    first_pullback_bear = pullback_bear & in_session & (bars["close"] < bars["ema_slow"])
-    
-    # 3. مقادیر سفارشات پندینگ
-    buf = cfg["buffer_pip"] * pip
-    bars["entry_l"] = bars["high"] + buf
-    bars["force_sl_l"] = bars["low"] - buf
-    
-    bars["entry_s"] = bars["low"] - buf
-    bars["force_sl_s"] = bars["high"] + buf
 
-    sigs = pd.DataFrame(index=bars.index)
-    sigs["sig_long"]  = first_pullback_bull.shift(1).fillna(False)
-    sigs["sig_short"] = first_pullback_bear.shift(1).fillna(False)
+def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Resample سریع"""
+    rule = f'{minutes}min'
+    return df.resample(rule).agg({
+        'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'
+    }).dropna()
+
+
+# ============================
+# VECTORIZED INDICATORS
+# ============================
+
+def find_swing_highs_vec(highs: np.ndarray, lookback: int = 10) -> np.ndarray:
+    """شناسایی Vectorized سویینگ‌ها - برمی‌گرداند boolean array"""
+    n = len(highs)
+    is_swing = np.zeros(n, dtype=bool)
+    half = lookback // 2
     
-    sigs["entry_l"] = bars["entry_l"].shift(1)
-    sigs["force_sl_l"] = bars["force_sl_l"].shift(1)
+    for i in range(half, n - half):
+        window = highs[i-half:i+half+1]
+        if highs[i] == window.max() and np.sum(window == highs[i]) == 1:
+            is_swing[i] = True
+    return is_swing
+
+
+def find_swing_lows_vec(lows: np.ndarray, lookback: int = 10) -> np.ndarray:
+    n = len(lows)
+    is_swing = np.zeros(n, dtype=bool)
+    half = lookback // 2
     
-    sigs["entry_s"] = bars["entry_s"].shift(1)
-    sigs["force_sl_s"] = bars["force_sl_s"].shift(1)
+    for i in range(half, n - half):
+        window = lows[i-half:i+half+1]
+        if lows[i] == window.min() and np.sum(window == lows[i]) == 1:
+            is_swing[i] = True
+    return is_swing
 
-    b_tr = bars[bars.index <= TRAIN_END]; b_oo = bars[bars.index >= TEST_START]
-    s_tr = sigs[sigs.index <= TRAIN_END]; s_oo = sigs[sigs.index >= TEST_START]
 
-    return run_sim_pending(b_tr, pair, s_tr, cfg["force_close"]) + run_sim_pending(b_oo, pair, s_oo, cfg["force_close"])
+def compute_daily_levels(df_m1: pd.DataFrame) -> pd.DataFrame:
+    """محاسبه PDH/PDL برای هر روز - Vectorized"""
+    daily = df_m1.resample('1D').agg({'High':'max','Low':'min'}).dropna()
+    daily.columns = ['DayHigh','DayLow']
+    
+    # Shift by 1 day = Previous Day High/Low
+    daily['PDH'] = daily['DayHigh'].shift(1)
+    daily['PDL'] = daily['DayLow'].shift(1)
+    daily.dropna(inplace=True)
+    return daily[['PDH','PDL']]
 
-# ─────────────────────────────────────────────────────────────
-#  METRICS & REPORTING
-# ─────────────────────────────────────────────────────────────
-def metrics(trades, eq_curve, label):
-    if not trades:
-        return dict(label=label, trades=0, net_pnl=0, win_rate=0, pf=0, max_dd=0,
-                    tp_count=0, sl_count=0, eod_count=0)
-    pnls = [t["pnl"] for t in trades]
-    wins = [p for p in pnls if p > 0]; loss = [p for p in pnls if p <= 0]
-    eqs  = pd.Series([e["equity"] for e in eq_curve])
-    dd   = (eqs.cummax() - eqs) / eqs.cummax() * 100
-    net  = sum(pnls)
-    gp   = sum(wins); gl = abs(sum(loss))
-    pf   = gp/gl if gl>0 else float("inf")
 
-    return dict(
-        label=label, trades=len(trades), win_rate=round(len(wins)/len(trades)*100,1),
-        net_pnl=round(net,2), pf=round(pf,2), max_dd=round(dd.max(),2),
-        tp_count=sum(1 for t in trades if t["result"]=="tp"),
-        sl_count=sum(1 for t in trades if t["result"]=="sl"),
-        eod_count=sum(1 for t in trades if t["result"]=="eod")
+def detect_fvg_vectorized(open_arr, high_arr, low_arr, close_arr, 
+                           min_gap: float) -> Tuple[np.ndarray, np.ndarray,
+                                                      np.ndarray, np.ndarray]:
+    """
+    Vectorized FVG detection
+    Returns: bullish_fvg_mask, bearish_fvg_mask, fvg_top, fvg_bottom
+    """
+    n = len(open_arr)
+    bull_fvg = np.zeros(n, dtype=bool)
+    bear_fvg = np.zeros(n, dtype=bool)
+    fvg_top = np.zeros(n)
+    fvg_bot = np.zeros(n)
+    
+    # Bullish FVG: candle[i] low > candle[i-2] high
+    if n > 2:
+        gap_bull = low_arr[2:] - high_arr[:-2]
+        mask_bull = gap_bull >= min_gap
+        bull_fvg[2:] = mask_bull
+        fvg_top[2:] = np.where(mask_bull, low_arr[2:], 0)
+        fvg_bot[2:] = np.where(mask_bull, high_arr[:-2], 0)
+        
+        # Bearish FVG: candle[i-2] low > candle[i] high
+        gap_bear = low_arr[:-2] - high_arr[2:]
+        mask_bear = gap_bear >= min_gap
+        bear_fvg[2:] = mask_bear
+        # For bearish: top = candle[i-2] low, bottom = candle[i] high
+        fvg_top[2:] = np.where(mask_bear, low_arr[:-2], fvg_top[2:])
+        fvg_bot[2:] = np.where(mask_bear, high_arr[2:], fvg_bot[2:])
+    
+    return bull_fvg, bear_fvg, fvg_top, fvg_bot
+
+
+# ============================
+# SIGNAL GENERATOR (Vectorized pre-compute)
+# ============================
+
+def generate_signals(df_htf: pd.DataFrame, df_mtf: pd.DataFrame,
+                     df_m1: pd.DataFrame, daily_levels: pd.DataFrame,
+                     config: dict, pip_size: float) -> pd.DataFrame:
+    """
+    تولید سیگنال‌ها بصورت Vectorized
+    خروجی: DataFrame با ستون‌های signal, direction, entry, sl, tp
+    """
+    cfg = config['strategy']
+    rr = config['risk']['reward_to_risk']
+    sl_buffer = cfg['sl_buffer_pips'] * pip_size
+    sweep_thresh = cfg['sweep_threshold_pips'] * pip_size
+    
+    print("  [1/5] Computing swing points...")
+    t0 = time_module.time()
+    
+    # Swing points on HTF
+    htf_swing_highs = find_swing_highs_vec(df_htf['High'].values, 
+                                            cfg['swing_lookback'])
+    htf_swing_lows = find_swing_lows_vec(df_htf['Low'].values, 
+                                          cfg['swing_lookback'])
+    
+    # Get swing prices
+    swing_high_prices = df_htf['High'].values.copy()
+    swing_high_prices[~htf_swing_highs] = np.nan
+    
+    swing_low_prices = df_htf['Low'].values.copy()
+    swing_low_prices[~htf_swing_lows] = np.nan
+    
+    print(f"      Swing Highs: {htf_swing_highs.sum()}, "
+          f"Swing Lows: {htf_swing_lows.sum()} "
+          f"({time_module.time()-t0:.1f}s)")
+    
+    print("  [2/5] Computing FVGs on MTF...")
+    t0 = time_module.time()
+    
+    bull_fvg, bear_fvg, fvg_top, fvg_bot = detect_fvg_vectorized(
+        df_mtf['Open'].values, df_mtf['High'].values,
+        df_mtf['Low'].values, df_mtf['Close'].values,
+        cfg['fvg_min_size_pips'] * pip_size
     )
-
-def write_report(m_res, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    div = "═"*75
-    lines = [
-        div, f"  PropBot Backtester v10.2  —  THE GOLD SCALPER (High-Freq)",
-        f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"  Logic : Relaxed Momentum Surge -> Pullback -> Pending Stop Order",
-        div, ""
-    ]
-
-    HDR = (f"  {'Period':<10} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
-           f" {'PF':>5} {'MaxDD':>7} {'TP':>4} {'SL':>4} {'EOD':>3}")
-    SEP = "  " + "─"*67
-
-    lines += [f"  ┌── PERFORMANCE REPORT (XAUUSD Exclusive) {'─'*25}┐", HDR, SEP]
+    print(f"      Bullish FVGs: {bull_fvg.sum()}, "
+          f"Bearish FVGs: {bear_fvg.sum()} ({time_module.time()-t0:.1f}s)")
     
-    for key, name in [("train", "2010-2019"), ("oos", "2020-2025")]:
-        m = m_res[key]
-        flag = " ⚠" if m["max_dd"] > 6 else ""
-        lines.append(
-            f"  {name:<10} {m['trades']:>5} {m['win_rate']:>5.1f}%"
-            f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
-            f" {m['max_dd']:>6.1f}% {m['tp_count']:>4} {m['sl_count']:>4} {m['eod_count']:>3}{flag}"
-        )
+    print("  [3/5] Mapping daily levels to MTF...")
+    t0 = time_module.time()
+    
+    # Map PDH/PDL to MTF bars
+    mtf_dates = df_mtf.index.date
+    mtf_pdh = np.full(len(df_mtf), np.nan)
+    mtf_pdl = np.full(len(df_mtf), np.nan)
+    
+    daily_dict = {}
+    for dt, row in daily_levels.iterrows():
+        daily_dict[dt.date()] = (row['PDH'], row['PDL'])
+    
+    for i, d in enumerate(mtf_dates):
+        if d in daily_dict:
+            mtf_pdh[i], mtf_pdl[i] = daily_dict[d]
+    
+    # Forward fill
+    mask = np.isnan(mtf_pdh)
+    idx = np.where(~mask, np.arange(len(mtf_pdh)), 0)
+    np.maximum.accumulate(idx, out=idx)
+    mtf_pdh = mtf_pdh[idx]
+    mtf_pdl = mtf_pdl[idx]
+    
+    print(f"      Done ({time_module.time()-t0:.1f}s)")
+    
+    print("  [4/5] Detecting sweeps & generating signals...")
+    t0 = time_module.time()
+    
+    highs = df_mtf['High'].values
+    lows = df_mtf['Low'].values
+    opens = df_mtf['Open'].values
+    closes = df_mtf['Close'].values
+    times = df_mtf.index
+    hours = df_mtf.index.hour
+    
+    # Session filter
+    london_start = cfg['london_start']
+    london_end = cfg['london_end']
+    ny_start = cfg['newyork_start']
+    ny_end = cfg['newyork_end']
+    
+    in_session = ((hours >= london_start) & (hours < london_end)) | \
+                 ((hours >= ny_start) & (hours < ny_end))
+    
+    # ========== SWEEP DETECTION (Vectorized) ==========
+    
+    # Sweep PDH (bearish): High > PDH + threshold AND Close < PDH
+    sweep_pdh = (highs > mtf_pdh + sweep_thresh) & (closes < mtf_pdh)
+    
+    # Sweep PDL (bullish): Low < PDL - threshold AND Close > PDL
+    sweep_pdl = (lows < mtf_pdl - sweep_thresh) & (closes > mtf_pdl)
+    
+    # Rolling swing high/low for recent levels
+    # Use rolling max/min of confirmed swing points
+    window = 50
+    
+    # Reindex HTF swings to MTF timeframe
+    htf_sh_series = pd.Series(swing_high_prices, index=df_htf.index).dropna()
+    htf_sl_series = pd.Series(swing_low_prices, index=df_htf.index).dropna()
+    
+    # Map nearest HTF swing to MTF
+    recent_swing_high = np.full(len(df_mtf), np.nan)
+    recent_swing_low = np.full(len(df_mtf), np.nan)
+    
+    sh_idx = 0
+    sl_idx = 0
+    sh_vals = htf_sh_series.values
+    sh_times = htf_sh_series.index
+    sl_vals = htf_sl_series.values
+    sl_times = htf_sl_series.index
+    
+    for i in range(len(df_mtf)):
+        ct = times[i]
+        # Update recent swing high
+        while sh_idx < len(sh_times) and sh_times[sh_idx] <= ct:
+            sh_idx += 1
+        if sh_idx > 0:
+            # Use last 3 swing highs, take max
+            start = max(0, sh_idx - 3)
+            recent_swing_high[i] = np.max(sh_vals[start:sh_idx])
+        
+        while sl_idx < len(sl_times) and sl_times[sl_idx] <= ct:
+            sl_idx += 1
+        if sl_idx > 0:
+            start = max(0, sl_idx - 3)
+            recent_swing_low[i] = np.min(sl_vals[start:sl_idx])
+    
+    # Also sweep swing highs/lows
+    valid_sh = ~np.isnan(recent_swing_high)
+    valid_sl = ~np.isnan(recent_swing_low)
+    
+    sweep_sh = valid_sh & (highs > recent_swing_high + sweep_thresh) & \
+               (closes < recent_swing_high)
+    sweep_sl = valid_sl & (lows < recent_swing_low - sweep_thresh) & \
+               (closes > recent_swing_low)
+    
+    # Combined sweep signals
+    any_sweep_high = sweep_pdh | sweep_sh  # Bearish setup
+    any_sweep_low = sweep_pdl | sweep_sl   # Bullish setup
+    
+    # ========== MARKET STRUCTURE (Simple version) ==========
+    # Bullish bias: close > rolling 50-period high midpoint
+    # Bearish bias: close < rolling 50-period low midpoint
+    
+    rolling_mid = (pd.Series(highs).rolling(window).max().values + 
+                   pd.Series(lows).rolling(window).min().values) / 2
+    
+    bullish_bias = closes > rolling_mid
+    bearish_bias = closes < rolling_mid
+    
+    # ========== COMBINE INTO SIGNALS ==========
+    
+    # SHORT signal: sweep high + bearish bias + in session
+    short_signal = any_sweep_high & bearish_bias & in_session
+    
+    # LONG signal: sweep low + bullish bias + in session
+    long_signal = any_sweep_low & bullish_bias & in_session
+    
+    # Remove conflicting signals (both at same bar)
+    conflict = short_signal & long_signal
+    short_signal = short_signal & ~conflict
+    long_signal = long_signal & ~conflict
+    
+    # ========== COMPUTE ENTRY/SL/TP ==========
+    
+    n = len(df_mtf)
+    signal = np.zeros(n, dtype=int)  # 1=long, -1=short
+    entry_prices = np.zeros(n)
+    sl_prices = np.zeros(n)
+    tp_prices = np.zeros(n)
+    
+    signal[long_signal] = 1
+    signal[short_signal] = -1
+    
+    # Long trades
+    long_mask = signal == 1
+    entry_prices[long_mask] = closes[long_mask]
+    
+    # SL = recent swing low - buffer (or PDL - buffer)
+    sl_long = np.where(valid_sl[long_mask], 
+                       recent_swing_low[long_mask], 
+                       mtf_pdl[long_mask])
+    sl_long = np.minimum(sl_long, lows[long_mask]) - sl_buffer
+    sl_prices[long_mask] = sl_long
+    
+    sl_dist_long = entry_prices[long_mask] - sl_prices[long_mask]
+    tp_prices[long_mask] = entry_prices[long_mask] + sl_dist_long * rr
+    
+    # Short trades
+    short_mask = signal == -1
+    entry_prices[short_mask] = closes[short_mask]
+    
+    sl_short = np.where(valid_sh[short_mask],
+                        recent_swing_high[short_mask],
+                        mtf_pdh[short_mask])
+    sl_short = np.maximum(sl_short, highs[short_mask]) + sl_buffer
+    sl_prices[short_mask] = sl_short
+    
+    sl_dist_short = sl_prices[short_mask] - entry_prices[short_mask]
+    tp_prices[short_mask] = entry_prices[short_mask] - sl_dist_short * rr
+    
+    # ========== FILTER BAD SIGNALS ==========
+    
+    # Remove signals with SL too small or too large
+    sl_dist = np.abs(entry_prices - sl_prices)
+    sl_pips = sl_dist / pip_size
+    
+    valid_sl_size = (sl_pips >= 3) & (sl_pips <= 80)
+    signal = np.where(valid_sl_size, signal, 0)
+    
+    # ========== MINIMUM SPACING (cooldown) ==========
+    
+    min_spacing = 4  # bars
+    signal_indices = np.where(signal != 0)[0]
+    
+    if len(signal_indices) > 1:
+        filtered = [signal_indices[0]]
+        for idx in signal_indices[1:]:
+            if idx - filtered[-1] >= min_spacing:
+                filtered.append(idx)
+        
+        clean_signal = np.zeros(n, dtype=int)
+        for idx in filtered:
+            clean_signal[idx] = signal[idx]
+        signal = clean_signal
+    
+    total_signals = np.sum(signal != 0)
+    longs = np.sum(signal == 1)
+    shorts = np.sum(signal == -1)
+    
+    print(f"      Signals: {total_signals} "
+          f"(Long: {longs}, Short: {shorts}) "
+          f"({time_module.time()-t0:.1f}s)")
+    
+    # Build result DataFrame
+    signals_df = pd.DataFrame({
+        'signal': signal,
+        'entry': entry_prices,
+        'sl': sl_prices,
+        'tp': tp_prices
+    }, index=df_mtf.index)
+    
+    return signals_df
+
+
+# ============================
+# FAST TRADE SIMULATOR
+# ============================
+
+def simulate_trades(df_mtf: pd.DataFrame, signals_df: pd.DataFrame,
+                    config: dict, pip_size: float, 
+                    symbol: str) -> Dict:
+    """
+    شبیه‌سازی سریع معاملات
+    فقط روی سیگنال‌ها لوپ می‌زنیم + بررسی خروج در بارهای بعدی
+    """
+    print("  [5/5] Simulating trades...")
+    t0 = time_module.time()
+    
+    initial_balance = config['account']['initial_balance']
+    balance = initial_balance
+    peak_balance = initial_balance
+    risk_pct = config['risk']['risk_per_trade']
+    commission_per_lot = config['execution']['commission_per_lot']
+    spread = config['execution']['spread_pips'] * pip_size
+    slippage = config['execution']['slippage_pips'] * pip_size
+    rr = config['risk']['reward_to_risk']
+    max_daily_dd = config['risk']['max_daily_loss']
+    prop_max_dd = config['prop_rules']['max_total_drawdown']
+    breakeven_1r = config['strategy']['breakeven_at_1r']
+    pip_value = 10.0  # per standard lot per pip
+    
+    # Get signal bars
+    sig_mask = signals_df['signal'].values != 0
+    sig_indices = np.where(sig_mask)[0]
+    
+    if len(sig_indices) == 0:
+        print("      No signals to simulate")
+        return {'trades': [], 'equity_curve': [], 'balance': balance}
+    
+    highs = df_mtf['High'].values
+    lows = df_mtf['Low'].values
+    closes = df_mtf['Close'].values
+    times = df_mtf.index
+    n_bars = len(df_mtf)
+    
+    trades = []
+    equity_curve = []
+    daily_pnl = {}
+    account_blown = False
+    
+    # For each signal, simulate forward
+    for sig_idx in sig_indices:
+        if account_blown:
+            break
+        
+        direction = signals_df['signal'].values[sig_idx]  # 1 or -1
+        entry = signals_df['entry'].values[sig_idx]
+        sl = signals_df['sl'].values[sig_idx]
+        tp = signals_df['tp'].values[sig_idx]
+        entry_time = times[sig_idx]
+        
+        # Apply spread/slippage
+        if direction == 1:
+            entry += spread/2 + slippage
+        else:
+            entry -= spread/2 + slippage
+        
+        # Position sizing
+        sl_pips = abs(entry - sl) / pip_size
+        if sl_pips <= 0:
+            continue
+        
+        risk_amount = balance * risk_pct
+        lot_size = risk_amount / (sl_pips * pip_value)
+        lot_size = max(0.01, round(lot_size, 2))
+        commission = commission_per_lot * lot_size
+        
+        # Check daily limit
+        day_key = str(entry_time.date())
+        if day_key in daily_pnl:
+            if daily_pnl[day_key] <= -balance * max_daily_dd:
+                continue
+        
+        # Simulate forward - find exit
+        current_sl = sl
+        hit_breakeven = False
+        exit_price = None
+        exit_time = None
+        exit_type = None
+        
+        max_forward = min(sig_idx + 500, n_bars)  # Max 500 bars forward
+        
+        for j in range(sig_idx + 1, max_forward):
+            bar_high = highs[j]
+            bar_low = lows[j]
             
-    lines += [f"  └{'─'*67}┘", ""]
-    txt = "\n".join(lines)
-    print(txt)
-    (out_dir / "report.txt").write_text(txt)
+            if direction == 1:  # LONG
+                # Breakeven check
+                if breakeven_1r and not hit_breakeven:
+                    one_r = abs(entry - sl)
+                    if bar_high >= entry + one_r:
+                        current_sl = entry + 2 * pip_size
+                        hit_breakeven = True
+                
+                # SL hit
+                if bar_low <= current_sl:
+                    exit_price = current_sl
+                    exit_time = times[j]
+                    if hit_breakeven and abs(current_sl - entry) < 5 * pip_size:
+                        exit_type = 'BE'
+                    else:
+                        exit_type = 'SL'
+                    break
+                
+                # TP hit
+                if bar_high >= tp:
+                    exit_price = tp
+                    exit_time = times[j]
+                    exit_type = 'TP'
+                    break
+            
+            else:  # SHORT
+                if breakeven_1r and not hit_breakeven:
+                    one_r = abs(sl - entry)
+                    if bar_low <= entry - one_r:
+                        current_sl = entry - 2 * pip_size
+                        hit_breakeven = True
+                
+                if bar_high >= current_sl:
+                    exit_price = current_sl
+                    exit_time = times[j]
+                    if hit_breakeven and abs(current_sl - entry) < 5 * pip_size:
+                        exit_type = 'BE'
+                    else:
+                        exit_type = 'SL'
+                    break
+                
+                if bar_low <= tp:
+                    exit_price = tp
+                    exit_time = times[j]
+                    exit_type = 'TP'
+                    break
+        
+        # If no exit found, close at last bar
+        if exit_price is None:
+            exit_price = closes[max_forward - 1]
+            exit_time = times[max_forward - 1]
+            exit_type = 'TIMEOUT'
+        
+        # Calculate PnL
+        if direction == 1:
+            pnl_pips = (exit_price - entry) / pip_size
+        else:
+            pnl_pips = (entry - exit_price) / pip_size
+        
+        pnl = (pnl_pips * pip_value * lot_size) - commission
+        r_multiple = pnl / risk_amount if risk_amount > 0 else 0
+        
+        balance += pnl
+        peak_balance = max(peak_balance, balance)
+        
+        # Track daily PnL
+        if day_key not in daily_pnl:
+            daily_pnl[day_key] = 0
+        daily_pnl[day_key] += pnl
+        
+        # Check prop rules
+        total_dd_pct = (peak_balance - balance) / initial_balance
+        if total_dd_pct >= prop_max_dd:
+            account_blown = True
+        
+        trades.append({
+            'symbol': symbol,
+            'direction': 'LONG' if direction == 1 else 'SHORT',
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'entry_price': round(entry, 5),
+            'exit_price': round(exit_price, 5),
+            'sl': round(sl, 5),
+            'tp': round(tp, 5),
+            'lot_size': lot_size,
+            'pnl': round(pnl, 2),
+            'pnl_pips': round(pnl_pips, 1),
+            'r_multiple': round(r_multiple, 2),
+            'exit_type': exit_type,
+            'balance': round(balance, 2)
+        })
+        
+        equity_curve.append({
+            'time': exit_time,
+            'balance': balance
+        })
+    
+    print(f"      Trades executed: {len(trades)} ({time_module.time()-t0:.1f}s)")
+    if account_blown:
+        print(f"      ⚠️  Account blown!")
+    
+    return {
+        'trades': trades,
+        'equity_curve': equity_curve,
+        'balance': balance,
+        'peak_balance': peak_balance,
+        'blown': account_blown
+    }
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default="data")
-    p.add_argument("--out-dir",  default="results")
-    args = p.parse_args()
-    data_dir = Path(args.data_dir); out_dir  = Path(args.out_dir)
 
-    print(f"\n{'═'*60}")
-    print(f"  PropBot v10.2  —  The Gold Momentum Scalper (High-Freq)")
-    print(f"{'═'*60}\n")
+# ============================
+# RESULTS & REPORTING
+# ============================
 
-    pair = GOLD_CFG["pairs"][0]
-    print(f"  Loading {pair} M1 data...", end=" ", flush=True)
-    m1_data = load_pair(data_dir, pair)
-    if m1_data.empty: sys.exit("NO DATA")
-    print(f"{len(m1_data):,} records loaded.\n")
-
-    print(f"  Executing Strategy...", end=" ", flush=True)
-    t_tr, eq_tr, t_oo, eq_oo = strategy_gold_momentum(m1_data, pair)
-    m_res = {"train": metrics(t_tr, eq_tr, "Train"), "oos": metrics(t_oo, eq_oo, "OOS")}
-    print(f"Done. (OOS Trades: {m_res['oos']['trades']})")
-
-    print("\nWriting report...\n")
-    write_report(m_res, out_dir)
-    print(f"\n  Done  →  {out_dir.resolve()}\n")
-
-if __name__ == "__main__": main()
+def print_results(results: Dict, config: dict):
+    """چاپ نتایج کامل"""
+    trades = results['trades']
+    if not trades:
+        print("\n  ❌ No trades executed!")
+        return
+    
+    initial = config['account']['initial_balance']
+    final = results['balance']
+    
+    df_trades = pd.DataFrame(trades)
+    
+    total = len(df_trades)
+    wins = df_trades[df_trades['pnl'] > 0]
+    losses = df_trades[df_trades['pnl'] < 0]
+    
+    win_rate = len(wins) / total * 100
+    total_pnl = df_trades['pnl'].sum()
+    total_pips = df_trades['pnl_pips'].sum()
+    
+    avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
+    avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0
+    avg_win_pips = wins['pnl_pips'].mean() if len(wins) > 0 else 0
+    avg_loss_pips = losses['pnl_pips'].mean() if len(losses) > 0 else 0
+    avg_r = df_trades['r_multiple'].mean()
+    
+    gross_profit = wins['pnl'].sum() if len(wins) > 0 else 0
+    gross_loss = abs(losses['pnl'].sum()) if len(losses) > 0 else 1
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    
+    return_pct = (final - initial) / initial * 100
+    
+    # Max drawdown from equity curve
+    balances = [initial] + [t['balance'] for t in trades]
+    peak = initial
+    max_dd = 0
+    max_dd_pct = 0
+    for b in balances:
+        if b > peak:
+            peak = b
+        dd = peak - b
+        dd_pct = dd / peak * 100
+        if dd_pct > max_dd_pct:
+            max_dd = dd
+            max_dd_pct = dd_pct
+    
+    # Consecutive
+    max_cw = max_cl = cw = cl = 0
+    for _, t in df_trades.iterrows():
+        if t['pnl'] > 0:
+            cw += 1; cl = 0
+            max_cw = max(max_cw, cw)
+        else:
+            cl += 1; cw = 0
+            max_cl = max(max_cl, cl)
+    
+    # Exit type breakdown
+    exit_counts = df_trades['exit_type'].value_counts()
+    
+    print(f"\n{'='*70}")
+    print(f"{'BACKTEST RESULTS':^70}")
+    print(f"{'='*70}")
+    
+    stats = [
+        ["Initial Balance", f"${initial:,.2f}"],
+        ["Final Balance", f"${final:,.2f}"],
+        ["Net P&L", f"${total_pnl:,.2f}"],
+        ["Return", f"{return_pct:+.2f}%"],
+        ["", ""],
+        ["Total Trades", total],
+        ["Win Rate", f"{win_rate:.1f}%"],
+        ["Wins / Losses", f"{len(wins)} / {len(losses)}"],
+        ["", ""],
+        ["Avg Win", f"${avg_win:,.2f} ({avg_win_pips:.1f} pips)"],
+        ["Avg Loss", f"${avg_loss:,.2f} ({avg_loss_pips:.1f} pips)"],
+        ["Avg R-Multiple", f"{avg_r:.2f}R"],
+        ["Profit Factor", f"{profit_factor:.2f}"],
+        ["Total Pips", f"{total_pips:,.1f}"],
+        ["", ""],
+        ["Max Drawdown", f"${max_dd:,.2f} ({max_dd_pct:.2f}%)"],
+        ["Max Consec Wins", max_cw],
+        ["Max Consec Losses", max_cl],
+        ["", ""],
+    ]
+    
+    for exit_type, count in exit_counts.items():
+        stats.append([f"Exit: {exit_type}", count])
+    
+    stats.extend([
+        ["", ""],
+        ["═══ PROP FIRM CHECK ═══", ""],
+        ["Phase 1 Target (8%)", 
+         "✅ PASSED" if return_pct >= 8 else f"❌ FAILED ({return_pct:.1f}%)"],
+        ["Max DD < 10%", 
+         "✅ OK" if max_dd_pct < 10 else f"❌ 
