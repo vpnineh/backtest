@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v9.0A — The London Specialist
+PropBot Backtester v10.1 — The Gold Momentum Scalper (Extended Session)
 ══════════════════════════════════════════════════════════════════
-Strategy : Macro-Aligned Liquidity Sweep
-Pairs    : GBPUSD (Exclusive Focus)
-Account  : $5,000 prop firm
-Split    : Train 2010-2019 | OOS 2020-2025
-Costs    : Raw Spread (0.5) + Commission ($6/lot) + Slippage
-Logic    : D1 Trend Alignment + Mid-Range BE + No Fridays + M15 Execution
+Strategy : Micro-Pullback Breakout on Steep Momentum
+Asset    : XAUUSD (Gold)
+Timeframe: M5 (5-Minute)
+Costs    : Realistic Gold Spread (15 pips) + Slippage
+Logic    : Momentum Surge -> First Pullback Candle -> Buy/Sell Stop -> 1:1 RR
+Session  : Full London to End of New York (Continuous)
 ══════════════════════════════════════════════════════════════════
 """
 
@@ -21,42 +21,38 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-#  ACCOUNT
+#  ACCOUNT & GOLD COSTS
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.005,
+    risk_pct     = 0.005,     # ریسک 0.5%
     max_open     = 1,
     daily_dd_lim = 0.03,
     max_dd_kill  = 0.07,
 )
 
-# ─────────────────────────────────────────────────────────────
-#  COSTS
-# ─────────────────────────────────────────────────────────────
-SPREAD_PIPS = dict(GBPUSD=0.5)
-COMMISSION_PIP = 0.6
-SLIPPAGE_PIP = 0.2
-LONDON_SPREAD_MULTIPLIER = 2.0
-PIP_SIZE = dict(GBPUSD=1e-4)
+# هزینه‌های واقع‌گرایانه طلا (پیپ در طلا معادل 0.01 دلار حرکت قیمت است)
+SPREAD_PIPS = dict(XAUUSD=15.0)   # 15 سنت اسپرد
+COMMISSION_PIP = 6.0              # 6 دلار در لات
+SLIPPAGE_PIP = 5.0                # 5 سنت اسلیپیج به خاطر ورود با پندینگ اردر
+PIP_SIZE = dict(XAUUSD=0.01)
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY PARAMS (LONDON SPECIALIST)
+#  STRATEGY PARAMS (GOLD M5 MOMENTUM)
 # ─────────────────────────────────────────────────────────────
-SWEEP_CFG = dict(
-    pairs         = ["GBPUSD"],
-    asian_start   = 0,
-    asian_end     = 7,
-    entry_open    = 7,
-    entry_close   = 11,
-    force_close   = 17,
-    min_range_pip = 10,
-    max_range_pip = 50,
-    atr_sl_mult   = 1.5,
-    macro_ema     = 50,
+GOLD_CFG = dict(
+    pairs         = ["XAUUSD"],
+    session_open  = 7,        # باز شدن لندن (شروع پنجره مجاز)
+    session_close = 21,       # پایان نیویورک (پایان پنجره مجاز)
+    force_close   = 22,       # بستن اجباری در انتهای روز
+    ema_fast      = 9,
+    ema_slow      = 20,
+    momentum_atr  = 0.5,      # حداقل فاصله دو EMA برای تایید "شیب تند"
+    buffer_pip    = 5.0,      # بافر برای قرار دادن پندینگ اردر بالا/پایین کندل
+    rr            = 1.0,      # تارگت 1 به 1
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -114,25 +110,20 @@ def atr(h, l, c, n):
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 # ─────────────────────────────────────────────────────────────
-#  TRADE ENGINE
+#  PENDING ORDER TRADE ENGINE
 # ─────────────────────────────────────────────────────────────
-def get_trade_cost(pair: str, ts: pd.Timestamp) -> float:
+def get_trade_cost(pair: str) -> float:
     pip = PIP_SIZE[pair]
-    base_spread = SPREAD_PIPS.get(pair, 0.5)
-    if 7 <= ts.hour <= 8:
-        spread = base_spread * LONDON_SPREAD_MULTIPLIER
-    else:
-        spread = base_spread
+    spread = SPREAD_PIPS.get(pair, 15.0)
     return (spread + COMMISSION_PIP + SLIPPAGE_PIP * 2) * pip
 
 class Pos:
-    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk","be_triggered"]
+    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk"]
     def __init__(self, d, entry, sl, tp, t0, risk_usd, pip, c_cost):
         self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
         self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
         self.c_cost = c_cost
         self.initial_risk = abs(entry - sl)
-        self.be_triggered = False
 
 def _close_pos(pos, ep, ts, pair):
     move    = (ep - pos.entry) * pos.d
@@ -144,7 +135,7 @@ def _close_pos(pos, ep, ts, pair):
     pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / initial_sl_pip)
     return pnl_usd
 
-def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_hour: int) -> tuple:
+def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_hour: int) -> tuple:
     pip      = PIP_SIZE[pair]
     acct     = ACCOUNT
     equity   = acct["initial_bal"]
@@ -165,6 +156,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
 
         o, h, l = row["open"], row["high"], row["low"]
 
+        # ── 1. Close Open Positions ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -182,128 +174,105 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
             if ep is not None:
                 pnl = _close_pos(pos, ep, ts, pair)
                 equity += pnl; peak = max(peak, equity)
-                if res == "sl" and pos.be_triggered: res = "be"
                 trades.append(dict(
                     pair=pair, dir="long" if pos.d==1 else "short",
                     open_time=str(pos.t0), close_time=str(ts),
-                    open_px=round(pos.entry,5), close_px=round(ep,5),
-                    sl=round(pos.sl,5), tp=round(pos.tp,5),
+                    open_px=round(pos.entry,2), close_px=round(ep,2),
+                    sl=round(pos.sl,2), tp=round(pos.tp,2),
                     pnl=round(pnl,2), result=res, equity=round(equity,2),
                 ))
                 closed.append(pos)
                 
         for p in closed: positions.remove(p)
-        
-        for pos in positions:
-            if not pos.be_triggered:
-                trigger_dist = abs(pos.tp - pos.entry) * 0.5
-                if pos.d == 1 and row["high"] >= pos.entry + trigger_dist:
-                    pos.sl = pos.entry + pos.c_cost
-                    pos.be_triggered = True
-                elif pos.d == -1 and row["low"] <= pos.entry - trigger_dist:
-                    pos.sl = pos.entry - pos.c_cost
-                    pos.be_triggered = True
-
         eq_curve.append({"datetime": ts, "equity": equity})
 
+        # ── 2. Kill Check ──
         if (peak - equity) / peak >= acct["max_dd_kill"]:
             killed = True; break
         if not frozen and (day_eq - equity) / max(day_eq,1) >= acct["daily_dd_lim"]:
             frozen = True
         if frozen or sig is None: continue
-
         if len(positions) >= acct["max_open"]: continue
 
+        # ── 3. Evaluate Pending Orders ──
         has_long  = any(p.d== 1 for p in positions)
         has_short = any(p.d==-1 for p in positions)
         risk_usd  = equity * acct["risk_pct"]
+        c_cost    = get_trade_cost(pair)
 
         if sig.get("sig_long") and not has_long:
-            c_cost = get_trade_cost(pair, ts)
-            entry = o + c_cost / 2
-            sl, tp = sig["force_sl"], sig["force_tp"]
-            if abs(entry - sl) / pip < 3: continue 
-            positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
+            buy_stop = sig["entry_l"]
+            if h >= buy_stop:
+                entry = max(o, buy_stop) + (c_cost / 2)
+                sl = sig["force_sl_l"]
+                tp = entry + (entry - sl) * GOLD_CFG["rr"]  
+                
+                if abs(entry - sl) / pip > 10: 
+                    positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
         elif sig.get("sig_short") and not has_short:
-            c_cost = get_trade_cost(pair, ts)
-            entry = o - c_cost / 2
-            sl, tp = sig["force_sl"], sig["force_tp"]
-            if abs(entry - sl) / pip < 3: continue
-            positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
+            sell_stop = sig["entry_s"]
+            if l <= sell_stop:
+                entry = min(o, sell_stop) - (c_cost / 2)
+                sl = sig["force_sl_s"]
+                tp = entry - (sl - entry) * GOLD_CFG["rr"]
+                
+                if abs(entry - sl) / pip > 10:
+                    positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
     return trades, eq_curve
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY — THE LONDON SPECIALIST
+#  STRATEGY — THE GOLD MOMENTUM SCALPER (M5)
 # ─────────────────────────────────────────────────────────────
-def strategy_specialist(m1: pd.DataFrame, pair: str) -> tuple:
-    cfg = SWEEP_CFG; pip = PIP_SIZE[pair]
+def strategy_gold_momentum(m1: pd.DataFrame, pair: str) -> tuple:
+    cfg = GOLD_CFG; pip = PIP_SIZE[pair]
     
-    d1 = resample(m1, "1D")
-    d1["ema_macro"] = ema(d1["close"], cfg["macro_ema"])
-    d1["ema_macro"] = d1["ema_macro"].shift(1) 
-    d1.index = d1.index.date 
-    
-    bars = resample(m1, "15min")
-    bars["date"] = bars.index.date
+    bars = resample(m1, "5min")
     bars["atr"] = atr(bars["high"], bars["low"], bars["close"], 14)
+    bars["ema_fast"] = ema(bars["close"], cfg["ema_fast"])
+    bars["ema_slow"] = ema(bars["close"], cfg["ema_slow"])
     
-    bars = bars.join(d1[["ema_macro"]], on="date")
-    bars["ema_macro"] = bars["ema_macro"].ffill()
+    # فیلتر سشن: از شروع لندن تا پایان نیویورک
+    in_session = (bars.index.hour >= cfg["session_open"]) & (bars.index.hour < cfg["session_close"])
+    
+    # 1. تعریف شیب تند (Steep Momentum)
+    min_dist = bars["atr"] * cfg["momentum_atr"]
+    steep_bull = (bars["ema_fast"] > bars["ema_slow"]) & ((bars["ema_fast"] - bars["ema_slow"]) > min_dist) & (bars["close"] > bars["ema_fast"])
+    steep_bear = (bars["ema_fast"] < bars["ema_slow"]) & ((bars["ema_slow"] - bars["ema_fast"]) > min_dist) & (bars["close"] < bars["ema_fast"])
+    
+    # 2. پیدا کردن اولین کندل اصلاحی (The Pullback Candle)
+    pullback_bull = steep_bull.shift(1) & (bars["low"] < bars["low"].shift(1))
+    pullback_bear = steep_bear.shift(1) & (bars["high"] > bars["high"].shift(1))
+    
+    # فیلتر: اطمینان حاصل کنیم که این "اولین" اصلاح است 
+    first_pullback_bull = pullback_bull & ~(bars["low"].shift(1) < bars["low"].shift(2)) & in_session
+    first_pullback_bear = pullback_bear & ~(bars["high"].shift(1) > bars["high"].shift(2)) & in_session
+    
+    # 3. مقادیر سفارشات پندینگ (Buy Stop / Sell Stop)
+    buf = cfg["buffer_pip"] * pip
+    bars["entry_l"] = bars["high"] + buf
+    bars["force_sl_l"] = bars["low"] - buf
+    
+    bars["entry_s"] = bars["low"] - buf
+    bars["force_sl_s"] = bars["high"] + buf
 
-    asian_mask = (bars.index.hour >= cfg["asian_start"]) & (bars.index.hour < cfg["asian_end"])
-    asian = bars[asian_mask].groupby("date").agg(asian_high=("high","max"), asian_low=("low","min"))
-    asian["range_pip"] = (asian["asian_high"] - asian["asian_low"]) / pip
-    asian = asian[asian["range_pip"].between(cfg["min_range_pip"], cfg["max_range_pip"])]
-
-    london_mask = (bars.index.hour >= cfg["entry_open"]) & (bars.index.hour <= cfg["entry_close"])
-    london = bars[london_mask].copy()
-    london["date"] = london.index.date
-    london = london.join(asian, on="date", how="inner").dropna(subset=["asian_high", "ema_macro"])
-
-    london["is_friday"] = london.index.dayofweek == 4
-
-    london["macro_bull"] = london["close"] > london["ema_macro"]
-    london["macro_bear"] = london["close"] < london["ema_macro"]
-
-    london["session_high"] = london.groupby("date")["high"].cummax()
-    london["session_low"]  = london.groupby("date")["low"].cummin()
-
-    london["is_sweep_high"] = london["high"] > london["asian_high"]
-    london["is_sweep_low"]  = london["low"] < london["asian_low"]
-    london["has_swept_high"] = london.groupby("date")["is_sweep_high"].cummax()
-    london["has_swept_low"]  = london.groupby("date")["is_sweep_low"].cummax()
-
-    london["raw_short"] = london["macro_bear"] & london["has_swept_high"] & (london["close"] < london["asian_high"]) & ~london["is_friday"]
-    london["raw_long"]  = london["macro_bull"] & london["has_swept_low"]  & (london["close"] > london["asian_low"]) & ~london["is_friday"]
-
-    atr_buf = london["atr"] * cfg["atr_sl_mult"]
-    london["force_sl_short"] = london["session_high"] + atr_buf
-    london["force_sl_long"]  = london["session_low"]  - atr_buf
-
-    sigs = pd.DataFrame(index=london.index)
-    sigs["date"] = london["date"]
-    sigs["raw_long"] = london["raw_long"]
-    sigs["raw_short"] = london["raw_short"]
-
-    sigs["force_sl"] = np.where(london["raw_long"], london["force_sl_long"],
-                       np.where(london["raw_short"], london["force_sl_short"], np.nan))
-    sigs["force_tp"] = np.where(london["raw_long"], london["asian_high"],
-                       np.where(london["raw_short"], london["asian_low"], np.nan))
-
-    shifted = sigs.shift(1); shifted["date"] = sigs["date"] 
-    active_sigs = shifted[(shifted["raw_long"] == True) | (shifted["raw_short"] == True)].copy()
-    first_sigs = active_sigs.drop_duplicates(subset=["date"], keep="first")
-    first_sigs = first_sigs.rename(columns={"raw_long": "sig_long", "raw_short": "sig_short"})
-
-    sigs_full = pd.DataFrame(index=bars.index).join(first_sigs[["sig_long", "sig_short", "force_sl", "force_tp"]])
-    sigs_full[["sig_long", "sig_short"]] = sigs_full[["sig_long", "sig_short"]].fillna(False)
+    # شیفت دادن سیگنال به کندل بعدی
+    sigs = pd.DataFrame(index=bars.index)
+    sigs["sig_long"]  = first_pullback_bull.shift(1).fillna(False)
+    sigs["sig_short"] = first_pullback_bear.shift(1).fillna(False)
+    
+    # انتقال نقاط ورود و خروج به فریم سیگنال
+    sigs["entry_l"] = bars["entry_l"].shift(1)
+    sigs["force_sl_l"] = bars["force_sl_l"].shift(1)
+    
+    sigs["entry_s"] = bars["entry_s"].shift(1)
+    sigs["force_sl_s"] = bars["force_sl_s"].shift(1)
 
     b_tr = bars[bars.index <= TRAIN_END]; b_oo = bars[bars.index >= TEST_START]
-    s_tr = sigs_full[sigs_full.index <= TRAIN_END]; s_oo = sigs_full[sigs_full.index >= TEST_START]
+    s_tr = sigs[sigs.index <= TRAIN_END]; s_oo = sigs[sigs.index >= TEST_START]
 
-    return run_sim(b_tr, pair, s_tr, cfg["force_close"]) + run_sim(b_oo, pair, s_oo, cfg["force_close"])
+    return run_sim_pending(b_tr, pair, s_tr, cfg["force_close"]) + run_sim_pending(b_oo, pair, s_oo, cfg["force_close"])
 
 # ─────────────────────────────────────────────────────────────
 #  METRICS & REPORTING
@@ -311,7 +280,7 @@ def strategy_specialist(m1: pd.DataFrame, pair: str) -> tuple:
 def metrics(trades, eq_curve, label):
     if not trades:
         return dict(label=label, trades=0, net_pnl=0, win_rate=0, pf=0, max_dd=0,
-                    tp_count=0, sl_count=0, be_count=0, eod_count=0)
+                    tp_count=0, sl_count=0, eod_count=0)
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]; loss = [p for p in pnls if p <= 0]
     eqs  = pd.Series([e["equity"] for e in eq_curve])
@@ -325,7 +294,6 @@ def metrics(trades, eq_curve, label):
         net_pnl=round(net,2), pf=round(pf,2), max_dd=round(dd.max(),2),
         tp_count=sum(1 for t in trades if t["result"]=="tp"),
         sl_count=sum(1 for t in trades if t["result"]=="sl"),
-        be_count=sum(1 for t in trades if t["result"]=="be"),
         eod_count=sum(1 for t in trades if t["result"]=="eod")
     )
 
@@ -333,16 +301,18 @@ def write_report(m_res, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     div = "═"*75
     lines = [
-        div, f"  PropBot Backtester v9.0A  —  THE LONDON SPECIALIST",
+        div, f"  PropBot Backtester v10.1  —  THE GOLD MOMENTUM SCALPER",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"  Logic : Macro Trend (D1) + Mid-Range BE + No Fridays", div, ""
+        f"  Asset : XAUUSD (M5)",
+        f"  Logic : Momentum Surge -> Wait for Pullback -> Pending Stop Order -> 1:1 RR",
+        f"  Window: Full London to End of New York", div, ""
     ]
 
     HDR = (f"  {'Period':<10} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
-           f" {'PF':>5} {'MaxDD':>7} {'TP':>4} {'SL':>4} {'BE':>3} {'EOD':>3}")
-    SEP = "  " + "─"*71
+           f" {'PF':>5} {'MaxDD':>7} {'TP':>4} {'SL':>4} {'EOD':>3}")
+    SEP = "  " + "─"*67
 
-    lines += [f"  ┌── PERFORMANCE REPORT (GBPUSD Exclusive) {'─'*27}┐", HDR, SEP]
+    lines += [f"  ┌── PERFORMANCE REPORT (XAUUSD Exclusive) {'─'*25}┐", HDR, SEP]
     
     for key, name in [("train", "2010-2019"), ("oos", "2020-2025")]:
         m = m_res[key]
@@ -350,10 +320,10 @@ def write_report(m_res, out_dir: Path):
         lines.append(
             f"  {name:<10} {m['trades']:>5} {m['win_rate']:>5.1f}%"
             f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
-            f" {m['max_dd']:>6.1f}% {m['tp_count']:>4} {m['sl_count']:>4} {m['be_count']:>3} {m['eod_count']:>3}{flag}"
+            f" {m['max_dd']:>6.1f}% {m['tp_count']:>4} {m['sl_count']:>4} {m['eod_count']:>3}{flag}"
         )
             
-    lines += [f"  └{'─'*71}┘", ""]
+    lines += [f"  └{'─'*67}┘", ""]
     txt = "\n".join(lines)
     print(txt)
     (out_dir / "report.txt").write_text(txt)
@@ -366,17 +336,17 @@ def main():
     data_dir = Path(args.data_dir); out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v9.0A  —  The London Specialist")
+    print(f"  PropBot v10.1  —  The Gold Momentum Scalper (Extended)")
     print(f"{'═'*60}\n")
 
-    pair = SWEEP_CFG["pairs"][0]
+    pair = GOLD_CFG["pairs"][0]
     print(f"  Loading {pair} M1 data...", end=" ", flush=True)
     m1_data = load_pair(data_dir, pair)
     if m1_data.empty: sys.exit("NO DATA")
     print(f"{len(m1_data):,} records loaded.\n")
 
-    print(f"  Executing London Specialist Strategy...", end=" ", flush=True)
-    t_tr, eq_tr, t_oo, eq_oo = strategy_specialist(m1_data, pair)
+    print(f"  Executing Gold Momentum Strategy on M5...", end=" ", flush=True)
+    t_tr, eq_tr, t_oo, eq_oo = strategy_gold_momentum(m1_data, pair)
     m_res = {"train": metrics(t_tr, eq_tr, "Train"), "oos": metrics(t_oo, eq_oo, "OOS")}
     print(f"Done. (OOS Trades: {m_res['oos']['trades']})")
 
