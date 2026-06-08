@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v3.0  —  Aggressive Scalp & Break-Even Edition
+PropBot Backtester v3.1  —  Optimal Scalp & BE Edition
 ══════════════════════════════════════════════════════════════════
 STR-A : EMA Multi-Timeframe  (H4 trend + H1 entry + RSI fixed)
-STR-B : London Breakout      (Hyper-Optimized for GBPUSD + BE Logic)
+STR-B : London Breakout      (GBPUSD | R:R 1.5 | BE at 1.0R)
 Account: $5,000 prop firm
 Split  : Train 2010-2019  |  OOS 2020-2025
 Costs  : Dynamic Spread + Breakout Slippage included
@@ -24,10 +24,10 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.005,     # ریسک 0.5% برای مهار دراوداون
+    risk_pct     = 0.005,     # ریسک 0.5%
     max_open     = 2,
-    daily_dd_lim = 0.03,      # 3% daily freeze  ($150)
-    max_dd_kill  = 0.07,      # 7% kill switch   ($350)
+    daily_dd_lim = 0.03,      
+    max_dd_kill  = 0.07,      
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ PIP_SIZE = dict(
 
 SLIPPAGE_PIP_STD = 0.5        
 SLIPPAGE_PIP_LBO = 1.5        # اسلیپیج سنگین برای سفارش‌های استاپ
-LONDON_SPREAD_MULTIPLIER = 2.5 # ضریب واید شدن اسپرد در ساعت باز شدن لندن
+LONDON_SPREAD_MULTIPLIER = 2.5 # ضریب واید شدن اسپرد لندن
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
@@ -71,12 +71,12 @@ LBO_CFG = dict(
     asian_end     = 7,    
     entry_open    = 7,    
     entry_close   = 10,   
-    force_close   = 16,       # اجازه رشد سود تا میانه‌ی سشن نیویورک
-    min_range_pip = 6,        # کاهش سخت‌گیری برای گرفتن فرکانس سیگنال بالاتر
+    force_close   = 16,       
+    min_range_pip = 6,        
     max_range_pip = 45,       
     buffer_pip    = 2,    
     sl_inside_pip = 3,    
-    rr            = 2.8,      # استخراج حداکثر ارزش از روندهای قوی لندن
+    rr            = 1.5,      # بازگشت به واقعیت: R:R = 1.5
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ def atr(h, l, c, n):
     return tr.ewm(com=n-1, adjust=False).mean()
 
 # ─────────────────────────────────────────────────────────────
-#  TRADE ENGINE  (Pessimistic + Break-Even Logic)
+#  TRADE ENGINE  (Pessimistic + Fast Break-Even Logic)
 # ─────────────────────────────────────────────────────────────
 def get_trade_cost(pair: str, ts: pd.Timestamp, is_breakout: bool) -> float:
     pip = PIP_SIZE[pair]
@@ -170,8 +170,6 @@ def _close_pos(pos, ep, ts, pair):
     sl_pip  = abs(pos.entry - pos.sl) / pos.pip
     if sl_pip < 1e-5: return 0.0
     
-    # Base calculation uses initial risk parameters for sizing logic
-    # Even if SL was moved to BE, position size (risk_usd / sl_pip_initial) remains fixed
     initial_sl_pip = pos.initial_risk / pos.pip
     pnl_usd = pnl_pip / initial_sl_pip * pos.risk_usd
     pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / initial_sl_pip)
@@ -206,7 +204,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
 
         o, h, l = row["open"], row["high"], row["low"]
 
-        # ── 1. Close positions (Pessimistic Check Maintained) ──
+        # ── 1. Close positions ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -229,7 +227,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 equity += pnl
                 peak    = max(peak, equity)
                 
-                # Tag BE hits for better reporting
+                # Tag BE hits
                 if res == "sl" and pos.be_triggered:
                     res = "be"
                     
@@ -245,14 +243,13 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 
         for p in closed: positions.remove(p)
 
-        # ── 2. Break-Even Logic for Surviving Positions ──
+        # ── 2. Fast Break-Even Logic (At 1.0R instead of 1.5R) ──
         for pos in positions:
             if not pos.be_triggered and is_breakout:
-                # اگر قیمت به 1.5 برابر ریسک در جهت سود رسید، استاپ لاس به نقطه ورود + هزینه منتقل می‌شود
-                if pos.d == 1 and row["high"] >= pos.entry + 1.5 * pos.initial_risk:
+                if pos.d == 1 and row["high"] >= pos.entry + 1.0 * pos.initial_risk:
                     pos.sl = pos.entry + pos.c_cost
                     pos.be_triggered = True
-                elif pos.d == -1 and row["low"] <= pos.entry - 1.5 * pos.initial_risk:
+                elif pos.d == -1 and row["low"] <= pos.entry - 1.0 * pos.initial_risk:
                     pos.sl = pos.entry - pos.c_cost
                     pos.be_triggered = True
 
@@ -456,11 +453,11 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     div = "═"*72
     lines = [
         div,
-        f"  PropBot Backtester v3.0  —  Account: $5,000",
+        f"  PropBot Backtester v3.1  —  Account: $5,000",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
         f"  Split : Train 2010-2019  |  OOS 2020-2025",
         f"  Costs : Dynamic Spread & Breakout Penalty Included",
-        f"  Logic : 0.5% Risk | R:R 2.8 | Break-Even Active",
+        f"  Logic : 0.5% Risk | R:R 1.5 | Break-Even at 1.0R",
         div,"",
     ]
 
@@ -471,7 +468,7 @@ def write_report(ema_res, lbo_res, out_dir: Path):
 
     for strat_name, results in [
         ("STRATEGY A — EMA Multi-Timeframe (H4 trend + H1 entry + RSI)", ema_res),
-        ("STRATEGY B — London Breakout    (Hyper-Optimized GBPUSD + BE)", lbo_res),
+        ("STRATEGY B — London Breakout    (Optimal Scalp GBPUSD + BE)", lbo_res),
     ]:
         lines += ["", f"  ╔{'═'*72}╗",
                   f"  ║  {strat_name:<70}║",
@@ -547,8 +544,8 @@ def main():
     out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v3.0  —  Aggressive Scalp & Break-Even Edition")
-    print(f"  0.5% Risk | R:R 2.8 | GBPUSD Focus")
+    print(f"  PropBot v3.1  —  Optimal Scalp & BE Edition")
+    print(f"  0.5% Risk | R:R 1.5 | Break-Even at 1.0R")
     print(f"{'═'*60}\n")
 
     m1_cache = {}
