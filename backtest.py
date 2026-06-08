@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v2.0  —  دو استراتژی، یک انتخاب
+PropBot Backtester v2.1  —  Artificial Pessimism Edition
 ══════════════════════════════════════════════════════════════════
 STR-A : EMA Multi-Timeframe  (H4 trend + H1 entry + RSI fixed)
 STR-B : London Breakout      (Asian range break at London open)
 Account: $5,000 prop firm
 Split  : Train 2010-2019  |  OOS 2020-2025
-Costs  : spread + 0.5-pip slippage (realistic)
+Costs  : Dynamic Spread (Wider at London Open) + Breakout Slippage
 ══════════════════════════════════════════════════════════════════
 """
 
 import sys, zipfile, io, csv, json, argparse
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -30,13 +30,19 @@ ACCOUNT = dict(
     max_dd_kill  = 0.07,      # 7% kill switch    ($350)
 )
 
+# ─────────────────────────────────────────────────────────────
+#  PESSIMISTIC COST CONFIGURATION
+# ─────────────────────────────────────────────────────────────
 SPREAD_PIPS = dict(
     EURUSD=1.2, GBPUSD=1.5, AUDUSD=1.4, USDCAD=1.8, XAUUSD=30,
 )
 PIP_SIZE = dict(
     EURUSD=1e-4, GBPUSD=1e-4, AUDUSD=1e-4, USDCAD=1e-4, XAUUSD=0.01,
 )
-SLIPPAGE_PIP = 0.5
+
+SLIPPAGE_PIP_STD = 0.5        # اسلیپیج استاندارد برای ورودهای پولبک (STR-A)
+SLIPPAGE_PIP_LBO = 1.5        # اسلیپیج سنگین‌تر برای سفارش‌های استاپ در بریک‌اوت (STR-B)
+LONDON_SPREAD_MULTIPLIER = 2.5 # ضریب واید شدن اسپرد در ساعت باز شدن لندن (07:00 UTC)
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
@@ -49,10 +55,10 @@ EMA_CFG = dict(
     h4_ema_fast   = 20,
     h4_ema_slow   = 50,
     h1_rsi        = 14,
-    h1_rsi_bull   = 45,   # RSI > 45 to confirm momentum in uptrend
-    h1_rsi_bear   = 55,   # RSI < 55 in downtrend
+    h1_rsi_bull   = 45,
+    h1_rsi_bear   = 55,
     h1_atr        = 14,
-    pullback_band = 0.8,  # ± 0.8 × ATR around EMA20
+    pullback_band = 0.8,  
     sl_atr        = 1.5,
     rr            = 1.6,
     session_open  = 7,
@@ -61,15 +67,15 @@ EMA_CFG = dict(
 
 LBO_CFG = dict(
     pairs         = ["EURUSD", "GBPUSD"],
-    asian_start   = 0,    # UTC hour
-    asian_end     = 7,    # UTC hour (exclusive)
-    entry_open    = 7,    # London open
-    entry_close   = 10,   # last bar to enter
-    force_close   = 13,   # exit all before NY session swamp
-    min_range_pip = 8,    # Asian range too tight → skip
-    max_range_pip = 50,   # Asian range too wide  → skip
-    buffer_pip    = 2,    # breakout confirmation buffer
-    sl_inside_pip = 3,    # SL inside range from breakout side
+    asian_start   = 0,    
+    asian_end     = 7,    
+    entry_open    = 7,    
+    entry_close   = 10,   
+    force_close   = 13,   
+    min_range_pip = 8,    
+    max_range_pip = 50,   
+    buffer_pip    = 2,    
+    sl_inside_pip = 3,    
     rr            = 1.5,
 )
 
@@ -135,36 +141,43 @@ def atr(h, l, c, n):
     return tr.ewm(com=n-1, adjust=False).mean()
 
 # ─────────────────────────────────────────────────────────────
-#  TRADE ENGINE  (shared)
+#  TRADE ENGINE  (Pessimistic Upgrades)
 # ─────────────────────────────────────────────────────────────
-def cost(pair):
+def get_trade_cost(pair: str, ts: pd.Timestamp, is_breakout: bool) -> float:
+    """محاسبه هزینه داینامیک بر اساس استراتژی و زمان"""
     pip = PIP_SIZE[pair]
-    return (SPREAD_PIPS.get(pair,2) + SLIPPAGE_PIP*2) * pip
+    base_spread = SPREAD_PIPS.get(pair, 2.0)
+    
+    # واید شدن اسپرد در سشن لندن
+    if ts.hour == 7:
+        spread = base_spread * LONDON_SPREAD_MULTIPLIER
+    else:
+        spread = base_spread
+        
+    # جریمه اسلیپیج برای بریک‌اوت
+    slippage = SLIPPAGE_PIP_LBO if is_breakout else SLIPPAGE_PIP_STD
+    
+    return (spread + slippage * 2) * pip
 
 class Pos:
-    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip"]
-    def __init__(self,d,entry,sl,tp,t0,risk_usd,pip):
-        self.d,self.entry,self.sl,self.tp=d,entry,sl,tp
-        self.t0,self.risk_usd,self.pip=t0,risk_usd,pip
+    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost"]
+    def __init__(self, d, entry, sl, tp, t0, risk_usd, pip, c_cost):
+        self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
+        self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
+        self.c_cost = c_cost # هزینه ذخیره شده در زمان باز شدن معامله
 
 def _close_pos(pos, ep, ts, pair):
     move    = (ep - pos.entry) * pos.d
     pnl_pip = move / pos.pip
     sl_pip  = abs(pos.entry - pos.sl) / pos.pip
-    if sl_pip < 1: return 0.0
+    if sl_pip < 1e-5: return 0.0
     pnl_usd = pnl_pip / sl_pip * pos.risk_usd
-    pnl_usd -= (cost(pair) / pos.pip) * (pos.risk_usd / sl_pip)
+    pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / sl_pip)
     return pnl_usd
 
 def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
-            force_close_hour: int = 20) -> tuple:
-    """
-    Generic simulator.  signals df must have columns:
-      sig_long, sig_short  (boolean, already shifted for no-lookahead)
-    Optional: force_sl, force_tp  (float) — used by LBO for per-trade SL/TP
-    """
+            force_close_hour: int = 20, is_breakout: bool = False) -> tuple:
     pip      = PIP_SIZE[pair]
-    c_cost   = cost(pair)
     acct     = ACCOUNT
 
     equity   = acct["initial_bal"]
@@ -191,7 +204,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
 
         o, h, l = row["open"], row["high"], row["low"]
 
-        # ── close positions ──
+        # ── close positions (Pessimistic Check Maintained) ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -218,6 +231,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                     open_time=str(pos.t0), close_time=str(ts),
                     open_px=round(pos.entry,5), close_px=round(ep,5),
                     sl=round(pos.sl,5), tp=round(pos.tp,5),
+                    cost_pips=round(pos.c_cost/pip, 1), # اضافه شدن گزارش هزینه به رکوردها
                     pnl=round(pnl,2), result=res, equity=round(equity,2),
                 ))
                 closed.append(pos)
@@ -242,6 +256,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
         risk_usd  = equity * acct["risk_pct"]
 
         if sig.get("sig_long") and not has_long:
+            c_cost = get_trade_cost(pair, ts, is_breakout)
             entry = o + c_cost / 2
             if has_per_trade_sl:
                 sl, tp = sig["force_sl"], sig["force_tp_l"]
@@ -251,9 +266,10 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 sl = entry - atr_v * EMA_CFG["sl_atr"]
                 tp = entry + atr_v * EMA_CFG["sl_atr"] * EMA_CFG["rr"]
             if abs(entry - sl) / pip < 5: continue
-            positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip))
+            positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
         elif sig.get("sig_short") and not has_short:
+            c_cost = get_trade_cost(pair, ts, is_breakout)
             entry = o - c_cost / 2
             if has_per_trade_sl:
                 sl, tp = sig["force_sl"], sig["force_tp_s"]
@@ -263,33 +279,28 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 sl = entry + atr_v * EMA_CFG["sl_atr"]
                 tp = entry - atr_v * EMA_CFG["sl_atr"] * EMA_CFG["rr"]
             if abs(entry - sl) / pip < 5: continue
-            positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip))
+            positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
     return trades, eq_curve
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY A  —  EMA Multi-TF  (H4 trend + H1 entry)
+#  STRATEGY A  —  EMA Multi-TF
 # ─────────────────────────────────────────────────────────────
 def strategy_ema(m1: pd.DataFrame, pair: str) -> tuple:
     cfg = EMA_CFG
 
-    # ── build H4 trend ──
     h4 = resample(m1, "4h")
     h4["ef"] = ema(h4["close"], cfg["h4_ema_fast"])
     h4["es"] = ema(h4["close"], cfg["h4_ema_slow"])
     h4["h4_bull"] = (h4["ef"] > h4["es"]).astype(int)
-    # forward-fill H4 signal to M1 index, then resample to H1
     h4_trend = h4["h4_bull"].reindex(m1.index, method="ffill")
 
-    # ── build H1 bars ──
     h1 = resample(m1, "1h")
     h1["rsi_v"] = rsi(h1["close"], cfg["h1_rsi"])
     h1["atr_v"] = atr(h1["high"], h1["low"], h1["close"], cfg["h1_atr"])
     h1["ema20"]  = ema(h1["close"], cfg["h4_ema_fast"])
-    # bring H4 trend into H1
     h1["h4_bull"] = h4_trend.reindex(h1.index, method="ffill").fillna(0).astype(int)
 
-    # ── entry conditions (evaluated on current bar) ──
     near = (h1["close"] - h1["ema20"]).abs() <= cfg["pullback_band"] * h1["atr_v"]
     rsi_bull = h1["rsi_v"] > cfg["h1_rsi_bull"]
     rsi_bear = h1["rsi_v"] < cfg["h1_rsi_bear"]
@@ -299,22 +310,20 @@ def strategy_ema(m1: pd.DataFrame, pair: str) -> tuple:
     raw_long  = (h1["h4_bull"] == 1) & near & rsi_bull & in_sess
     raw_short = (h1["h4_bull"] == 0) & near & rsi_bear & in_sess
 
-    # strict no-lookahead
     sigs = pd.DataFrame(index=h1.index)
     sigs["sig_long"]  = raw_long.shift(1).fillna(False)
     sigs["sig_short"] = raw_short.shift(1).fillna(False)
 
-    # attach ATR to h1 for position sizing in engine
     h1["atr"] = h1["atr_v"]
 
-    # split
     h1_train = h1[h1.index <= TRAIN_END]
     h1_oos   = h1[h1.index >= TEST_START]
     s_train  = sigs[sigs.index <= TRAIN_END]
     s_oos    = sigs[sigs.index >= TEST_START]
 
-    t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["session_close"])
-    t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["session_close"])
+    # پارامتر is_breakout=False
+    t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["session_close"], False)
+    t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["session_close"], False)
     return t_tr, eq_tr, t_oo, eq_oo
 
 # ─────────────────────────────────────────────────────────────
@@ -327,7 +336,6 @@ def strategy_lbo(m1: pd.DataFrame, pair: str) -> tuple:
     h1 = resample(m1, "1h")
     h1["date"] = h1.index.date
 
-    # ── compute Asian range per day ──
     asian_mask = (h1.index.hour >= cfg["asian_start"]) & \
                  (h1.index.hour <  cfg["asian_end"])
     asian = h1[asian_mask].groupby("date").agg(
@@ -336,12 +344,8 @@ def strategy_lbo(m1: pd.DataFrame, pair: str) -> tuple:
     )
     asian["range_pip"] = (asian["asian_high"] - asian["asian_low"]) / pip
 
-    # filter on range size
-    asian = asian[
-        asian["range_pip"].between(cfg["min_range_pip"], cfg["max_range_pip"])
-    ]
+    asian = asian[asian["range_pip"].between(cfg["min_range_pip"], cfg["max_range_pip"])]
 
-    # ── build signal frame for London hours ──
     london_mask = (h1.index.hour >= cfg["entry_open"]) & \
                   (h1.index.hour <= cfg["entry_close"])
     london = h1[london_mask].copy()
@@ -352,14 +356,9 @@ def strategy_lbo(m1: pd.DataFrame, pair: str) -> tuple:
     buf      = cfg["buffer_pip"] * pip
     sl_buf   = cfg["sl_inside_pip"] * pip
 
-    # breakout: open of the bar is already outside the range
-    # (entry at open of next bar — we will shift)
     london["raw_long"]  = london["open"] > (london["asian_high"] + buf)
     london["raw_short"] = london["open"] < (london["asian_low"]  - buf)
 
-    # per-trade SL / TP stored in signal frame
-    # Long:  SL = asian_high - sl_buf,  TP = entry + range * rr
-    # Short: SL = asian_low  + sl_buf,  TP = entry - range * rr
     london["force_sl"]   = np.where(
         london["raw_long"],
         london["asian_high"] - sl_buf,
@@ -369,29 +368,24 @@ def strategy_lbo(m1: pd.DataFrame, pair: str) -> tuple:
     london["force_tp_l"] = london["asian_high"] + buf + r_pip * cfg["rr"]
     london["force_tp_s"] = london["asian_low"]  - buf - r_pip * cfg["rr"]
 
-    # no-lookahead shift
     sigs = london[["raw_long","raw_short","force_sl","force_tp_l","force_tp_s"]].copy()
     sigs["sig_long"]  = sigs["raw_long"].shift(1).fillna(False)
     sigs["sig_short"] = sigs["raw_short"].shift(1).fillna(False)
-    # SL/TP don't shift — they reference the prior bar's range (already known)
 
-    # only one entry per day per direction
     sigs["date"] = sigs.index.date
     sigs = sigs[~sigs.duplicated(subset=["date","sig_long","sig_short"], keep="first")]
 
-    # full H1 bars for the engine
     sigs_full = sigs.reindex(h1.index)
-    sigs_full[["sig_long","sig_short"]] = \
-        sigs_full[["sig_long","sig_short"]].fillna(False)
+    sigs_full[["sig_long","sig_short"]] = sigs_full[["sig_long","sig_short"]].fillna(False)
 
-    # split
     h1_train = h1[h1.index <= TRAIN_END]
     h1_oos   = h1[h1.index >= TEST_START]
     s_train  = sigs_full[sigs_full.index <= TRAIN_END]
     s_oos    = sigs_full[sigs_full.index >= TEST_START]
 
-    t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["force_close"])
-    t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["force_close"])
+    # پارامتر is_breakout=True
+    t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["force_close"], True)
+    t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["force_close"], True)
     return t_tr, eq_tr, t_oo, eq_oo
 
 # ─────────────────────────────────────────────────────────────
@@ -444,10 +438,10 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     div = "═"*72
     lines = [
         div,
-        f"  PropBot Backtester v2.0  —  Account: $5,000",
+        f"  PropBot Backtester v2.1  —  Account: $5,000",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
         f"  Split : Train 2010-2019  |  OOS 2020-2025",
-        f"  Costs : spread (pair-specific) + {SLIPPAGE_PIP}-pip slippage each side",
+        f"  Costs : Dynamic Spread & Breakout Penalty Included",
         div,"",
     ]
 
@@ -488,21 +482,12 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     # ── verdict ──
     lines += ["", div, "  VERDICT", div]
     def oos_pnl(res): return sum(r["oos"]["net_pnl"] for r in res)
-    def oos_dd(res):  return max(r["oos"]["max_dd"]   for r in res)
-
+    
     ea_pnl = oos_pnl(ema_res); la_pnl = oos_pnl(lbo_res)
     winner = "STR-A (EMA)" if ea_pnl > la_pnl else "STR-B (London Breakout)"
     lines += [
         f"  OOS net P&L  →  STR-A: {ea_pnl:+.0f}$   STR-B: {la_pnl:+.0f}$",
         f"  Winner (OOS) →  {winner}",
-        "",
-        "  Notes:",
-        "  • OOS win is the only metric that matters for prop live trading.",
-        "  • Profit Factor < 1.0 = losing strategy — do NOT go live.",
-        "  • Profit Factor 1.0-1.3 = marginal — needs more validation.",
-        "  • Profit Factor > 1.3 with Sharpe > 0.5 = acceptable for live.",
-        "  • Max DD shown is per-pair peak-to-trough during simulation.",
-        "  • ⚠ = DD > 6% — too close to 7% prop kill threshold.",
         "",
     ]
 
@@ -533,44 +518,6 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     } for r in lbo_res]}
     (out_dir/"summary.json").write_text(json.dumps(summary, indent=2))
 
-    # chart
-    try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt, matplotlib.dates as mdates
-
-        n_pairs = max(len(ema_res), len(lbo_res))
-        fig, axes = plt.subplots(2, n_pairs, figsize=(5*n_pairs, 8), squeeze=False)
-        fig.suptitle("PropBot v2 — Equity Curves (OOS 2020-2025)", fontsize=12)
-
-        for row_i, (label, results, color) in enumerate([
-            ("STR-A EMA", ema_res, "#2563eb"),
-            ("STR-B LBO", lbo_res, "#16a34a"),
-        ]):
-            for col_i, r in enumerate(results):
-                ax = axes[row_i][col_i]
-                eq = r.get("eq_oos",[])
-                if eq:
-                    dts=[e["datetime"] for e in eq]
-                    eqs=[e["equity"]   for e in eq]
-                    ax.plot(dts, eqs, color=color, linewidth=0.8)
-                    ax.axhline(ACCOUNT["initial_bal"], color="#9ca3af",
-                               linewidth=0.5, linestyle="--")
-                m = r["oos"]
-                ax.set_title(
-                    f"{label} | {r['pair']}\n"
-                    f"WR={m.get('win_rate',0):.0f}%  PF={m.get('pf',0):.2f}  "
-                    f"DD={m.get('max_dd',0):.1f}%", fontsize=8)
-                ax.set_ylabel("$", fontsize=7)
-                ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-                ax.tick_params(labelsize=6); ax.grid(True, alpha=0.2)
-
-        plt.tight_layout()
-        plt.savefig(out_dir/"equity_oos.png", dpi=130, bbox_inches="tight")
-        plt.close()
-        print(f"  [OK] Chart → {out_dir/'equity_oos.png'}")
-    except ImportError:
-        print("  [INFO] matplotlib not found — chart skipped")
-
 # ─────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────
@@ -583,12 +530,10 @@ def main():
     out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v2.0  —  $5K Prop Account")
-    print(f"  Two strategies: EMA Multi-TF  vs  London Breakout")
-    print(f"  Data: {data_dir.resolve()}")
+    print(f"  PropBot v2.1  —  Artificial Pessimism Edition")
+    print(f"  Costs: Dynamic Spread & Breakout Penalty Included")
     print(f"{'═'*60}\n")
 
-    # ── preload M1 data ──
     m1_cache = {}
     all_pairs = list(set(EMA_CFG["pairs"] + LBO_CFG["pairs"]))
     for pair in all_pairs:
@@ -601,7 +546,6 @@ def main():
 
     print()
 
-    # ── Strategy A ──
     print("  ── Strategy A: EMA Multi-TF ──────────────────────────")
     ema_results = []
     for pair in EMA_CFG["pairs"]:
@@ -617,7 +561,6 @@ def main():
                                 eq_train=eq_tr, eq_oos=eq_oo))
     print()
 
-    # ── Strategy B ──
     print("  ── Strategy B: London Breakout ────────────────────────")
     lbo_results = []
     for pair in LBO_CFG["pairs"]:
