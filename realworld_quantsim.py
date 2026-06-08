@@ -1,5 +1,5 @@
 """
-CorrArb v14b — Fixed Risk Control & Multi-Timeframe Analysis
+CorrArb v14c — Dynamic Timeframe Scaling
 ============================================================
 """
 
@@ -21,7 +21,6 @@ class GlobalConfig:
     lot_size           = 100_000
     max_lot            = 3.0
     min_lot            = 0.01
-    warmup             = 500
     consec_loss_n      = 2
     risk_reduce        = 0.5
     cooldown_days      = 10
@@ -31,20 +30,24 @@ class GlobalConfig:
     bad_hours          = {4, 5, 7, 9, 13, 18, 20}
     trade_days         = [0, 1, 2, 3, 4]
     max_trades_day     = 2
-    z_fast_period      = 96
+    
+    # ── پارامترهای مرجع (بر اساس 15 دقیقه) ──
+    warmup_base        = 500
+    z_fast_period_base = 96
+    atr_period_base    = 14
+    atr_ma_period_base = 96
+    vr_period_base     = 200
+    corr_period_base   = 96
+    
     z_entry            = 2.1
     z_exit_partial     = 0.50
     z_exit_full        = 0.0
     z_stop_margin      = 4.0
     min_net_profit_usd = 15.0
     partial_ratio      = 0.75
-    atr_period         = 14
-    atr_ma_period      = 96
     atr_max_mult       = 3.0
     atr_min_mult       = 0.5
-    vr_period          = 200
     vr_k               = 4
-    corr_period        = 96
 
     # ── Risk Control ──
     dd_levels = [
@@ -92,6 +95,27 @@ PAIR_CFG = {
     },
 }
 
+# ═══════════════════════════════════════════════════════
+# DYNAMIC CONFIGURATOR
+# ═══════════════════════════════════════════════════════
+def get_dynamic_config(tf_str):
+    """
+    تبدیل پارامترهای تایم‌فریم 15 دقیقه به تایم‌فریم هدف
+    تا «رفتار زمانی» اندیکاتورها دقیقاً یکسان بماند.
+    """
+    tf_map = {'1min': 1, '5min': 5, '15min': 15, '1h': 60}
+    mins = tf_map.get(tf_str, 15)
+    ratio = 15.0 / mins  # ضریب تبدیل نسبت به 15 دقیقه
+
+    G = GlobalConfig
+    return {
+        'warmup': max(50, int(G.warmup_base * ratio)),
+        'z_fast_period': max(2, int(G.z_fast_period_base * ratio)),
+        'atr_period': max(2, int(G.atr_period_base * ratio)),
+        'atr_ma_period': max(2, int(G.atr_ma_period_base * ratio)),
+        'vr_period': max(2, int(G.vr_period_base * ratio)),
+        'corr_period': max(2, int(G.corr_period_base * ratio)),
+    }
 
 # ═══════════════════════════════════════════════════════
 # DATA
@@ -118,7 +142,6 @@ def load_raw_zip(pattern):
     raw[['o', 'h', 'l', 'c']] = raw[['o', 'h', 'l', 'c']].astype(float)
     return raw
 
-
 def load_raw_csv(pattern):
     paths = sorted(glob.glob(pattern))
     if not paths: return None
@@ -137,28 +160,25 @@ def load_raw_csv(pattern):
     raw[['o', 'h', 'l', 'c']] = raw[['o', 'h', 'l', 'c']].astype(float)
     return raw
 
-
 def load_instrument(name):
     for pat in [
-        f'data/HISTDATA*{name}*.zip',
-        f'data/*{name}*.zip',
-        f'data/HISTDATA*{name}*.csv',
-        f'data/*{name}*.csv',
+        f'data/HISTDATA*{name}*.zip', f'data/*{name}*.zip',
+        f'data/HISTDATA*{name}*.csv', f'data/*{name}*.csv',
     ]:
         raw = (load_raw_zip(pat) if '.zip' in pat else load_raw_csv(pat))
         if raw is not None and len(raw) > 1000:
             return raw
     return None
 
-# تغییر مهم: تابع داینامیک برای گرفتن تایم‌فریم‌های مختلف
 def to_tf(raw, sfx, tf):
+    # برای 1h ممکن است در دیتای شما H نوشته شود، هندلینگ ساده:
+    tf_str = '60min' if tf == '1h' else tf
     return pd.DataFrame({
-        f'o_{sfx}': raw['o'].resample(tf).first(),
-        f'h_{sfx}': raw['h'].resample(tf).max(),
-        f'l_{sfx}': raw['l'].resample(tf).min(),
-        f'c_{sfx}': raw['c'].resample(tf).last(),
+        f'o_{sfx}': raw['o'].resample(tf_str).first(),
+        f'h_{sfx}': raw['h'].resample(tf_str).max(),
+        f'l_{sfx}': raw['l'].resample(tf_str).min(),
+        f'c_{sfx}': raw['c'].resample(tf_str).last(),
     }).dropna()
-
 
 def build_pair(pcfg, tf):
     r1 = load_instrument(pcfg['leg1'])
@@ -190,7 +210,7 @@ def build_pair(pcfg, tf):
 
 
 # ═══════════════════════════════════════════════════════
-# SIGNALS & RISK MULTIPLIER (بدون تغییر)
+# SIGNALS & RISK MULTIPLIER
 # ═══════════════════════════════════════════════════════
 def calc_atr(h, l, c, period=14):
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
@@ -203,21 +223,23 @@ def calc_vr(series, k, window):
     vk = rk.rolling(window).var()
     return vk / (k * v1.replace(0, np.nan))
 
-def compute_signals(df, pcfg):
+def compute_signals(df, pcfg, dyn_cfg):
     G = GlobalConfig
     log_r  = np.log(df['c_spread'].replace(0, np.nan))
-    z_mean = log_r.rolling(G.z_fast_period).mean()
-    z_std  = log_r.rolling(G.z_fast_period).std()
+    
+    # استفاده از پارامترهای داینامیک
+    z_mean = log_r.rolling(dyn_cfg['z_fast_period']).mean()
+    z_std  = log_r.rolling(dyn_cfg['z_fast_period']).std()
     z      = (log_r - z_mean) / z_std.replace(0, np.nan)
 
-    corr    = (df['c_leg1'].pct_change().rolling(G.corr_period).corr(df['c_leg2'].pct_change()))
+    corr    = (df['c_leg1'].pct_change().rolling(dyn_cfg['corr_period']).corr(df['c_leg2'].pct_change()))
     corr_ok = corr.abs() > pcfg['corr_min']
 
-    vr        = calc_vr(log_r, G.vr_k, G.vr_period)
+    vr        = calc_vr(log_r, G.vr_k, dyn_cfg['vr_period'])
     regime_ok = vr < pcfg['vr_max']
 
-    atr    = calc_atr(df['h_spread'], df['l_spread'], df['c_spread'], G.atr_period)
-    atr_ma = atr.rolling(G.atr_ma_period).mean()
+    atr    = calc_atr(df['h_spread'], df['l_spread'], df['c_spread'], dyn_cfg['atr_period'])
+    atr_ma = atr.rolling(dyn_cfg['atr_ma_period']).mean()
     vol_ok = ((atr > atr_ma * G.atr_min_mult) & (atr < atr_ma * G.atr_max_mult))
 
     hour    = pd.Series(df.index.hour, index=df.index)
@@ -263,7 +285,7 @@ def new_acc(ts):
         'consec_loss': 0,
     }
 
-def run_portfolio(pair_data, tf_name):
+def run_portfolio(pair_data, tf_name, dyn_cfg):
     G = GlobalConfig
     cidx = None
     for name, (df, sig, z, pcfg) in pair_data.items():
@@ -285,8 +307,9 @@ def run_portfolio(pair_data, tf_name):
 
     FLOOR  = G.initial_balance * (1 - G.max_total_dd_pct)
     TARGET = G.initial_balance * (1 + G.profit_target_pct)
-
-    acc          = new_acc(cidx[G.warmup])
+    
+    warmup = dyn_cfg['warmup']
+    acc          = new_acc(cidx[warmup])
     withdrawn    = 0.0
     acc_num      = 1
     day_eq       = G.initial_balance
@@ -303,10 +326,7 @@ def run_portfolio(pair_data, tf_name):
     prev_date  = None
     prev_month = None
 
-    print(f"  ▶ Portfolio ({tf_name}): {list(pair_data.keys())}")
-    print(f"    Bars:{N:,} | {cidx[0].date()} → {cidx[-1].date()}")
-
-    for bar in range(G.warmup, N):
+    for bar in range(warmup, N):
         ts        = cidx[bar]
         cur_date  = ts.date()
         cur_month = (ts.year, ts.month)
@@ -326,7 +346,6 @@ def run_portfolio(pair_data, tf_name):
 
         in_cd = cooldown_til is not None and ts < cooldown_til
 
-        # Blown Check
         if acc['blown']:
             acc_logs.append({
                 'reason': acc['blown_rsn'], 'pnl': acc['equity'] - G.initial_balance,
@@ -344,11 +363,9 @@ def run_portfolio(pair_data, tf_name):
 
         if in_cd: continue
 
-        # Risk multiplier
         month_pnl = acc['equity'] - month_eq
         risk_mult = get_risk_mult(acc['equity'], acc['peak'], pnl_hist, month_pnl, G.monthly_loss_threshold)
 
-        # Open
         for name in pair_data:
             a = pa[name]; pcfg = a['cfg']
             if pending[name] != 0 and positions[name] is None and day_trades[name] < G.max_trades_day:
@@ -368,7 +385,6 @@ def run_portfolio(pair_data, tf_name):
                 day_trades[name] += 1
             pending[name] = 0
 
-        # Float / Daily limit
         total_float = sum(
             pnl_calc(p['dir'], p['entry'], pa[n]['c'][bar], p['lot_rem'], pa[n]['qr'][bar], p['pip'])
             for n in pair_data if (p := positions[n]) is not None
@@ -389,7 +405,6 @@ def run_portfolio(pair_data, tf_name):
                 positions[name] = None
             continue
 
-        # Exit
         for name in pair_data:
             pos = positions[name]
             if pos is None: continue
@@ -432,7 +447,6 @@ def run_portfolio(pair_data, tf_name):
                 if fpnl > 0: acc['consec_loss'] = 0
                 else:        acc['consec_loss'] += 1
 
-        # Target
         if acc['equity'] >= TARGET and all(positions[n] is None for n in pair_data):
             w = acc['equity'] - G.initial_balance
             withdrawn += w
@@ -444,7 +458,6 @@ def run_portfolio(pair_data, tf_name):
             prev_date = cur_date; prev_month = cur_month
             continue
 
-        # Signals
         for name in pair_data:
             a = pa[name]
             if (positions[name] is None and not acc['blown'] and not in_cd
@@ -453,7 +466,7 @@ def run_portfolio(pair_data, tf_name):
 
     return {'all_trades': all_trades, 'account_logs': acc_logs,
             'withdrawn': withdrawn, 'final_equity': acc['equity'],
-            'common_idx': cidx, 'eq_curve': eq_curve}
+            'common_idx': cidx, 'eq_curve': eq_curve, 'warmup': warmup}
 
 
 # ═══════════════════════════════════════════════════════
@@ -475,8 +488,9 @@ def print_report(res, title, tf_str):
     pf     = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) else 99.0
 
     ci = res['common_idx']
+    warmup = res['warmup']
     all_months = pd.period_range(
-        start=ci[GlobalConfig.warmup].to_period('M'),
+        start=ci[warmup].to_period('M'),
         end=ci[-1].to_period('M'), freq='M')
     monthly = df.groupby('month')['pnl'].sum().reindex(all_months, fill_value=0.0)
 
@@ -490,9 +504,8 @@ def print_report(res, title, tf_str):
     print(f"  Trades:{len(df):,}  WR:{wr:.1f}%  PF:{pf:.3f}")
     print(f"  Net:${df['pnl'].sum():,.2f}  MonthAvg:${monthly.mean():.2f}  Sharpe:{sharpe:.2f}  Blows:{n_blow}")
     
-    # Save CSVs uniquely for each timeframe
-    monthly.to_csv(f'monthly_v14b_{tf_str}.csv', header=['pnl'])
-    pd.DataFrame(res['eq_curve']).to_csv(f'equity_v14b_{tf_str}.csv', index=False)
+    monthly.to_csv(f'monthly_v14c_{tf_str}.csv', header=['pnl'])
+    pd.DataFrame(res['eq_curve']).to_csv(f'equity_v14c_{tf_str}.csv', index=False)
 
     return {
         'trades': len(df),
@@ -511,7 +524,7 @@ def print_report(res, title, tf_str):
 if __name__ == "__main__":
     t0 = datetime.now()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  CorrArb v14b — Multi-Timeframe Comparison Engine          ║")
+    print("║  CorrArb v14c — Dynamic Timeframe Comparison Engine        ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
     timeframes_to_test = ['1min', '5min', '15min', '1h']
@@ -520,6 +533,8 @@ if __name__ == "__main__":
     for tf in timeframes_to_test:
         print("\n" + "═"*70)
         print(f"  ⏳ RUNNING BACKTEST FOR TIMEFRAME: {tf}")
+        dyn_cfg = get_dynamic_config(tf)
+        print(f"  ⚙️ Dynamic Params: Z-Period={dyn_cfg['z_fast_period']} | ATR={dyn_cfg['atr_period']} | VR={dyn_cfg['vr_period']} | Warmup={dyn_cfg['warmup']}")
         print("═"*70)
 
         pair_data = {}
@@ -527,7 +542,7 @@ if __name__ == "__main__":
             df = build_pair(pcfg, tf)
             if df is None:
                 print(f"  ❌ {name}: not found or insufficient data"); continue
-            sig, z = compute_signals(df, pcfg)
+            sig, z = compute_signals(df, pcfg, dyn_cfg)
             n = int((sig != 0).sum())
             print(f"  ✅ {name} ({tf}): {len(df):,} bars | {n:,} signals")
             pair_data[name] = (df, sig, z, pcfg)
@@ -536,13 +551,12 @@ if __name__ == "__main__":
             print(f"  ⚠️ No valid data for {tf}. Skipping...")
             continue
 
-        res = run_portfolio(pair_data, tf)
+        res = run_portfolio(pair_data, tf, dyn_cfg)
         metrics = print_report(res, f"Timeframe {tf}", tf)
         
         if metrics:
             comparison_results[tf] = metrics
 
-    # Print Final Comparison Table
     print("\n" + "█"*85)
     print("  🏆 FINAL TIMEFRAME COMPARISON 🏆")
     print("█"*85)
