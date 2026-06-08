@@ -1,42 +1,27 @@
-name: Fast Backtest
+name: Backtest
 
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  backtest:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # حالا ۳۰ دقیقه کافیه نه ۱۲۰
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    - name: Install deps
-      run: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
+    - run: pip install pandas numpy matplotlib seaborn tabulate pyyaml
 
-    - name: Check data
-      run: |
-        echo "Data files:"
-        ls -la data/DAT_ASCII_*.csv 2>/dev/null | wc -l
-        echo "files found"
+    - run: python backtest_fast.py
 
-    - name: Run Backtest
-      run: python run_backtest.py
-
-    - name: Upload Results
-      uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: backtest-results
+        name: results
         path: results/
         retention-days: 30
