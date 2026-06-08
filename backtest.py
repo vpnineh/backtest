@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v10.1 — The Gold Momentum Scalper (Extended Session)
+PropBot Backtester v10.2 — The Gold Momentum Scalper (High-Frequency)
 ══════════════════════════════════════════════════════════════════
 Strategy : Micro-Pullback Breakout on Steep Momentum
 Asset    : XAUUSD (Gold)
 Timeframe: M5 (5-Minute)
 Costs    : Realistic Gold Spread (15 pips) + Slippage
-Logic    : Momentum Surge -> First Pullback Candle -> Buy/Sell Stop -> 1:1 RR
-Session  : Full London to End of New York (Continuous)
+Logic    : Relaxed Momentum Filter -> Pullback -> Pending Order
 ══════════════════════════════════════════════════════════════════
 """
 
@@ -25,34 +24,33 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.005,     # ریسک 0.5%
+    risk_pct     = 0.005,
     max_open     = 1,
     daily_dd_lim = 0.03,
     max_dd_kill  = 0.07,
 )
 
-# هزینه‌های واقع‌گرایانه طلا (پیپ در طلا معادل 0.01 دلار حرکت قیمت است)
-SPREAD_PIPS = dict(XAUUSD=15.0)   # 15 سنت اسپرد
-COMMISSION_PIP = 6.0              # 6 دلار در لات
-SLIPPAGE_PIP = 5.0                # 5 سنت اسلیپیج به خاطر ورود با پندینگ اردر
+SPREAD_PIPS = dict(XAUUSD=15.0)   
+COMMISSION_PIP = 6.0              
+SLIPPAGE_PIP = 5.0                
 PIP_SIZE = dict(XAUUSD=0.01)
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY PARAMS (GOLD M5 MOMENTUM)
+#  STRATEGY PARAMS
 # ─────────────────────────────────────────────────────────────
 GOLD_CFG = dict(
     pairs         = ["XAUUSD"],
-    session_open  = 7,        # باز شدن لندن (شروع پنجره مجاز)
-    session_close = 21,       # پایان نیویورک (پایان پنجره مجاز)
-    force_close   = 22,       # بستن اجباری در انتهای روز
+    session_open  = 7,        
+    session_close = 21,       
+    force_close   = 22,       
     ema_fast      = 9,
     ema_slow      = 20,
-    momentum_atr  = 0.5,      # حداقل فاصله دو EMA برای تایید "شیب تند"
-    buffer_pip    = 5.0,      # بافر برای قرار دادن پندینگ اردر بالا/پایین کندل
-    rr            = 1.0,      # تارگت 1 به 1
+    momentum_atr  = 0.1,      # 🔴 کاهش شدید فیلتر: اجازه نفس کشیدن به استراتژی 🔴
+    buffer_pip    = 3.0,      # بافر کمتر برای فعال شدن سریع‌تر
+    rr            = 1.0,      
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -156,7 +154,6 @@ def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_
 
         o, h, l = row["open"], row["high"], row["low"]
 
-        # ── 1. Close Open Positions ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -186,7 +183,6 @@ def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_
         for p in closed: positions.remove(p)
         eq_curve.append({"datetime": ts, "equity": equity})
 
-        # ── 2. Kill Check ──
         if (peak - equity) / peak >= acct["max_dd_kill"]:
             killed = True; break
         if not frozen and (day_eq - equity) / max(day_eq,1) >= acct["daily_dd_lim"]:
@@ -194,7 +190,6 @@ def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_
         if frozen or sig is None: continue
         if len(positions) >= acct["max_open"]: continue
 
-        # ── 3. Evaluate Pending Orders ──
         has_long  = any(p.d== 1 for p in positions)
         has_short = any(p.d==-1 for p in positions)
         risk_usd  = equity * acct["risk_pct"]
@@ -207,7 +202,8 @@ def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_
                 sl = sig["force_sl_l"]
                 tp = entry + (entry - sl) * GOLD_CFG["rr"]  
                 
-                if abs(entry - sl) / pip > 10: 
+                # جلوگیری از اردرهای مایکرو که توسط اسپرد بلعیده می‌شوند
+                if abs(entry - sl) / pip > 15: 
                     positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
         elif sig.get("sig_short") and not has_short:
@@ -217,13 +213,13 @@ def run_sim_pending(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_
                 sl = sig["force_sl_s"]
                 tp = entry - (sl - entry) * GOLD_CFG["rr"]
                 
-                if abs(entry - sl) / pip > 10:
+                if abs(entry - sl) / pip > 15:
                     positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
     return trades, eq_curve
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY — THE GOLD MOMENTUM SCALPER (M5)
+#  STRATEGY — THE GOLD MOMENTUM SCALPER (M5) - HIGH FREQUENCY
 # ─────────────────────────────────────────────────────────────
 def strategy_gold_momentum(m1: pd.DataFrame, pair: str) -> tuple:
     cfg = GOLD_CFG; pip = PIP_SIZE[pair]
@@ -233,23 +229,28 @@ def strategy_gold_momentum(m1: pd.DataFrame, pair: str) -> tuple:
     bars["ema_fast"] = ema(bars["close"], cfg["ema_fast"])
     bars["ema_slow"] = ema(bars["close"], cfg["ema_slow"])
     
-    # فیلتر سشن: از شروع لندن تا پایان نیویورک
     in_session = (bars.index.hour >= cfg["session_open"]) & (bars.index.hour < cfg["session_close"])
     
-    # 1. تعریف شیب تند (Steep Momentum)
+    # 1. تعریف شیب تند (Relaxed Momentum)
     min_dist = bars["atr"] * cfg["momentum_atr"]
-    steep_bull = (bars["ema_fast"] > bars["ema_slow"]) & ((bars["ema_fast"] - bars["ema_slow"]) > min_dist) & (bars["close"] > bars["ema_fast"])
-    steep_bear = (bars["ema_fast"] < bars["ema_slow"]) & ((bars["ema_slow"] - bars["ema_fast"]) > min_dist) & (bars["close"] < bars["ema_fast"])
     
-    # 2. پیدا کردن اولین کندل اصلاحی (The Pullback Candle)
-    pullback_bull = steep_bull.shift(1) & (bars["low"] < bars["low"].shift(1))
-    pullback_bear = steep_bear.shift(1) & (bars["high"] > bars["high"].shift(1))
+    # اضافه شدن شرطِ: EMA سریع در 3 کندل اخیر صعودی بوده باشد (برای تایید مومنتوم)
+    ema_bull_trend = (bars["ema_fast"] > bars["ema_fast"].shift(1)) & (bars["ema_fast"].shift(1) > bars["ema_fast"].shift(2))
+    ema_bear_trend = (bars["ema_fast"] < bars["ema_fast"].shift(1)) & (bars["ema_fast"].shift(1) < bars["ema_fast"].shift(2))
+
+    steep_bull = (bars["ema_fast"] > bars["ema_slow"]) & ((bars["ema_fast"] - bars["ema_slow"]) > min_dist) & ema_bull_trend
+    steep_bear = (bars["ema_fast"] < bars["ema_slow"]) & ((bars["ema_slow"] - bars["ema_fast"]) > min_dist) & ema_bear_trend
     
-    # فیلتر: اطمینان حاصل کنیم که این "اولین" اصلاح است 
-    first_pullback_bull = pullback_bull & ~(bars["low"].shift(1) < bars["low"].shift(2)) & in_session
-    first_pullback_bear = pullback_bear & ~(bars["high"].shift(1) > bars["high"].shift(2)) & in_session
+    # 2. پیدا کردن اولین کندل اصلاحی
+    # 🔴 اصلاح: هر کندلی که Low آن کوچکتر یا مساوی کندل قبلی باشد یک پولبک محسوب می‌شود
+    pullback_bull = steep_bull.shift(1) & (bars["low"] <= bars["low"].shift(1))
+    pullback_bear = steep_bear.shift(1) & (bars["high"] >= bars["high"].shift(1))
     
-    # 3. مقادیر سفارشات پندینگ (Buy Stop / Sell Stop)
+    # اطمینان از اینکه کندل فعلی هنوز در جهت روند بسته شده یا حداقل خیلی خلاف آن نرفته است
+    first_pullback_bull = pullback_bull & in_session & (bars["close"] > bars["ema_slow"])
+    first_pullback_bear = pullback_bear & in_session & (bars["close"] < bars["ema_slow"])
+    
+    # 3. مقادیر سفارشات پندینگ
     buf = cfg["buffer_pip"] * pip
     bars["entry_l"] = bars["high"] + buf
     bars["force_sl_l"] = bars["low"] - buf
@@ -257,12 +258,10 @@ def strategy_gold_momentum(m1: pd.DataFrame, pair: str) -> tuple:
     bars["entry_s"] = bars["low"] - buf
     bars["force_sl_s"] = bars["high"] + buf
 
-    # شیفت دادن سیگنال به کندل بعدی
     sigs = pd.DataFrame(index=bars.index)
     sigs["sig_long"]  = first_pullback_bull.shift(1).fillna(False)
     sigs["sig_short"] = first_pullback_bear.shift(1).fillna(False)
     
-    # انتقال نقاط ورود و خروج به فریم سیگنال
     sigs["entry_l"] = bars["entry_l"].shift(1)
     sigs["force_sl_l"] = bars["force_sl_l"].shift(1)
     
@@ -301,11 +300,10 @@ def write_report(m_res, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     div = "═"*75
     lines = [
-        div, f"  PropBot Backtester v10.1  —  THE GOLD MOMENTUM SCALPER",
+        div, f"  PropBot Backtester v10.2  —  THE GOLD SCALPER (High-Freq)",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"  Asset : XAUUSD (M5)",
-        f"  Logic : Momentum Surge -> Wait for Pullback -> Pending Stop Order -> 1:1 RR",
-        f"  Window: Full London to End of New York", div, ""
+        f"  Logic : Relaxed Momentum Surge -> Pullback -> Pending Stop Order",
+        div, ""
     ]
 
     HDR = (f"  {'Period':<10} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
@@ -336,7 +334,7 @@ def main():
     data_dir = Path(args.data_dir); out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v10.1  —  The Gold Momentum Scalper (Extended)")
+    print(f"  PropBot v10.2  —  The Gold Momentum Scalper (High-Freq)")
     print(f"{'═'*60}\n")
 
     pair = GOLD_CFG["pairs"][0]
@@ -345,7 +343,7 @@ def main():
     if m1_data.empty: sys.exit("NO DATA")
     print(f"{len(m1_data):,} records loaded.\n")
 
-    print(f"  Executing Gold Momentum Strategy on M5...", end=" ", flush=True)
+    print(f"  Executing Strategy...", end=" ", flush=True)
     t_tr, eq_tr, t_oo, eq_oo = strategy_gold_momentum(m1_data, pair)
     m_res = {"train": metrics(t_tr, eq_tr, "Train"), "oos": metrics(t_oo, eq_oo, "OOS")}
     print(f"Done. (OOS Trades: {m_res['oos']['trades']})")
