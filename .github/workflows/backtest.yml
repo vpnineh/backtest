@@ -27,8 +27,6 @@ on:
       - backtest
     paths:
       - "backtest.py"
-      - ".github/workflows/backtest.yml"
-
 jobs:
   backtest:
     name: Run PropBot Backtest
@@ -80,7 +78,7 @@ jobs:
           python backtest.py \
             --data-dir "${{ github.event.inputs.data_dir || 'data' }}" \
             --out-dir  results \
-            --pairs    "${{ github.event.inputs.pairs || '' }}"
+            
 
       # ── 7. Print report to Actions log ──────────────────────────────────
       - name: Print summary report
