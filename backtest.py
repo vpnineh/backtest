@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v7.0  —  The Prop Killer Edition
+PropBot Backtester v8.0  —  The Portfolio Scaler
 ══════════════════════════════════════════════════════════════════
 Strategy : Institutional Liquidity Sweep (Macro Aligned)
+Pairs    : EURUSD, GBPUSD, AUDUSD, USDCAD
 Account  : $5,000 prop firm
 Split    : Train 2010-2019  |  OOS 2020-2025
-Costs    : Raw Spread (0.5) + Commission (0.6) + Slippage (0.2)
+Costs    : Raw Spread + Commission ($6/lot) + Slippage
 Logic    : D1 Trend Alignment + Mid-Range BE + No Fridays
 ══════════════════════════════════════════════════════════════════
 """
@@ -24,8 +25,8 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.005,     # ریسک 0.5% برای کنترل افت حساب
-    max_open     = 1,         
+    risk_pct     = 0.005,     # ریسک 0.5% برای هر معامله
+    max_open     = 3,         # اجازه باز بودن حداکثر 3 معامله همزمان روی ارزهای مختلف
     daily_dd_lim = 0.03,      
     max_dd_kill  = 0.07,      
 )
@@ -33,11 +34,11 @@ ACCOUNT = dict(
 # ─────────────────────────────────────────────────────────────
 #  REALISTIC COST CONFIGURATION (RAW SPREAD ACCOUNT)
 # ─────────────────────────────────────────────────────────────
-SPREAD_PIPS = dict(GBPUSD=0.5)
-COMMISSION_PIP = 0.6          # معادل 6 دلار کمیسیون برای هر لات
+SPREAD_PIPS = dict(EURUSD=0.2, GBPUSD=0.5, AUDUSD=0.4, USDCAD=0.6)
+COMMISSION_PIP = 0.6          
 SLIPPAGE_PIP = 0.2            
 LONDON_SPREAD_MULTIPLIER = 2.0 
-PIP_SIZE = dict(GBPUSD=1e-4)
+PIP_SIZE = dict(EURUSD=1e-4, GBPUSD=1e-4, AUDUSD=1e-4, USDCAD=1e-4)
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
@@ -46,16 +47,16 @@ TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 #  STRATEGY PARAMS (MACRO-ALIGNED SWEEP)
 # ─────────────────────────────────────────────────────────────
 SWEEP_CFG = dict(
-    pairs         = ["GBPUSD"], 
+    pairs         = ["EURUSD", "GBPUSD", "AUDUSD", "USDCAD"], # سبد ارزی
     asian_start   = 0,    
     asian_end     = 7,    
     entry_open    = 7,    
     entry_close   = 11,       
     force_close   = 17,       
-    min_range_pip = 10,       
+    min_range_pip = 8,        # کاهش ملایم برای فرکانس بالاتر
     max_range_pip = 50,       
-    atr_sl_mult   = 1.5,      # بافر امنیتی 1.5 برابر ATR
-    macro_ema     = 50,       # EMA پنجاه روزه برای همسویی روند
+    atr_sl_mult   = 1.5,      
+    macro_ema     = 50,       
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -118,12 +119,10 @@ def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def get_trade_cost(pair: str, ts: pd.Timestamp) -> float:
     pip = PIP_SIZE[pair]
     base_spread = SPREAD_PIPS.get(pair, 0.5)
-    
     if 7 <= ts.hour <= 8:
         spread = base_spread * LONDON_SPREAD_MULTIPLIER
     else:
         spread = base_spread
-        
     return (spread + COMMISSION_PIP + SLIPPAGE_PIP * 2) * pip
 
 class Pos:
@@ -140,7 +139,6 @@ def _close_pos(pos, ep, ts, pair):
     pnl_pip = move / pos.pip
     sl_pip  = abs(pos.entry - pos.sl) / pos.pip
     if sl_pip < 1e-5: return 0.0
-    
     initial_sl_pip = pos.initial_risk / pos.pip
     pnl_usd = pnl_pip / initial_sl_pip * pos.risk_usd
     pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / initial_sl_pip)
@@ -161,13 +159,11 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
         if killed: break
         row = bars.loc[ts]
         sig = signals.loc[ts] if ts in signals.index else None
-
         d = ts.date()
         if d != last_day: day_eq, last_day, frozen = equity, d, False
 
         o, h, l = row["open"], row["high"], row["low"]
 
-        # ── Close positions ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -185,9 +181,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
             if ep is not None:
                 pnl = _close_pos(pos, ep, ts, pair)
                 equity += pnl; peak = max(peak, equity)
-                
                 if res == "sl" and pos.be_triggered: res = "be"
-                
                 trades.append(dict(
                     pair=pair, dir="long" if pos.d==1 else "short",
                     open_time=str(pos.t0), close_time=str(ts),
@@ -199,10 +193,8 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
                 
         for p in closed: positions.remove(p)
         
-        # ── Mid-Range Break-Even Logic ──
         for pos in positions:
             if not pos.be_triggered:
-                # محاسبه فاصله تا تارگت، فعال‌سازی در نقطه 50%
                 trigger_dist = abs(pos.tp - pos.entry) * 0.5
                 if pos.d == 1 and row["high"] >= pos.entry + trigger_dist:
                     pos.sl = pos.entry + pos.c_cost
@@ -213,14 +205,12 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
 
         eq_curve.append({"datetime": ts, "equity": equity})
 
-        # ── Kill Check ──
         if (peak - equity) / peak >= acct["max_dd_kill"]:
             killed = True; break
         if not frozen and (day_eq - equity) / max(day_eq,1) >= acct["daily_dd_lim"]:
             frozen = True
         if frozen or sig is None: continue
 
-        # ── Open positions ──
         if len(positions) >= acct["max_open"]: continue
 
         has_long  = any(p.d== 1 for p in positions)
@@ -249,20 +239,15 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame, force_close_ho
 def strategy_prop_killer(m1: pd.DataFrame, pair: str) -> tuple:
     cfg = SWEEP_CFG; pip = PIP_SIZE[pair]
     
-    # 1. Macro Trend Calculation (D1)
     d1 = resample(m1, "1D")
     d1["ema_macro"] = ema(d1["close"], cfg["macro_ema"])
-    d1["ema_macro"] = d1["ema_macro"].shift(1) # جلوگیری از نشت دیتا (Lookahead)
-    
-    # همگام‌سازی ایندکس روزانه برای جلوگیری از خطای Merge پانداس
+    d1["ema_macro"] = d1["ema_macro"].shift(1) 
     d1.index = d1.index.date 
     
-    # 2. Execution Timeframe (M15)
     bars = resample(m1, "15min")
     bars["date"] = bars.index.date
     bars["atr"] = atr(bars["high"], bars["low"], bars["close"], 14)
     
-    # ادغام EMA روزانه در تایم فریم 15 دقیقه‌ای
     bars = bars.join(d1[["ema_macro"]], on="date")
     bars["ema_macro"] = bars["ema_macro"].ffill()
 
@@ -276,10 +261,8 @@ def strategy_prop_killer(m1: pd.DataFrame, pair: str) -> tuple:
     london["date"] = london.index.date
     london = london.join(asian, on="date", how="inner").dropna(subset=["asian_high", "ema_macro"])
 
-    # فیلتر جمعه‌ها
     london["is_friday"] = london.index.dayofweek == 4
 
-    # منطق هم‌سویی با روند
     london["macro_bull"] = london["close"] > london["ema_macro"]
     london["macro_bear"] = london["close"] < london["ema_macro"]
 
@@ -291,11 +274,7 @@ def strategy_prop_killer(m1: pd.DataFrame, pair: str) -> tuple:
     london["has_swept_high"] = london.groupby("date")["is_sweep_high"].cummax()
     london["has_swept_low"]  = london.groupby("date")["is_sweep_low"].cummax()
 
-    # THE HOLY GRAIL LOGIC:
-    # شورت فقط در صورتی که روند نزولی است و قیمت سقف را زده است
     london["raw_short"] = london["macro_bear"] & london["has_swept_high"] & (london["close"] < london["asian_high"]) & ~london["is_friday"]
-    
-    # لانگ فقط در صورتی که روند صعودی است و قیمت کف را زده است
     london["raw_long"]  = london["macro_bull"] & london["has_swept_low"]  & (london["close"] > london["asian_low"]) & ~london["is_friday"]
 
     atr_buf = london["atr"] * cfg["atr_sl_mult"]
@@ -330,7 +309,7 @@ def strategy_prop_killer(m1: pd.DataFrame, pair: str) -> tuple:
 # ─────────────────────────────────────────────────────────────
 def metrics(trades, eq_curve, label):
     if not trades:
-        return dict(label=label, trades=0, net_pnl=0, win_rate=0, pf=0, max_dd=0, sharpe=0,
+        return dict(label=label, trades=0, net_pnl=0, win_rate=0, pf=0, max_dd=0,
                     tp_count=0, sl_count=0, be_count=0, eod_count=0)
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]; loss = [p for p in pnls if p <= 0]
@@ -340,13 +319,9 @@ def metrics(trades, eq_curve, label):
     gp   = sum(wins); gl = abs(sum(loss))
     pf   = gp/gl if gl>0 else float("inf")
 
-    eq_df   = pd.DataFrame(eq_curve).set_index("datetime")["equity"]
-    monthly = eq_df.resample("ME").last().pct_change().dropna()
-    sharpe  = (monthly.mean()/monthly.std()*12**0.5 if len(monthly)>=3 and monthly.std()>0 else 0.0)
-
     return dict(
         label=label, trades=len(trades), win_rate=round(len(wins)/len(trades)*100,1),
-        net_pnl=round(net,2), pf=round(pf,2), max_dd=round(dd.max(),2), sharpe=round(sharpe,2),
+        net_pnl=round(net,2), pf=round(pf,2), max_dd=round(dd.max(),2),
         tp_count=sum(1 for t in trades if t["result"]=="tp"),
         sl_count=sum(1 for t in trades if t["result"]=="sl"),
         be_count=sum(1 for t in trades if t["result"]=="be"),
@@ -356,32 +331,38 @@ def metrics(trades, eq_curve, label):
 # ─────────────────────────────────────────────────────────────
 #  REPORT
 # ─────────────────────────────────────────────────────────────
-def write_report(m_res, out_dir: Path):
+def write_report(results, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    div = "═"*75
+    div = "═"*78
     lines = [
-        div, f"  PropBot Backtester v7.0  —  THE PROP KILLER",
+        div, f"  PropBot Backtester v8.0  —  THE PORTFOLIO SCALER",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
         f"  Logic : Macro Trend (D1) + Mid-Range BE + No Fridays", div, ""
     ]
 
-    HDR = (f"  {'Period':<10} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
-           f" {'PF':>5} {'MaxDD':>7} {'Sharpe':>7} {'TP':>4} {'SL':>4} {'BE':>3} {'EOD':>3}")
-    SEP = "  " + "─"*71
+    HDR = (f"  {'Pair':<8} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
+           f" {'PF':>5} {'MaxDD':>7} {'TP':>4} {'SL':>4} {'BE':>3} {'EOD':>4}")
+    SEP = "  " + "─"*74
 
-    lines += [f"  ┌── PERFORMANCE REPORT {'─'*48}┐", HDR, SEP]
+    lines += [f"  ┌── OOS PERFORMANCE (2020-2025) {'─'*40}┐", HDR, SEP]
     
-    for key, name in [("train", "2010-2019"), ("oos", "2020-2025")]:
-        m = m_res[key]
+    tot_trades = tot_pnl = 0
+    max_portfolio_dd = 0
+
+    for r in results:
+        m = r["oos"]
         flag = " ⚠" if m["max_dd"] > 6 else ""
         lines.append(
-            f"  {name:<10} {m['trades']:>5} {m['win_rate']:>5.1f}%"
+            f"  {m['label']:<8} {m['trades']:>5} {m['win_rate']:>5.1f}%"
             f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
-            f" {m['max_dd']:>6.1f}% {m['sharpe']:>7.2f}"
-            f" {m['tp_count']:>4} {m['sl_count']:>4} {m['be_count']:>3} {m['eod_count']:>3}{flag}"
+            f" {m['max_dd']:>6.1f}% {m['tp_count']:>4} {m['sl_count']:>4} {m['be_count']:>3} {m['eod_count']:>4}{flag}"
         )
+        tot_trades += m["trades"]
+        tot_pnl += m["net_pnl"]
+        max_portfolio_dd = max(max_portfolio_dd, m["max_dd"]) # Estimate
             
-    lines += [f"  └{'─'*71}┘", ""]
+    lines += [SEP, f"  {'TOTAL':<8} {tot_trades:>5} {'-':>6} {tot_pnl:>+9.0f} {'-':>5} {max_portfolio_dd:>6.1f}%"]
+    lines += [f"  └{'─'*74}┘", ""]
     txt = "\n".join(lines)
     print(txt)
     (out_dir / "report.txt").write_text(txt)
@@ -394,22 +375,26 @@ def main():
     data_dir = Path(args.data_dir); out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v7.0  —  The Prop Killer (Macro Aligned)")
+    print(f"  PropBot v8.0  —  The Portfolio Scaler")
     print(f"{'═'*60}\n")
 
-    pair = "GBPUSD"
-    print(f"  Loading {pair} M1 data...", end=" ", flush=True)
-    m1_data = load_pair(data_dir, pair)
-    if m1_data.empty: sys.exit("NO DATA")
-    print(f"{len(m1_data):,} records loaded.\n")
+    all_results = []
+    
+    for pair in SWEEP_CFG["pairs"]:
+        print(f"  Loading {pair} M1 data...", end=" ", flush=True)
+        m1_data = load_pair(data_dir, pair)
+        if m1_data.empty: 
+            print("NO DATA - Skipping")
+            continue
+        print(f"OK. Running Strategy...", end=" ", flush=True)
+        
+        t_tr, eq_tr, t_oo, eq_oo = strategy_prop_killer(m1_data, pair)
+        m_res = {"train": metrics(t_tr, eq_tr, pair), "oos": metrics(t_oo, eq_oo, pair)}
+        all_results.append(m_res)
+        print(f"Done. (OOS: {m_res['oos']['trades']} trades)")
 
-    print(f"  Running Heavy Artillery (Trend + BE + Friday Filter)...", end=" ", flush=True)
-    t_tr, eq_tr, t_oo, eq_oo = strategy_prop_killer(m1_data, pair)
-    m_res = {"train": metrics(t_tr, eq_tr, "Train"), "oos": metrics(t_oo, eq_oo, "OOS")}
-    print(f"Done. (OOS Trades: {m_res['oos']['trades']})")
-
-    print("\nWriting report...\n")
-    write_report(m_res, out_dir)
+    print("\nWriting Portfolio report...\n")
+    write_report(all_results, out_dir)
     print(f"\n  Done  →  {out_dir.resolve()}\n")
 
 if __name__ == "__main__": main()
