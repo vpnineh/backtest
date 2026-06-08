@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v2.1  —  Artificial Pessimism Edition
+PropBot Backtester v3.0  —  Aggressive Scalp & Break-Even Edition
 ══════════════════════════════════════════════════════════════════
 STR-A : EMA Multi-Timeframe  (H4 trend + H1 entry + RSI fixed)
-STR-B : London Breakout      (Asian range break at London open)
+STR-B : London Breakout      (Hyper-Optimized for GBPUSD + BE Logic)
 Account: $5,000 prop firm
 Split  : Train 2010-2019  |  OOS 2020-2025
-Costs  : Dynamic Spread (Wider at London Open) + Breakout Slippage
+Costs  : Dynamic Spread + Breakout Slippage included
 ══════════════════════════════════════════════════════════════════
 """
 
@@ -20,14 +20,14 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-#  ACCOUNT  —  $5K prop firm
+#  ACCOUNT  —  $5K prop firm (Risk adjusted for DD control)
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.01,      # 1% per trade = $50
+    risk_pct     = 0.005,     # ریسک 0.5% برای مهار دراوداون
     max_open     = 2,
     daily_dd_lim = 0.03,      # 3% daily freeze  ($150)
-    max_dd_kill  = 0.07,      # 7% kill switch    ($350)
+    max_dd_kill  = 0.07,      # 7% kill switch   ($350)
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -40,15 +40,15 @@ PIP_SIZE = dict(
     EURUSD=1e-4, GBPUSD=1e-4, AUDUSD=1e-4, USDCAD=1e-4, XAUUSD=0.01,
 )
 
-SLIPPAGE_PIP_STD = 0.5        # اسلیپیج استاندارد برای ورودهای پولبک (STR-A)
-SLIPPAGE_PIP_LBO = 1.5        # اسلیپیج سنگین‌تر برای سفارش‌های استاپ در بریک‌اوت (STR-B)
-LONDON_SPREAD_MULTIPLIER = 2.5 # ضریب واید شدن اسپرد در ساعت باز شدن لندن (07:00 UTC)
+SLIPPAGE_PIP_STD = 0.5        
+SLIPPAGE_PIP_LBO = 1.5        # اسلیپیج سنگین برای سفارش‌های استاپ
+LONDON_SPREAD_MULTIPLIER = 2.5 # ضریب واید شدن اسپرد در ساعت باز شدن لندن
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY PARAMS  —  fixed, not optimised on test data
+#  STRATEGY PARAMS
 # ─────────────────────────────────────────────────────────────
 EMA_CFG = dict(
     pairs         = ["EURUSD", "GBPUSD", "AUDUSD", "USDCAD"],
@@ -66,17 +66,17 @@ EMA_CFG = dict(
 )
 
 LBO_CFG = dict(
-    pairs         = ["EURUSD", "GBPUSD"],
+    pairs         = ["GBPUSD"], # تمرکز مطلق روی پوند/دلار
     asian_start   = 0,    
     asian_end     = 7,    
     entry_open    = 7,    
     entry_close   = 10,   
-    force_close   = 13,   
-    min_range_pip = 8,    
-    max_range_pip = 50,   
+    force_close   = 16,       # اجازه رشد سود تا میانه‌ی سشن نیویورک
+    min_range_pip = 6,        # کاهش سخت‌گیری برای گرفتن فرکانس سیگنال بالاتر
+    max_range_pip = 45,       
     buffer_pip    = 2,    
     sl_inside_pip = 3,    
-    rr            = 1.5,
+    rr            = 2.8,      # استخراج حداکثر ارزش از روندهای قوی لندن
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -141,38 +141,40 @@ def atr(h, l, c, n):
     return tr.ewm(com=n-1, adjust=False).mean()
 
 # ─────────────────────────────────────────────────────────────
-#  TRADE ENGINE  (Pessimistic Upgrades)
+#  TRADE ENGINE  (Pessimistic + Break-Even Logic)
 # ─────────────────────────────────────────────────────────────
 def get_trade_cost(pair: str, ts: pd.Timestamp, is_breakout: bool) -> float:
-    """محاسبه هزینه داینامیک بر اساس استراتژی و زمان"""
     pip = PIP_SIZE[pair]
     base_spread = SPREAD_PIPS.get(pair, 2.0)
     
-    # واید شدن اسپرد در سشن لندن
     if ts.hour == 7:
         spread = base_spread * LONDON_SPREAD_MULTIPLIER
     else:
         spread = base_spread
         
-    # جریمه اسلیپیج برای بریک‌اوت
     slippage = SLIPPAGE_PIP_LBO if is_breakout else SLIPPAGE_PIP_STD
-    
     return (spread + slippage * 2) * pip
 
 class Pos:
-    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost"]
+    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk","be_triggered"]
     def __init__(self, d, entry, sl, tp, t0, risk_usd, pip, c_cost):
         self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
         self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
-        self.c_cost = c_cost # هزینه ذخیره شده در زمان باز شدن معامله
+        self.c_cost = c_cost 
+        self.initial_risk = abs(entry - sl)
+        self.be_triggered = False
 
 def _close_pos(pos, ep, ts, pair):
     move    = (ep - pos.entry) * pos.d
     pnl_pip = move / pos.pip
     sl_pip  = abs(pos.entry - pos.sl) / pos.pip
     if sl_pip < 1e-5: return 0.0
-    pnl_usd = pnl_pip / sl_pip * pos.risk_usd
-    pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / sl_pip)
+    
+    # Base calculation uses initial risk parameters for sizing logic
+    # Even if SL was moved to BE, position size (risk_usd / sl_pip_initial) remains fixed
+    initial_sl_pip = pos.initial_risk / pos.pip
+    pnl_usd = pnl_pip / initial_sl_pip * pos.risk_usd
+    pnl_usd -= (pos.c_cost / pos.pip) * (pos.risk_usd / initial_sl_pip)
     return pnl_usd
 
 def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
@@ -204,7 +206,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
 
         o, h, l = row["open"], row["high"], row["low"]
 
-        # ── close positions (Pessimistic Check Maintained) ──
+        # ── 1. Close positions (Pessimistic Check Maintained) ──
         closed = []
         for pos in positions:
             ep = res = None
@@ -226,20 +228,37 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 pnl = _close_pos(pos, ep, ts, pair)
                 equity += pnl
                 peak    = max(peak, equity)
+                
+                # Tag BE hits for better reporting
+                if res == "sl" and pos.be_triggered:
+                    res = "be"
+                    
                 trades.append(dict(
                     pair=pair, dir="long" if pos.d==1 else "short",
                     open_time=str(pos.t0), close_time=str(ts),
                     open_px=round(pos.entry,5), close_px=round(ep,5),
                     sl=round(pos.sl,5), tp=round(pos.tp,5),
-                    cost_pips=round(pos.c_cost/pip, 1), # اضافه شدن گزارش هزینه به رکوردها
+                    cost_pips=round(pos.c_cost/pip, 1), 
                     pnl=round(pnl,2), result=res, equity=round(equity,2),
                 ))
                 closed.append(pos)
+                
         for p in closed: positions.remove(p)
+
+        # ── 2. Break-Even Logic for Surviving Positions ──
+        for pos in positions:
+            if not pos.be_triggered and is_breakout:
+                # اگر قیمت به 1.5 برابر ریسک در جهت سود رسید، استاپ لاس به نقطه ورود + هزینه منتقل می‌شود
+                if pos.d == 1 and row["high"] >= pos.entry + 1.5 * pos.initial_risk:
+                    pos.sl = pos.entry + pos.c_cost
+                    pos.be_triggered = True
+                elif pos.d == -1 and row["low"] <= pos.entry - 1.5 * pos.initial_risk:
+                    pos.sl = pos.entry - pos.c_cost
+                    pos.be_triggered = True
 
         eq_curve.append({"datetime": ts, "equity": equity})
 
-        # ── kill / freeze ──
+        # ── 3. Kill / Freeze Check ──
         if (peak - equity) / peak >= acct["max_dd_kill"]:
             killed = True
             print(f"  [KILL] {pair} DD={((peak-equity)/peak*100):.1f}% at {ts.date()}")
@@ -248,7 +267,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
             frozen = True
         if frozen or sig is None: continue
 
-        # ── open positions ──
+        # ── 4. Open new positions ──
         if len(positions) >= acct["max_open"]: continue
 
         has_long  = any(p.d== 1 for p in positions)
@@ -321,7 +340,6 @@ def strategy_ema(m1: pd.DataFrame, pair: str) -> tuple:
     s_train  = sigs[sigs.index <= TRAIN_END]
     s_oos    = sigs[sigs.index >= TEST_START]
 
-    # پارامتر is_breakout=False
     t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["session_close"], False)
     t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["session_close"], False)
     return t_tr, eq_tr, t_oo, eq_oo
@@ -383,7 +401,6 @@ def strategy_lbo(m1: pd.DataFrame, pair: str) -> tuple:
     s_train  = sigs_full[sigs_full.index <= TRAIN_END]
     s_oos    = sigs_full[sigs_full.index >= TEST_START]
 
-    # پارامتر is_breakout=True
     t_tr, eq_tr = run_sim(h1_train, pair, s_train, cfg["force_close"], True)
     t_oo, eq_oo = run_sim(h1_oos,   pair, s_oos,   cfg["force_close"], True)
     return t_tr, eq_tr, t_oo, eq_oo
@@ -395,7 +412,7 @@ def metrics(trades, eq_curve, label):
     if not trades:
         return dict(label=label, trades=0, net_pnl=0, win_rate=0,
                     pf=0, max_dd=0, sharpe=0, calmar=0,
-                    tp_count=0, sl_count=0, eod_count=0, max_consec_l=0)
+                    tp_count=0, sl_count=0, be_count=0, eod_count=0, max_consec_l=0)
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     loss = [p for p in pnls if p <= 0]
@@ -424,6 +441,7 @@ def metrics(trades, eq_curve, label):
         sharpe=round(sharpe,2), calmar=round(calmar,2),
         tp_count=sum(1 for t in trades if t["result"]=="tp"),
         sl_count=sum(1 for t in trades if t["result"]=="sl"),
+        be_count=sum(1 for t in trades if t["result"]=="be"),
         eod_count=sum(1 for t in trades if t["result"]=="eod"),
         max_consec_l=best,
         avg_win=round(np.mean(wins),2) if wins else 0,
@@ -438,46 +456,47 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     div = "═"*72
     lines = [
         div,
-        f"  PropBot Backtester v2.1  —  Account: $5,000",
+        f"  PropBot Backtester v3.0  —  Account: $5,000",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
         f"  Split : Train 2010-2019  |  OOS 2020-2025",
         f"  Costs : Dynamic Spread & Breakout Penalty Included",
+        f"  Logic : 0.5% Risk | R:R 2.8 | Break-Even Active",
         div,"",
     ]
 
     HDR = (f"  {'Pair':<8} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
            f" {'PF':>5} {'MaxDD':>7} {'Sharpe':>7} {'Calmar':>7}"
-           f" {'TP':>4} {'SL':>4} {'EOD':>4}")
-    SEP = "  " + "─"*68
+           f" {'TP':>3} {'SL':>3} {'BE':>3} {'EOD':>3}")
+    SEP = "  " + "─"*70
 
     for strat_name, results in [
         ("STRATEGY A — EMA Multi-Timeframe (H4 trend + H1 entry + RSI)", ema_res),
-        ("STRATEGY B — London Breakout    (Asian range → London open)",   lbo_res),
+        ("STRATEGY B — London Breakout    (Hyper-Optimized GBPUSD + BE)", lbo_res),
     ]:
-        lines += ["", f"  ╔{'═'*70}╗",
-                  f"  ║  {strat_name:<68}║",
-                  f"  ╚{'═'*70}╝"]
+        lines += ["", f"  ╔{'═'*72}╗",
+                  f"  ║  {strat_name:<70}║",
+                  f"  ╚{'═'*72}╝"]
 
         for period, key in [("TRAIN 2010-2019","train"),("OOS  2020-2025","oos")]:
-            lines += [f"\n  ┌── {period} {'─'*(58-len(period))}┐", HDR, SEP]
+            lines += [f"\n  ┌── {period} {'─'*(60-len(period))}┐", HDR, SEP]
             tot_pnl = tot_trades = 0
             for r in results:
                 m = r[key]
                 if m["trades"]==0:
-                    lines.append(f"  {r['pair']:<8} {'—no trades—':>60}")
+                    lines.append(f"  {r['pair']:<8} {'—no trades—':>62}")
                     continue
                 flag = " ⚠" if m["max_dd"] > 6 else ""
                 lines.append(
                     f"  {m['label']:<8} {m['trades']:>5} {m['win_rate']:>5.1f}%"
                     f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
                     f" {m['max_dd']:>6.1f}% {m['sharpe']:>7.2f} {m['calmar']:>7.2f}"
-                    f" {m['tp_count']:>4} {m['sl_count']:>4} {m['eod_count']:>4}{flag}"
+                    f" {m['tp_count']:>3} {m['sl_count']:>3} {m['be_count']:>3} {m['eod_count']:>3}{flag}"
                 )
                 tot_pnl    += m["net_pnl"]
                 tot_trades += m["trades"]
             lines += [SEP,
                       f"  {'TOTAL':<8} {tot_trades:>5}{'':>7} {tot_pnl:>+9.0f}",
-                      f"  └{'─'*68}┘"]
+                      f"  └{'─'*70}┘"]
 
     # ── verdict ──
     lines += ["", div, "  VERDICT", div]
@@ -495,7 +514,6 @@ def write_report(ema_res, lbo_res, out_dir: Path):
     print(txt)
     (out_dir / "report.txt").write_text(txt)
 
-    # save trades & equity
     for name, results in [("ema", ema_res), ("lbo", lbo_res)]:
         for r in results:
             all_t = r["trades_train"] + r["trades_oos"]
@@ -510,7 +528,6 @@ def write_report(ema_res, lbo_res, out_dir: Path):
                         w = csv.DictWriter(f, fieldnames=["datetime","equity"])
                         w.writeheader(); w.writerows(eq)
 
-    # summary json
     summary = {"ema": [{
         "pair":r["pair"],"train":r["train"],"oos":r["oos"]
     } for r in ema_res], "lbo": [{
@@ -530,8 +547,8 @@ def main():
     out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v2.1  —  Artificial Pessimism Edition")
-    print(f"  Costs: Dynamic Spread & Breakout Penalty Included")
+    print(f"  PropBot v3.0  —  Aggressive Scalp & Break-Even Edition")
+    print(f"  0.5% Risk | R:R 2.8 | GBPUSD Focus")
     print(f"{'═'*60}\n")
 
     m1_cache = {}
