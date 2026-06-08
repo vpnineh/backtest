@@ -10,15 +10,6 @@ name: PropBot Backtest
 on:
   # ── manual trigger (most common — press "Run workflow" in Actions tab) ──
   workflow_dispatch:
-    inputs:
-      pairs:
-        description: "Pairs to test (comma-separated, blank = all detected)"
-        required: false
-        default: ""
-      data_dir:
-        description: "Subdirectory containing the CSV/ZIP data files"
-        required: false
-        default: "data"
 
   # ── auto trigger on push to these branches ──
   push:
