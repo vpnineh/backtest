@@ -1,39 +1,140 @@
-name: Real-World Portfolio Simulator
+name: Forex Backtester
 
 on:
   workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Symbol (EURUSD, GBPUSD, XAUUSD, ...)'
+        required: false
+        default: 'EURUSD'
+        type: choice
+        options:
+          - EURUSD
+          - GBPUSD
+          - AUDUSD
+          - USDCAD
+          - USDCHF
+          - NZDUSD
+          - AUDNZD
+          - EURGBP
+          - XAUUSD
+          - XAGUSD
+
+      timeframe:
+        description: 'Timeframe'
+        required: false
+        default: 'H1'
+        type: choice
+        options:
+          - M5
+          - M15
+          - H1
+          - H4
+          - D1
+
+      run_all_symbols:
+        description: 'Run ALL symbols?'
+        required: false
+        default: false
+        type: boolean
+
+      walk_forward:
+        description: 'Walk-Forward Validation?'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  run-simulator:
+  backtest:
+    name: Run Backtest [${{ inputs.symbol }} / ${{ inputs.timeframe }}]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout Repository
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.10
+      # ── 2. Python setup ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Libraries
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy
+          pip install numpy pandas matplotlib
 
-      - name: Run Simulator
-        run: python realworld_quantsim.py
+      # ── 4. Create required directories ────────────────────────────────────
+      - name: Create directories
+        run: |
+          mkdir -p backtest_results
+          mkdir -p data
 
-      - name: Upload Full Report
+      # ── 5. Check data files ────────────────────────────────────────────────
+      - name: Check data files
+        run: |
+          echo "=== Files in data/ ==="
+          ls -lh data/ || echo "data/ is empty"
+          echo ""
+          echo "Expected format:"
+          echo "  DAT_ASCII_EURUSD_M1_2020.csv"
+          echo "  HISTDATA_COM_ASCII_EURUSD_M12020.zip"
+
+      # ── 6. Build CLI arguments ─────────────────────────────────────────────
+      - name: Build run arguments
+        id: args
+        run: |
+          ARGS="--symbol ${{ inputs.symbol }} --timeframe ${{ inputs.timeframe }}"
+
+          if [ "${{ inputs.run_all_symbols }}" = "true" ]; then
+            ARGS="$ARGS --all"
+          fi
+
+          if [ "${{ inputs.walk_forward }}" = "true" ]; then
+            ARGS="$ARGS --wf"
+          fi
+
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+          echo "Built args: $ARGS"
+
+      # ── 7. Run backtest ────────────────────────────────────────────────────
+      - name: Run backtest
+        run: |
+          echo "Starting backtest..."
+          echo "Symbol    : ${{ inputs.symbol }}"
+          echo "Timeframe : ${{ inputs.timeframe }}"
+          echo "All Syms  : ${{ inputs.run_all_symbols }}"
+          echo "Walk-Fwd  : ${{ inputs.walk_forward }}"
+          echo "──────────────────────────────────────"
+          python main.py ${{ steps.args.outputs.args }}
+
+      # ── 8. Show log tail ───────────────────────────────────────────────────
+      - name: Show backtest log
+        if: always()
+        run: |
+          echo "=== backtest.log (last 80 lines) ==="
+          tail -n 80 backtest_results/backtest.log || echo "No log file found"
+
+      # ── 9. Show result files ───────────────────────────────────────────────
+      - name: List result files
+        if: always()
+        run: |
+          echo "=== backtest_results/ ==="
+          ls -lh backtest_results/
+
+      # ── 10. Upload all artifacts ───────────────────────────────────────────
+      - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Prop-Backtest-Report
+          name: backtest-results-${{ inputs.symbol }}-${{ inputs.timeframe }}-${{ github.run_number }}
           path: |
-            Equity_Curve_Report.csv
-            trades_detail.csv
-            equity_curve.csv
-            monthly_report.csv
-            yearly_report.csv
+            backtest_results/*.png
+            backtest_results/*.csv
+            backtest_results/*.log
           retention-days: 30
