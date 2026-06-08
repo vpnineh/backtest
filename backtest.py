@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PropBot Backtester v4.0  —  Execution Timeframe Optimization
+PropBot Backtester v5.0  —  Liquidity Sweep (Judas Swing) Edition
 ══════════════════════════════════════════════════════════════════
-Strategy : London Breakout (Hyper-Optimized GBPUSD + BE)
+Strategy : Fade the Breakout / Turtle Soup (GBPUSD)
 Timeframes: M5, M15, H1
 Account  : $5,000 prop firm
 Split    : Train 2010-2019  |  OOS 2020-2025
 Costs    : Dynamic Spread + Breakout Slippage included
-Logic    : 0.5% Risk | R:R 1.5 | Break-Even at 1.0R
+Logic    : Wait for Sweep -> Wait for Close inside Range -> Trade opposite side
 ══════════════════════════════════════════════════════════════════
 """
 
@@ -21,12 +21,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-#  ACCOUNT  —  $5K prop firm (Risk adjusted for DD control)
+#  ACCOUNT  —  $5K prop firm 
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = dict(
     initial_bal  = 5_000.0,
-    risk_pct     = 0.005,     # Risk 0.5%
-    max_open     = 2,
+    risk_pct     = 0.005,     # ریسک 0.5%
+    max_open     = 1,         # فقط یک معامله در روز
     daily_dd_lim = 0.03,      
     max_dd_kill  = 0.07,      
 )
@@ -42,27 +42,25 @@ PIP_SIZE = dict(
 )
 
 SLIPPAGE_PIP_STD = 0.5        
-SLIPPAGE_PIP_LBO = 1.5        # Heavy slippage for stop orders
-LONDON_SPREAD_MULTIPLIER = 2.5 # Morning liquidity sweep simulation
+SLIPPAGE_PIP_LBO = 1.0        # اسلیپیج معقول برای ورود تاییدشده
+LONDON_SPREAD_MULTIPLIER = 2.5 
 
 TRAIN_END  = pd.Timestamp("2019-12-31", tz="UTC")
 TEST_START = pd.Timestamp("2020-01-01", tz="UTC")
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY PARAMS (LONDON BREAKOUT ONLY)
+#  STRATEGY PARAMS (LIQUIDITY SWEEP ONLY)
 # ─────────────────────────────────────────────────────────────
 LBO_CFG = dict(
-    pairs         = ["GBPUSD"], # Laser focus on the Cable
+    pairs         = ["GBPUSD"], 
     asian_start   = 0,    
     asian_end     = 7,    
     entry_open    = 7,    
-    entry_close   = 10,   
-    force_close   = 16,       
-    min_range_pip = 6,        
-    max_range_pip = 45,       
-    buffer_pip    = 2,    
-    sl_inside_pip = 3,    
-    rr            = 1.5,      # Realistic targets
+    entry_close   = 11,       # زمان بیشتر برای شکل‌گیری تله
+    force_close   = 17,       # پایان سشن نیویورک
+    min_range_pip = 12,       # رنج باید ارزش معامله داشته باشد
+    max_range_pip = 50,       
+    sweep_sl_pip  = 2,        # استاپ دقیقاً 2 پیپ بالاتر/پایین‌تر از شدویِ فیک‌اوت
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -112,28 +110,26 @@ def resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     return df.resample(tf).agg(agg).dropna()
 
 # ─────────────────────────────────────────────────────────────
-#  TRADE ENGINE  (Pessimistic + Fast Break-Even Logic)
+#  TRADE ENGINE
 # ─────────────────────────────────────────────────────────────
 def get_trade_cost(pair: str, ts: pd.Timestamp) -> float:
     pip = PIP_SIZE[pair]
     base_spread = SPREAD_PIPS.get(pair, 2.0)
     
-    if ts.hour == 7:
+    if 7 <= ts.hour <= 8:
         spread = base_spread * LONDON_SPREAD_MULTIPLIER
     else:
         spread = base_spread
         
-    slippage = SLIPPAGE_PIP_LBO
-    return (spread + slippage * 2) * pip
+    return (spread + SLIPPAGE_PIP_LBO * 2) * pip
 
 class Pos:
-    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk","be_triggered"]
+    __slots__ = ["d","entry","sl","tp","t0","risk_usd","pip","c_cost","initial_risk"]
     def __init__(self, d, entry, sl, tp, t0, risk_usd, pip, c_cost):
         self.d, self.entry, self.sl, self.tp = d, entry, sl, tp
         self.t0, self.risk_usd, self.pip = t0, risk_usd, pip
         self.c_cost = c_cost 
         self.initial_risk = abs(entry - sl)
-        self.be_triggered = False
 
 def _close_pos(pos, ep, ts, pair):
     move    = (ep - pos.entry) * pos.d
@@ -196,10 +192,6 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 equity += pnl
                 peak    = max(peak, equity)
                 
-                # Tag BE hits
-                if res == "sl" and pos.be_triggered:
-                    res = "be"
-                    
                 trades.append(dict(
                     pair=pair, dir="long" if pos.d==1 else "short",
                     open_time=str(pos.t0), close_time=str(ts),
@@ -212,19 +204,9 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
                 
         for p in closed: positions.remove(p)
 
-        # ── 2. Fast Break-Even Logic (At 1.0R) ──
-        for pos in positions:
-            if not pos.be_triggered:
-                if pos.d == 1 and row["high"] >= pos.entry + 1.0 * pos.initial_risk:
-                    pos.sl = pos.entry + pos.c_cost
-                    pos.be_triggered = True
-                elif pos.d == -1 and row["low"] <= pos.entry - 1.0 * pos.initial_risk:
-                    pos.sl = pos.entry - pos.c_cost
-                    pos.be_triggered = True
-
         eq_curve.append({"datetime": ts, "equity": equity})
 
-        # ── 3. Kill / Freeze Check ──
+        # ── 2. Kill / Freeze Check ──
         if (peak - equity) / peak >= acct["max_dd_kill"]:
             killed = True
             print(f"  [KILL] {pair} DD={((peak-equity)/peak*100):.1f}% at {ts.date()}")
@@ -233,7 +215,7 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
             frozen = True
         if frozen or sig is None: continue
 
-        # ── 4. Open new positions ──
+        # ── 3. Open new positions ──
         if len(positions) >= acct["max_open"]: continue
 
         has_long  = any(p.d== 1 for p in positions)
@@ -243,23 +225,24 @@ def run_sim(bars: pd.DataFrame, pair: str, signals: pd.DataFrame,
         if sig.get("sig_long") and not has_long:
             c_cost = get_trade_cost(pair, ts)
             entry = o + c_cost / 2
-            sl, tp = sig["force_sl"], sig["force_tp_l"]
-            if abs(entry - sl) / pip < 5: continue
+            sl, tp = sig["force_sl"], sig["force_tp"]
+            # جلوگیری از ورود با استاپ‌های بیش از حد کوچک که توسط اسپرد خورده می‌شوند
+            if abs(entry - sl) / pip < 3: continue 
             positions.append(Pos(1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
         elif sig.get("sig_short") and not has_short:
             c_cost = get_trade_cost(pair, ts)
             entry = o - c_cost / 2
-            sl, tp = sig["force_sl"], sig["force_tp_s"]
-            if abs(entry - sl) / pip < 5: continue
+            sl, tp = sig["force_sl"], sig["force_tp"]
+            if abs(entry - sl) / pip < 3: continue
             positions.append(Pos(-1, entry, sl, tp, ts, risk_usd, pip, c_cost))
 
     return trades, eq_curve
 
 # ─────────────────────────────────────────────────────────────
-#  STRATEGY B  —  London Breakout (Dynamic Timeframe)
+#  STRATEGY V5 — LIQUIDITY SWEEP (Dynamic Timeframe)
 # ─────────────────────────────────────────────────────────────
-def strategy_lbo(m1: pd.DataFrame, pair: str, tf_code: str) -> tuple:
+def strategy_sweep(m1: pd.DataFrame, pair: str, tf_code: str) -> tuple:
     cfg = LBO_CFG
     pip = PIP_SIZE[pair]
 
@@ -273,7 +256,6 @@ def strategy_lbo(m1: pd.DataFrame, pair: str, tf_code: str) -> tuple:
         asian_low =("low","min"),
     )
     asian["range_pip"] = (asian["asian_high"] - asian["asian_low"]) / pip
-
     asian = asian[asian["range_pip"].between(cfg["min_range_pip"], cfg["max_range_pip"])]
 
     london_mask = (bars.index.hour >= cfg["entry_open"]) & \
@@ -283,31 +265,53 @@ def strategy_lbo(m1: pd.DataFrame, pair: str, tf_code: str) -> tuple:
     london = london.join(asian, on="date", how="inner")
     london = london.dropna(subset=["asian_high","asian_low"])
 
-    buf      = cfg["buffer_pip"] * pip
-    sl_buf   = cfg["sl_inside_pip"] * pip
+    # رهگیری بالاترین و پایین‌ترین نقطه در طول سشن برای استاپ‌لاس داینامیک
+    london["session_high"] = london.groupby("date")["high"].cummax()
+    london["session_low"]  = london.groupby("date")["low"].cummin()
 
-    # Trigger based on the CLOSE of the specific timeframe
-    london["raw_long"]  = london["close"] > (london["asian_high"] + buf)
-    london["raw_short"] = london["close"] < (london["asian_low"]  - buf)
+    # آیا قیمت سقف یا کف آسیا را جارو (Sweep) کرده است؟
+    london["is_sweep_high"] = london["high"] > london["asian_high"]
+    london["is_sweep_low"]  = london["low"] < london["asian_low"]
+    
+    london["has_swept_high"] = london.groupby("date")["is_sweep_high"].cummax()
+    london["has_swept_low"]  = london.groupby("date")["is_sweep_low"].cummax()
 
-    london["force_sl"]   = np.where(
-        london["raw_long"],
-        london["asian_high"] - sl_buf,
-        london["asian_low"]  + sl_buf,
-    )
-    r_pip = london["asian_high"] - london["asian_low"]
-    london["force_tp_l"] = london["asian_high"] + buf + r_pip * cfg["rr"]
-    london["force_tp_s"] = london["asian_low"]  - buf - r_pip * cfg["rr"]
+    # تاییدیه ورود: جارو کردن سقف -> بسته شدنِ کندل در زیر سقف (داخل رنج)
+    london["raw_short"] = london["has_swept_high"] & (london["close"] < london["asian_high"])
+    london["raw_long"]  = london["has_swept_low"]  & (london["close"] > london["asian_low"])
 
-    sigs = london[["raw_long","raw_short","force_sl","force_tp_l","force_tp_s"]].copy()
-    sigs["sig_long"]  = sigs["raw_long"].shift(1).fillna(False)
-    sigs["sig_short"] = sigs["raw_short"].shift(1).fillna(False)
+    # استاپ‌لاس‌ها بر اساس ماکزیمم شدویِ ثبت شده تنظیم می‌شوند
+    sl_buf = cfg["sweep_sl_pip"] * pip
+    london["force_sl_short"] = london["session_high"] + sl_buf
+    london["force_sl_long"]  = london["session_low"]  - sl_buf
 
-    sigs["date"] = sigs.index.date
-    sigs = sigs[~sigs.duplicated(subset=["date","sig_long","sig_short"], keep="first")]
+    sigs = pd.DataFrame(index=london.index)
+    sigs["date"] = london["date"]
+    sigs["raw_long"] = london["raw_long"]
+    sigs["raw_short"] = london["raw_short"]
 
-    sigs_full = sigs.reindex(bars.index)
-    sigs_full[["sig_long","sig_short"]] = sigs_full[["sig_long","sig_short"]].fillna(False)
+    sigs["force_sl"] = np.where(london["raw_long"], london["force_sl_long"],
+                       np.where(london["raw_short"], london["force_sl_short"], np.nan))
+    
+    # تارگت همیشه سمتِ مخالفِ رنج آسیا است
+    sigs["force_tp"] = np.where(london["raw_long"], london["asian_high"],
+                       np.where(london["raw_short"], london["asian_low"], np.nan))
+
+    # شیفت بدون Lookahead: سیگنال به کندل بعدی منتقل می‌شود
+    shifted = sigs.shift(1)
+    shifted["date"] = sigs["date"] 
+    
+    # استخراج فقط سیگنال‌های فعال
+    active_sigs = shifted[(shifted["raw_long"] == True) | (shifted["raw_short"] == True)].copy()
+    
+    # فیلتر حیاتی: فقط و فقط اولین تاییدیه روز را معامله کن تا از نوسانات پیاپی جلوگیری شود
+    first_sigs = active_sigs.drop_duplicates(subset=["date"], keep="first")
+    first_sigs = first_sigs.rename(columns={"raw_long": "sig_long", "raw_short": "sig_short"})
+
+    # بازگرداندن به تایم فریم اصلی
+    sigs_full = pd.DataFrame(index=bars.index)
+    sigs_full = sigs_full.join(first_sigs[["sig_long", "sig_short", "force_sl", "force_tp"]])
+    sigs_full[["sig_long", "sig_short"]] = sigs_full[["sig_long", "sig_short"]].fillna(False)
 
     bars_train = bars[bars.index <= TRAIN_END]
     bars_oos   = bars[bars.index >= TEST_START]
@@ -325,7 +329,7 @@ def metrics(trades, eq_curve, label):
     if not trades:
         return dict(label=label, trades=0, net_pnl=0, win_rate=0,
                     pf=0, max_dd=0, sharpe=0, calmar=0,
-                    tp_count=0, sl_count=0, be_count=0, eod_count=0, max_consec_l=0)
+                    tp_count=0, sl_count=0, eod_count=0, max_consec_l=0)
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     loss = [p for p in pnls if p <= 0]
@@ -354,7 +358,6 @@ def metrics(trades, eq_curve, label):
         sharpe=round(sharpe,2), calmar=round(calmar,2),
         tp_count=sum(1 for t in trades if t["result"]=="tp"),
         sl_count=sum(1 for t in trades if t["result"]=="sl"),
-        be_count=sum(1 for t in trades if t["result"]=="be"),
         eod_count=sum(1 for t in trades if t["result"]=="eod"),
         max_consec_l=best,
         avg_win=round(np.mean(wins),2) if wins else 0,
@@ -369,17 +372,16 @@ def write_report(tf_results, out_dir: Path):
     div = "═"*72
     lines = [
         div,
-        f"  PropBot Backtester v4.0  —  Account: $5,000",
+        f"  PropBot Backtester v5.0  —  Liquidity Sweep Edition",
         f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
         f"  Split : Train 2010-2019  |  OOS 2020-2025",
-        f"  Costs : Realistic Spread & Slippage Penalty",
-        f"  Focus : GBPUSD Execution Timeframe Comparison",
+        f"  Logic : Fade the Breakout (Turtle Soup) | 0.5% Risk",
         div,"",
     ]
 
     HDR = (f"  {'Timeframe':<10} {'#':>5} {'WinR':>6} {'NetPnL':>9}"
            f" {'PF':>5} {'MaxDD':>7} {'Sharpe':>7}"
-           f" {'TP':>4} {'SL':>3} {'BE':>3} {'EOD':>3}")
+           f" {'TP':>4} {'SL':>4} {'EOD':>4}")
     SEP = "  " + "─"*68
 
     lines += [f"  ┌── OOS PERFORMANCE (2020-2025) {'─'*33}┐", HDR, SEP]
@@ -394,7 +396,7 @@ def write_report(tf_results, out_dir: Path):
             f"  {m['label']:<10} {m['trades']:>5} {m['win_rate']:>5.1f}%"
             f" {m['net_pnl']:>+9.0f} {m['pf']:>5.2f}"
             f" {m['max_dd']:>6.1f}% {m['sharpe']:>7.2f}"
-            f" {m['tp_count']:>4} {m['sl_count']:>3} {m['be_count']:>3} {m['eod_count']:>3}{flag}"
+            f" {m['tp_count']:>4} {m['sl_count']:>4} {m['eod_count']:>4}{flag}"
         )
         if m["net_pnl"] > best_pnl:
             best_pnl = m["net_pnl"]
@@ -406,7 +408,7 @@ def write_report(tf_results, out_dir: Path):
         div,
         f"  VERDICT (OOS)",
         div,
-        f"  Optimal Execution Timeframe: {best_tf}",
+        f"  Optimal Sweep Timeframe: {best_tf}",
         f"  Max Profit: {best_pnl:+.0f}$",
         ""
     ]
@@ -427,8 +429,8 @@ def main():
     out_dir  = Path(args.out_dir)
 
     print(f"\n{'═'*60}")
-    print(f"  PropBot v4.0  —  Execution Timeframe Optimization")
-    print(f"  Testing M5 vs M15 vs H1 for Breakout Confirmation")
+    print(f"  PropBot v5.0  —  Liquidity Sweep (Judas Swing) Edition")
+    print(f"  Hunting Fakeouts on M5, M15, and H1")
     print(f"{'═'*60}\n")
 
     pair = LBO_CFG["pairs"][0]
@@ -447,8 +449,8 @@ def main():
     tf_results = []
     
     for tf_name, tf_code in timeframes:
-        print(f"  Running Backtest for Timeframe: {tf_name} ...", end=" ", flush=True)
-        t_tr, eq_tr, t_oo, eq_oo = strategy_lbo(m1_data, pair, tf_code)
+        print(f"  Running Backtest for {tf_name} Fakeouts ...", end=" ", flush=True)
+        t_tr, eq_tr, t_oo, eq_oo = strategy_sweep(m1_data, pair, tf_code)
         
         m_tr = metrics(t_tr, eq_tr, tf_name)
         m_oo = metrics(t_oo, eq_oo, tf_name)
