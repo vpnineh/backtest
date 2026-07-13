@@ -5,12 +5,19 @@
 
 data:
   symbol: "EURGBP"
-  path: "data"                # folder containing your yearly CSV files (2010-2025)
-  file_pattern: "*.zip"       # matches every csv inside data/
-  start_date: "2010-01-01"
-  end_date: "2025-12-31"
+  path: "data"                     # folder containing your yearly zip/CSV files (2010-2025)
+  file_pattern: "*.zip"            # "*.zip" = all years, "*M12025*.zip" = just one file
+
+  # ---- THE TWO KNOBS YOU CHANGE MOST OFTEN ----
+  year: "2025"                     # "2025" | "2020-2023" | "all" (or null) for the full 2010-2025 range
+  resample_timeframe: "5min"       # "1min" (native), "5min", "15min", "1h" ... or null to keep native M1
+  # ----------------------------------------------
+
+  start_date: null                 # only used if `year` above is null/"all"
+  end_date: null                   # only used if `year` above is null/"all"
   datetime_column: "auto"
   timezone: "UTC"
+  native_timeframe_minutes: 1
 
 strategy:
   initial_lot: 0.10
@@ -24,7 +31,7 @@ strategy:
   contract_size: 100000.0
 
 exit:
-  mode: "A"                   # A | B | C | D  (see exit_manager.py docstring)
+  mode: "ALL"                 # A | B | C | D | ALL  -> "ALL" runs every mode on the same data and compares them
   target_profit: 50.0         # used by Mode B
   convergence_pips: 2.0       # used by Mode C
   equilibrium_buffer_pips: 1.0  # used by Mode D
@@ -52,3 +59,10 @@ output:
   save_trade_log: true
   save_cycle_log: true
   report_name: "simulation_report"
+  print_last_n_cycles: 5      # how many cycles to print "Cycle #N" detail for in the console (0 = all)
+
+# n_workers only affects grid_search_parallel()/monte_carlo_cycle_resample_parallel()
+# in hedge_sim/optimizer.py - the main backtest run below is always single-core
+# by design (it is path-dependent and cannot be safely split). 0 = use all cores.
+performance:
+  n_workers: 0
