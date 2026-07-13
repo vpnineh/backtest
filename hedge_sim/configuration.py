@@ -18,10 +18,25 @@ class DataConfig:
     symbol: str = "EURGBP"
     path: str = "data"                 # folder OR single file
     file_pattern: str = "*.csv"        # used when `path` is a folder
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
+    year: Optional[str] = None         # simplest control: "2025" or "2020-2023" or "all"/None for everything
+    start_date: Optional[str] = None   # used only if `year` is not set
+    end_date: Optional[str] = None     # used only if `year` is not set
     datetime_column: str = "auto"
     timezone: str = "UTC"
+    resample_timeframe: Optional[str] = None   # e.g. "5min" - None/"" keeps native (M1) resolution
+    native_timeframe_minutes: int = 1          # informational; assumed source resolution
+
+    def resolve_date_range(self) -> tuple[Optional[str], Optional[str]]:
+        """Single source of truth for the effective (start, end) date range.
+        `year` always takes priority over start_date/end_date when set, so
+        changing the tested period is a ONE-LINE edit in config.yaml."""
+        if self.year and str(self.year).lower() not in ("all", "none", ""):
+            y = str(self.year).strip()
+            if "-" in y:
+                y_start, y_end = y.split("-")
+                return f"{y_start.strip()}-01-01", f"{y_end.strip()}-12-31"
+            return f"{y}-01-01", f"{y}-12-31"
+        return self.start_date, self.end_date
 
 
 @dataclass
@@ -70,6 +85,17 @@ class OutputConfig:
     save_trade_log: bool = True
     save_cycle_log: bool = True
     report_name: str = "simulation_report"
+    print_last_n_cycles: int = 5       # detailed per-cycle report (Cycle #N format) for the console
+
+
+@dataclass
+class PerformanceConfig:
+    # NOTE: the main sequential backtest loop is path-dependent (open positions
+    # carry state across time) and is therefore NOT split across processes -
+    # doing so would silently corrupt results. `n_workers` only applies to
+    # embarrassingly-parallel, independent workloads: grid_search() over
+    # parameter combinations and monte_carlo_cycle_resample(). See optimizer.py.
+    n_workers: int = 0   # 0 = auto (all logical cores)
 
 
 @dataclass
@@ -80,6 +106,7 @@ class Config:
     costs: CostsConfig = field(default_factory=CostsConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
 
     @staticmethod
     def from_yaml(path: str | Path) -> "Config":
@@ -96,4 +123,5 @@ class Config:
             costs=build(CostsConfig, "costs"),
             account=build(AccountConfig, "account"),
             output=build(OutputConfig, "output"),
+            performance=build(PerformanceConfig, "performance"),
         )

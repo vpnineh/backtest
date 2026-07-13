@@ -37,6 +37,63 @@ class SimulationReport:
             pd.DataFrame(self.state.trade_log).to_csv(
                 os.path.join(out_dir, f"{name}_trades.csv"), index=False)
 
+    def _format_cycle(self, c) -> str:
+        lines = [f"Cycle #{c.cycle_id}"]
+        lines.append(f"  Open Date                  : {c.open_time}")
+        lines.append(f"  Close Date                  : {c.close_time}")
+        lines.append(f"  Direction Movement          : {c.direction_movement}  "
+                      f"({c.open_price:.5f} -> {c.exit_price:.5f})")
+        lines.append(f"  Total Buy Lots              : {c.total_buy_lots:.2f}")
+        lines.append(f"  Total Sell Lots             : {c.total_sell_lots:.2f}")
+        lines.append(f"  Average Buy Price           : {c.avg_buy_price:.5f}")
+        lines.append(f"  Average Sell Price          : {c.avg_sell_price:.5f}")
+        lines.append(f"  Number of Pyramid Positions : {c.num_pyramid_positions}")
+        lines.append(f"  Number of Martingale Positions : {c.num_martingale_positions}")
+        lines.append(f"  Net Floating P/L (final)    : {c.realized_pnl:.2f}")
+        be = f"{c.breakeven_price:.5f}" if c.breakeven_price is not None else "N/A (net-neutral lots)"
+        lines.append(f"  Break-even Price            : {be}")
+        rd = f"{c.recovery_distance_pips:.1f} pips" if c.recovery_distance_pips is not None else "N/A"
+        lines.append(f"  Recovery Distance Required  : {rd}  (from worst point to break-even)")
+        lines.append(f"  Maximum Adverse Excursion   : {abs(min(c.worst_floating_pnl, 0.0)):.2f}  "
+                      f"(worst floating P/L: {c.worst_floating_pnl:.2f} @ {c.worst_price:.5f})")
+        lines.append(f"  Maximum Favorable Excursion : {max(c.best_floating_pnl, 0.0):.2f}  "
+                      f"(best floating P/L: {c.best_floating_pnl:.2f} @ {c.best_price:.5f})")
+        rp = f"{c.recovery_percentage:.1f}%" if c.recovery_percentage is not None else "N/A"
+        lines.append(f"  Recovery Percentage         : {rp}")
+        if c.recovery_time_seconds is not None:
+            hrs = c.recovery_time_seconds / 3600.0
+            lines.append(f"  Time To Recovery            : {hrs:.2f} hours")
+        else:
+            lines.append(f"  Time To Recovery            : did not fully recover before close")
+        lines.append(f"  Exit Price                  : {c.exit_price:.5f}  (reason: {c.exit_reason})")
+        lines.append(f"  Max levels (buy/sell)       : {c.max_levels_buy} / {c.max_levels_sell}")
+        return "\n".join(lines)
+
+    def print_cycle_reports(self, n: int | None = None):
+        cycles = self.state.cycles
+        if not cycles:
+            print("No hedge cycles were executed.")
+            return
+        n = n if n is not None else self.config.output.print_last_n_cycles
+        selected = cycles[-n:] if n and n > 0 else cycles
+        print("\n" + "-" * 60)
+        print(f"  PER-CYCLE DETAIL (last {len(selected)} of {len(cycles)} cycles)")
+        print("-" * 60)
+        for c in selected:
+            print(self._format_cycle(c))
+            print()
+
+    def save_cycle_reports_txt(self):
+        """Writes the Cycle #N formatted report for EVERY cycle to a text file."""
+        out_dir = self.config.output.results_dir
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{self.config.output.report_name}_cycles_detail.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            for c in self.state.cycles:
+                f.write(self._format_cycle(c))
+                f.write("\n\n")
+        return path
+
     def print_summary(self):
         s = self.stats
         print("\n" + "=" * 60)

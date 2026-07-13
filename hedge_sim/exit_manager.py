@@ -62,12 +62,22 @@ class ExitModeB(ExitStrategy):
 
 
 class ExitModeC(ExitStrategy):
-    """Weighted-average prices of the two baskets converge."""
+    """Weighted-average prices of the two baskets converge.
+
+    BUG FIX: right after a fresh hedge open, avg_buy and avg_sell are only
+    `spread` apart - which already satisfies most convergence thresholds,
+    causing an instant open/close loop. We require that the basket has
+    genuinely grown beyond the initial hedge pair (at least one grid level
+    added on either side) before convergence is evaluated, since
+    "convergence" is only a meaningful signal once there was real divergence.
+    """
     name = "C"
 
     def should_close(self, buy_basket, sell_basket, current_price, quote_to_account_rate=1.0):
         if buy_basket.levels == 0 or sell_basket.levels == 0:
             return False, ""
+        if buy_basket.levels <= 1 and sell_basket.levels <= 1:
+            return False, ""  # still just the initial hedge pair - nothing has diverged yet
         gap = abs(buy_basket.weighted_avg_price - sell_basket.weighted_avg_price)
         gap_pips = gap / self.strat_cfg.pip_size
         if gap_pips <= self.exit_cfg.convergence_pips:

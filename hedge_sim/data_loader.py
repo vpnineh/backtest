@@ -109,10 +109,11 @@ class DataLoader:
         data = data.dropna(subset=["time", "open", "high", "low", "close"])
         data = data.sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)
 
-        if self.cfg.start_date:
-            data = data[data["time"] >= pd.to_datetime(self.cfg.start_date)]
-        if self.cfg.end_date:
-            data = data[data["time"] <= pd.to_datetime(self.cfg.end_date)]
+        start_date, end_date = self.cfg.resolve_date_range()
+        if start_date:
+            data = data[data["time"] >= pd.to_datetime(start_date)]
+        if end_date:
+            data = data[data["time"] <= pd.to_datetime(end_date)]
 
         if data.empty:
             raise ValueError("Loaded dataset is empty after filtering - check date range / files.")
@@ -122,4 +123,39 @@ class DataLoader:
         if "volume" not in data.columns:
             data["volume"] = 0.0
 
+        data = self._sanity_filter(data)
+
         return data.reset_index(drop=True)
+
+    @staticmethod
+    def _sanity_filter(data: pd.DataFrame, max_bar_move_pct: float = 0.20,
+                        max_hl_range_pct: float = 0.10) -> pd.DataFrame:
+        """
+        Drops corrupted/outlier rows that are common in real downloaded FX
+        history (a decimal shifted by a stray digit, a duplicated header
+        line, a garbage tick). A single bad row like this can otherwise
+        blow up margin/exposure/drawdown stats by orders of magnitude
+        without ever showing up as an obvious crash. Heuristics:
+          - OHLC values must be internally consistent (low <= open,close <= high, low <= high)
+          - high/low range within a bar can't exceed `max_hl_range_pct` of price
+          - close-to-close jump between consecutive bars can't exceed `max_bar_move_pct`
+        Flagged rows are dropped and a summary is printed.
+        """
+        before = len(data)
+        consistent = (data["low"] <= data["open"]) & (data["open"] <= data["high"]) & \
+                     (data["low"] <= data["close"]) & (data["close"] <= data["high"]) & \
+                     (data["low"] <= data["high"]) & (data["open"] > 0) & (data["close"] > 0)
+
+        hl_range_pct = (data["high"] - data["low"]) / data["close"].replace(0, pd.NA)
+        sane_range = hl_range_pct.fillna(0) <= max_hl_range_pct
+
+        prev_close = data["close"].shift(1)
+        jump_pct = (data["close"] - prev_close).abs() / prev_close.replace(0, pd.NA)
+        sane_jump = jump_pct.fillna(0) <= max_bar_move_pct
+
+        keep = consistent & sane_range & sane_jump
+        dropped = before - int(keep.sum())
+        if dropped > 0:
+            print(f"      [data sanity check] dropped {dropped} corrupted/outlier row(s) out of {before} "
+                  f"(inconsistent OHLC, absurd intrabar range, or an implausible tick-to-tick jump).")
+        return data[keep]
