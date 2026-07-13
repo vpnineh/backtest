@@ -45,7 +45,7 @@ jobs:
           PY
 
       - name: Run backtest
-        run: python main.py --config config.yaml
+        run: python -u main.py --config config.yaml
 
       - name: Upload results
         uses: actions/upload-artifact@v4
