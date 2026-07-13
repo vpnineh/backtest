@@ -7,7 +7,7 @@ data:
   symbol: "EURGBP"
   path: "data"                # folder containing your yearly CSV files (2010-2025)
   file_pattern: "*.zip"       # matches every csv inside data/
-  file_pattern: "*M12025*.zip"   # فقط فایل سال 2025 رو می‌گیره
+  file_pattern: "*M12025*.zip"
   start_date: "2025-01-01"
   end_date: "2025-12-31"
   timezone: "UTC"
