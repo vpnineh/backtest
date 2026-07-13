@@ -13,24 +13,21 @@ from datetime import datetime
 class Position:
     entry_price: float
     lot_size: float
-    direction: str            
+    direction: str            # "BUY" or "SELL"
     open_time: datetime
-    level: int                 
-    kind: str                  
-    commission: float = 0.0    
+    level: int                 # 0 = initial hedge position, 1..N = grid level
+    kind: str                  # "hedge" | "pyramid" | "martingale"
+    commission: float = 0.0    # charged at open (round-turn amortized at close too if desired)
     swap_accrued: float = 0.0
     close_price: float | None = None
     close_time: datetime | None = None
     closed: bool = False
 
-    def floating_pnl(self, current_bid: float, current_ask: float, pip_size: float, contract_size: float,
+    def floating_pnl(self, current_price: float, pip_size: float, contract_size: float,
                       quote_to_account_rate: float = 1.0) -> float:
-        """Realistic Floating P/L: BUY uses BID to close, SELL uses ASK to close."""
-        if self.direction == "BUY":
-            price_diff = (current_bid - self.entry_price)
-        else:
-            price_diff = (self.entry_price - current_ask)
-            
+        """Floating P/L in account currency (simplified constant conversion rate)."""
+        sign = 1 if self.direction == "BUY" else -1
+        price_diff = (current_price - self.entry_price) * sign
         pnl = price_diff * self.lot_size * contract_size
         return pnl * quote_to_account_rate - self.commission + self.swap_accrued
 

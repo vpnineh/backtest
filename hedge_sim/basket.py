@@ -17,6 +17,7 @@ class Basket:
         self.positions: list[Position] = []
         self.closed_positions: list[Position] = []
 
+    # ---- state -----------------------------------------------------
     @property
     def total_lots(self) -> float:
         return sum(p.lot_size for p in self.positions)
@@ -32,22 +33,18 @@ class Basket:
             return 0.0
         return sum(p.entry_price * p.lot_size for p in self.positions) / lots
 
-    @property
-    def breakeven_price(self) -> float:
-        """Calculates theoretical breakeven considering average price."""
-        return self.weighted_avg_price
-
-    def floating_pnl(self, current_bid: float, current_ask: float, pip_size: float, contract_size: float,
+    def floating_pnl(self, current_price: float, pip_size: float, contract_size: float,
                       quote_to_account_rate: float = 1.0) -> float:
         return sum(
-            p.floating_pnl(current_bid, current_ask, pip_size, contract_size, quote_to_account_rate)
+            p.floating_pnl(current_price, pip_size, contract_size, quote_to_account_rate)
             for p in self.positions
         )
 
-    def is_profitable(self, current_bid: float, current_ask: float, pip_size: float, contract_size: float,
+    def is_profitable(self, current_price: float, pip_size: float, contract_size: float,
                        quote_to_account_rate: float = 1.0) -> bool:
-        return self.floating_pnl(current_bid, current_ask, pip_size, contract_size, quote_to_account_rate) > 0
+        return self.floating_pnl(current_price, pip_size, contract_size, quote_to_account_rate) > 0
 
+    # ---- mutation ----------------------------------------------------
     def add_position(self, entry_price: float, lot_size: float, open_time: datetime,
                       level: int, kind: str, commission: float = 0.0) -> Position:
         pos = Position(
