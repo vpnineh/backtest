@@ -1,0 +1,54 @@
+# =====================================================================
+# Hedge-Grid Strategy - Research Backtest Configuration
+# Every strategy assumption lives here. Nothing is hardcoded in the code.
+# =====================================================================
+
+data:
+  symbol: "EURGBP"
+  path: "data"                # folder containing your yearly CSV files (2010-2025)
+  file_pattern: "*.zip"       # matches every csv inside data/
+  start_date: "2010-01-01"
+  end_date: "2025-12-31"
+  datetime_column: "auto"
+  timezone: "UTC"
+
+strategy:
+  initial_lot: 0.10
+  scale_factor: 1.20          # same factor used for BOTH pyramid and martingale sides
+  grid_distance_pips: 15.0
+  max_levels: 10
+  grid_mode: "fixed"          # "fixed" or "atr"
+  atr_period: 14
+  atr_multiplier: 1.0
+  pip_size: 0.0001            # EURGBP -> 0.0001 (use 0.01 for JPY pairs)
+  contract_size: 100000.0
+
+exit:
+  mode: "A"                   # A | B | C | D  (see exit_manager.py docstring)
+  target_profit: 50.0         # used by Mode B
+  convergence_pips: 2.0       # used by Mode C
+  equilibrium_buffer_pips: 1.0  # used by Mode D
+
+costs:
+  commission_per_lot: 7.0     # account currency, round-turn per 1.0 lot
+  spread_pips: 1.2
+  slippage_pips: 0.2
+  swap_long_per_lot: -0.5
+  swap_short_per_lot: 0.2
+
+account:
+  starting_balance: 10000.0
+  leverage: 100.0
+  currency: "USD"
+  margin_call_level: 50.0
+  # EURGBP P/L is naturally denominated in GBP. This is a simplified
+  # constant conversion to account currency - replace with a real
+  # GBP->USD (or your account currency) rate/series for production use.
+  quote_to_account_rate: 1.27
+
+output:
+  results_dir: "results"
+  generate_charts: true
+  save_trade_log: true
+  save_cycle_log: true
+  report_name: "simulation_report"
