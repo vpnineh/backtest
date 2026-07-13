@@ -15,13 +15,6 @@ on:
         description: "Grid distance in pips"
         required: false
         default: "15"
-  push:
-    branches: [ main ]
-    paths:
-      - "config.yaml"
-      - "hedge_sim/**"
-      - "main.py"
-      - "data/**"
 
 jobs:
   backtest:
@@ -38,8 +31,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Override config with workflow inputs (manual runs only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Override config with workflow inputs
         run: |
           python - <<'PY'
           import yaml
