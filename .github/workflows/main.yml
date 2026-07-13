@@ -1,93 +1,63 @@
-name: Forex Backtester
+name: Hedge-Grid Strategy Backtest
 
 on:
   workflow_dispatch:
     inputs:
-      symbol:
-        description: 'Symbol'
+      exit_mode:
+        description: "Exit mode (A, B, C, D)"
         required: false
-        default: 'EURUSD'
-        type: choice
-        options:
-          - EURUSD
-          - GBPUSD
-          - AUDUSD
-          - USDCAD
-          - USDCHF
-          - NZDUSD
-          - AUDNZD
-          - EURGBP
-          - XAUUSD
-          - XAGUSD
-
-      timeframe:
-        description: 'Timeframe'
+        default: "A"
+      scale_factor:
+        description: "Scale factor for pyramid/martingale"
         required: false
-        default: 'H1'
-        type: choice
-        options:
-          - M5
-          - M15
-          - H1
-          - H4
-          - D1
-
-      run_all_symbols:
-        description: 'Run ALL symbols?'
+        default: "1.20"
+      grid_distance_pips:
+        description: "Grid distance in pips"
         required: false
-        default: false
-        type: boolean
-
-      walk_forward:
-        description: 'Walk-Forward Validation?'
-        required: false
-        default: false
-        type: boolean
+        default: "15"
+  push:
+    branches: [ main ]
+    paths:
+      - "config.yaml"
+      - "hedge_sim/**"
+      - "main.py"
+      - "data/**"
 
 jobs:
   backtest:
-    name: Run Backtest [${{ inputs.symbol }} / ${{ inputs.timeframe }}]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install numpy pandas matplotlib
+        run: pip install -r requirements.txt
 
-      - name: Create output directory
-        run: mkdir -p backtest_results
-
-      - name: Show available data files
+      - name: Override config with workflow inputs (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          echo "=== data/ ==="
-          ls -lh data/
+          python - <<'PY'
+          import yaml
+          with open("config.yaml") as f:
+              cfg = yaml.safe_load(f)
+          cfg["exit"]["mode"] = "${{ github.event.inputs.exit_mode }}"
+          cfg["strategy"]["scale_factor"] = float("${{ github.event.inputs.scale_factor }}")
+          cfg["strategy"]["grid_distance_pips"] = float("${{ github.event.inputs.grid_distance_pips }}")
+          with open("config.yaml", "w") as f:
+              yaml.safe_dump(cfg, f)
+          PY
 
       - name: Run backtest
-        run: |
-          ARGS="--symbol ${{ inputs.symbol }} --timeframe ${{ inputs.timeframe }}"
-          [ "${{ inputs.run_all_symbols }}" = "true" ] && ARGS="$ARGS --all"
-          [ "${{ inputs.walk_forward }}"   = "true" ] && ARGS="$ARGS --wf"
-          echo "Running: python backtest.py $ARGS"
-          python backtest.py $ARGS
-
-      - name: Show log
-        if: always()
-        run: cat backtest_results/backtest.log || echo "no log"
+        run: python main.py --config config.yaml
 
       - name: Upload results
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-${{ inputs.symbol }}-${{ inputs.timeframe }}-run${{ github.run_number }}
-          path: backtest_results/
-          if-no-files-found: warn
+          name: backtest-results-${{ github.run_number }}
+          path: results/
           retention-days: 30
