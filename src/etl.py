@@ -2,6 +2,8 @@
 import zipfile
 import re
 import polars as pl
+import tempfile
+import os
 from pathlib import Path
 from loguru import logger
 from src.config import BacktestSettings
@@ -16,17 +18,22 @@ TF_MAP = {
     "D1": "1d"
 }
 
-def read_m1_data(data_dir: Path, start_year: int, end_year: int) -> pl.DataFrame:
-    """Reads and concatenates all M1 ZIP files within the year range."""
+def read_m1_data(settings: BacktestSettings) -> pl.DataFrame:
+    """Reads and concatenates all M1 ZIP files within the year range for the specific symbol."""
+    data_dir = settings.data_dir
+    symbol = settings.symbol
+    start_year = settings.start_year
+    end_year = settings.end_year
+    
     schema = {
         "datetime": pl.Utf8, "open": pl.Float32, "high": pl.Float32, 
         "low": pl.Float32, "close": pl.Float32, "volume": pl.Int32
     }
     
-    # We ALWAYS look for M1 files since that's our base data
-    zip_files = sorted(data_dir.glob("*M1*.zip"))
+    # 1. Filter strictly by SYMBOL and M1 to avoid reading other pairs (like AUDNZD)
+    zip_files = sorted(data_dir.glob(f"*{symbol}*M1*.zip"))
     if not zip_files:
-        raise FileNotFoundError(f"No M1 ZIP files found in {data_dir}. Base data is required.")
+        raise FileNotFoundError(f"No M1 ZIP files found for {symbol} in {data_dir}.")
         
     chunks = []
     for zip_file in zip_files:
@@ -39,17 +46,48 @@ def read_m1_data(data_dir: Path, start_year: int, end_year: int) -> pl.DataFrame
         with zipfile.ZipFile(zip_file, 'r') as z:
             csv_name = z.namelist()[0] 
             with z.open(csv_name) as f:
-                df_chunk = pl.read_csv(f, has_header=False, ignore_errors=True)
-                if df_chunk.shape[1] == 5:
-                    df_chunk.columns = ["datetime", "open", "high", "low", "close"]
-                    df_chunk = df_chunk.with_columns(pl.lit(0).alias("volume").cast(pl.Int32))
-                else:
-                    df_chunk = df_chunk[:, :6]
-                    df_chunk.columns = list(schema.keys())
-                chunks.append(df_chunk.select(list(schema.keys())).cast(schema))
+                csv_bytes = f.read()
+                
+            # Write to temp file to avoid Polars file-object warning and maximize performance
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                tmp.write(csv_bytes)
+                tmp_path = tmp.name
+                
+            try:
+                # Detect separator (HistData ASCII is usually ';', but sometimes ',')
+                first_line = csv_bytes.split(b'\n')[0].decode('utf-8')
+                sep = ';' if ';' in first_line else ','
+                
+                df_chunk = pl.read_csv(
+                    tmp_path, 
+                    has_header=False, 
+                    separator=sep,
+                    ignore_errors=True
+                )
+            finally:
+                # Clean up temp file
+                os.remove(tmp_path)
+                
+            # Standardize columns (Handle 5 or 6 column variations)
+            if df_chunk.shape[1] == 5:
+                df_chunk.columns = ["datetime", "open", "high", "low", "close"]
+                df_chunk = df_chunk.with_columns(pl.lit(0).alias("volume").cast(pl.Int32))
+            elif df_chunk.shape[1] >= 6:
+                df_chunk = df_chunk[:, :6]
+                df_chunk.columns = list(schema.keys())
+            else:
+                logger.warning(f"Skipping malformed file: {zip_file.name}")
+                continue
+                
+            chunks.append(df_chunk.select(list(schema.keys())).cast(schema))
+
+    if not chunks:
+        raise ValueError(f"No valid data processed for {symbol} between {start_year} and {end_year}.")
 
     logger.info("Concatenating M1 chunks and parsing datetimes...")
     df = pl.concat(chunks).unique(subset=["datetime"]).sort("datetime")
+    
+    # Parse datetime (HistData format: YYYYMMDD HHMMSS)
     df = df.with_columns(
         pl.col("datetime").str.strptime(pl.Datetime, "%Y%m%d %H%M%S").alias("datetime")
     )
@@ -70,7 +108,7 @@ def extract_histdata_to_parquet(settings: BacktestSettings) -> Path:
     logger.info(f"Starting ETL for {settings.symbol} | Target Timeframe: {settings.timeframe} | Years: {settings.start_year}-{settings.end_year}")
     
     # 1. Always read M1 first (Base Data)
-    df_m1 = read_m1_data(data_dir, settings.start_year, settings.end_year)
+    df_m1 = read_m1_data(settings)
     
     # 2. If target timeframe is M1, just save and return
     if settings.timeframe == "M1":
