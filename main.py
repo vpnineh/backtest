@@ -3,311 +3,235 @@ import glob
 import zipfile
 import datetime
 import pandas as pd
-import backtrader as bt
+import numpy as np
+import pandas_ta as ta
 
 # ==========================================
-# 1. DATA PIPELINE (AUTOMATED ZIP/CSV LOADER)
+# 1. FAST DATA INGESTION
 # ==========================================
 def load_historical_data(pair, data_dir='data'):
-    """
-    Scans the data directory for ZIP and CSV files matching the pair,
-    extracts them in-memory, parses HistData/ASCII formats, and returns a sorted Pandas DataFrame.
-    """
     print(f"[*] Scanning '{data_dir}' for {pair} data...")
-    
-    zip_pattern = os.path.join(data_dir, f'*{pair}*.zip')
-    csv_pattern = os.path.join(data_dir, f'*{pair}*.csv')
-    
-    zip_files = glob.glob(zip_pattern)
-    csv_files = glob.glob(csv_pattern)
-    
+    zip_files = glob.glob(os.path.join(data_dir, f'*{pair}*.zip'))
     all_dfs = []
     
-    # Process ZIP files (HistData format usually uses ';' as separator)
     for zf in zip_files:
-        print(f"    -> Extracting from: {os.path.basename(zf)}")
         with zipfile.ZipFile(zf, 'r') as z:
             for file_info in z.infolist():
                 if file_info.filename.endswith('.csv'):
                     with z.open(file_info) as f:
-                        # Histdata ASCII format: 20100103 170000;1.430100;1.430400;1.430100;1.430400;0
                         df = pd.read_csv(f, sep=';', header=None,
                                          names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
-                                         engine='python', on_bad_lines='skip')
+                                         engine='c', on_bad_lines='skip') # Using 'c' engine for max speed
                         all_dfs.append(df)
 
-    # Process Standalone CSV files
-    for cf in csv_files:
-        print(f"    -> Reading: {os.path.basename(cf)}")
-        # Check standard comma or semicolon separator
-        with open(cf, 'r') as f:
-            first_line = f.readline()
-        sep = ';' if ';' in first_line else ','
-        
-        df = pd.read_csv(cf, sep=sep, header=None,
-                         names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
-                         engine='python', on_bad_lines='skip')
-        all_dfs.append(df)
-
     if not all_dfs:
-        raise FileNotFoundError(f"[!] No data found for {pair} in '{data_dir}' directory.")
+        raise FileNotFoundError(f"[!] No data found for {pair}.")
 
-    print(f"[*] Merging {len(all_dfs)} files and formatting dates...")
+    print(f"[*] Merging and sorting data...")
     master_df = pd.concat(all_dfs, ignore_index=True)
-    
-    # Parse DateTime and Set Index
-    # Format 'YYYYMMDD HHMMSS' matching Histdata
-    master_df['datetime'] = pd.to_datetime(master_df['datetime'], format='%Y%m%d %H%M%S', errors='coerce')
-    master_df.dropna(subset=['datetime'], inplace=True)
+    master_df['datetime'] = pd.to_datetime(master_df['datetime'], format='%Y%m%d %H%M%S')
     master_df.set_index('datetime', inplace=True)
-    
-    # Sort chronologically (CRUCIAL for backtesting)
     master_df.sort_index(inplace=True)
     
-    # Clean up exact matching columns for Backtrader PandasData
-    master_df = master_df[['open', 'high', 'low', 'close', 'volume']]
+    return master_df[['open', 'high', 'low', 'close']]
+
+# ==========================================
+# 2. VECTORIZED INDICATORS (ZERO LOOK-AHEAD)
+# ==========================================
+def prepare_multi_timeframe_data(df):
+    print("[*] Calculating Multi-Timeframe Indicators (Vectorized)...")
     
-    print(f"[*] Total Rows Loaded: {len(master_df)}")
-    return master_df
+    # --- H4 Calculations ---
+    # Resample to 4H, calc EMA200, shift by 4H so it's only available AFTER the candle closes
+    df_h4 = df['close'].resample('4h', label='left', closed='left').last().to_frame(name='close')
+    df_h4['ema_200'] = ta.ema(df_h4['close'], length=200)
+    df_h4.index = df_h4.index + pd.Timedelta(hours=4) 
 
+    # --- M15 Calculations ---
+    df_m15 = df.resample('15min', label='left', closed='left').agg({'open':'first', 'high':'max', 'low':'min', 'close':'last'})
+    df_m15['rsi'] = ta.rsi(df_m15['close'], length=14)
+    bbands = ta.bbands(df_m15['close'], length=20, std=2.0)
+    if bbands is not None:
+        df_m15['bb_bot'] = bbands.iloc[:, 0] # Lower band
+        df_m15['bb_top'] = bbands.iloc[:, 2] # Upper band
+    else:
+        df_m15['bb_bot'] = np.nan
+        df_m15['bb_top'] = np.nan
+        
+    df_m15['atr_100'] = ta.atr(df_m15['high'], df_m15['low'], df_m15['close'], length=100)
+    adx = ta.adx(df_m15['high'], df_m15['low'], df_m15['close'], length=14)
+    df_m15['adx'] = adx.iloc[:, 0] if adx is not None else np.nan
+    
+    # Simple Engulfing Pattern Logic
+    df_m15['prev_open'] = df_m15['open'].shift(1)
+    df_m15['prev_close'] = df_m15['close'].shift(1)
+    df_m15['bull_engulf'] = (df_m15['prev_close'] < df_m15['prev_open']) & (df_m15['close'] > df_m15['open']) & (df_m15['close'] > df_m15['prev_open']) & (df_m15['open'] < df_m15['prev_close'])
+    df_m15['bear_engulf'] = (df_m15['prev_close'] > df_m15['prev_open']) & (df_m15['close'] < df_m15['open']) & (df_m15['close'] < df_m15['prev_open']) & (df_m15['open'] > df_m15['prev_close'])
+    
+    # Shift M15 by 15 mins to prevent look-ahead bias
+    df_m15.index = df_m15.index + pd.Timedelta(minutes=15)
+
+    # --- M5 Calculations ---
+    df_m5 = df.resample('5min', label='left', closed='left').agg({'high':'max', 'low':'min', 'close':'last'})
+    df_m5['atr_14_m5'] = ta.atr(df_m5['high'], df_m5['low'], df_m5['close'], length=14)
+    df_m5.index = df_m5.index + pd.Timedelta(minutes=5)
+
+    # --- Merge All to M1 ---
+    print("[*] Merging Timeframes without bias...")
+    merged = df.copy()
+    
+    # Join and Forward Fill (ffill)
+    merged = merged.join(df_h4[['ema_200']], how='left')
+    merged = merged.join(df_m15[['rsi', 'bb_bot', 'bb_top', 'atr_100', 'adx', 'bull_engulf', 'bear_engulf']], how='left')
+    merged = merged.join(df_m5[['atr_14_m5']], how='left')
+    
+    merged.ffill(inplace=True)
+    merged.dropna(inplace=True) # Drop initial rows where indicators are calculating
+    
+    return merged
 
 # ==========================================
-# 2. STRATEGY ENGINE (NO LOOK-AHEAD BIAS)
+# 3. HIGH-SPEED ENGINE (NUMPY ITERATION)
 # ==========================================
-class ProfessionalMartingale(bt.Strategy):
-    params = (
-        ('pair', 'AUDNZD'),          
-        ('risk_pct', 0.002),         # 0.20% risk
-        ('max_levels', 7),           
-        ('grid_multipliers', [1.00, 1.35, 1.80, 2.40, 3.20, 4.30, 5.0]), 
-        ('target_profit_pct', 0.01), # 1% basket target
-        ('max_daily_dd', 0.03),      # 3%
-        ('max_weekly_dd', 0.08),     # 8%
-    )
-
-    def __init__(self):
-        # Timframes setup (Data0=M1, Data1=M5, Data2=M15, Data3=H4)
-        self.m1 = self.datas[0]
-        self.m5 = self.datas[1]
-        self.m15 = self.datas[2]
-        self.h4 = self.datas[3]
-
-        # Indicators strictly bound to their respective timeframes
-        self.ema200_h4 = bt.indicators.EMA(self.h4.close, period=200)
-
-        self.rsi_m15 = bt.indicators.RSI(self.m15.close, period=14)
-        self.bbands_m15 = bt.indicators.BollingerBands(self.m15.close, period=20, devfactor=2.0)
-        self.atr100_m15 = bt.indicators.ATR(self.m15, period=100)
-        self.adx_m15 = bt.indicators.ADX(self.m15, period=14)
+def run_fast_backtest(df, pair):
+    print(f"[*] Starting High-Speed Backtest Engine over {len(df)} 1-Minute candles...")
+    
+    # Extract to fast Numpy arrays
+    closes = df['close'].values
+    ema200 = df['ema_200'].values
+    rsi = df['rsi'].values
+    bb_bot = df['bb_bot'].values
+    bb_top = df['bb_top'].values
+    atr_100 = df['atr_100'].values
+    adx = df['adx'].values
+    bull_eng = df['bull_engulf'].values
+    bear_eng = df['bear_engulf'].values
+    atr_14_m5 = df['atr_14_m5'].values
+    
+    hours = df.index.hour.values
+    days = df.index.dayofweek.values
+    dates = df.index.date
+    
+    # Settings
+    pip_val = 0.0001 if 'JPY' not in pair else 0.01
+    grid_multipliers = [1.00, 1.35, 1.80, 2.40, 3.20, 4.30, 5.0]
+    max_levels = 7
+    target_profit_pct = 0.01
+    
+    # Account State
+    equity = 10000.0
+    initial_equity = 10000.0
+    
+    basket_dir = 0
+    positions = [] # list of tuples: (price, size)
+    basket_start_equity = 0.0
+    
+    total_trades = 0
+    winning_baskets = 0
+    losing_baskets = 0
+    max_dd = 0.0
+    peak_equity = equity
+    
+    for i in range(100, len(closes)):
+        price = closes[i]
         
-        self.atr14_m5 = bt.indicators.ATR(self.m5, period=14)
-
-        # State Variables
-        self.basket_direction = 0  
-        self.grid_levels_open = 0
-        self.initial_lot = 0
-        self.last_trade_price = 0.0
-        self.initial_equity_basket = 0.0
-        
-        # Drawdown tracking
-        self.day_start_equity = None
-        self.week_start_equity = None
-        self.last_day = None
-        self.last_week = None
-        self.trading_disabled_today = False
-        self.trading_disabled_this_week = False
-        
-        self.pip_value = 0.0001 if 'JPY' not in self.p.pair else 0.01
-
-    def start(self):
-        self.initial_equity = self.broker.getvalue()
-        self.day_start_equity = self.initial_equity
-        self.week_start_equity = self.initial_equity
-
-    def check_drawdowns(self):
-        current_equity = self.broker.getvalue()
-        current_date = self.data.datetime.date(0)
-        current_week = current_date.isocalendar()[1]
-
-        if self.last_day != current_date:
-            self.day_start_equity = current_equity
-            self.last_day = current_date
-            self.trading_disabled_today = False
-
-        if self.last_week != current_week:
-            self.week_start_equity = current_equity
-            self.last_week = current_week
-            self.trading_disabled_this_week = False
-
-        daily_dd = (self.day_start_equity - current_equity) / self.day_start_equity
-        weekly_dd = (self.week_start_equity - current_equity) / self.week_start_equity
-
-        if daily_dd > self.p.max_daily_dd:
-            self.trading_disabled_today = True
-        if weekly_dd > self.p.max_weekly_dd:
-            self.trading_disabled_this_week = True
-
-    def get_dynamic_grid_distance(self):
-        dist = 0.8 * self.atr14_m5[0]
-        dist_pips = dist / self.pip_value
-        dist_pips = max(25, min(dist_pips, 45))
-        return dist_pips * self.pip_value
-
-    def get_initial_lot_size(self):
-        return 10000  # Default 0.1 Lot size for standard accounts
-
-    def check_candle_pattern(self, is_bullish):
-        o1, c1 = self.m15.open[-1], self.m15.close[-1]
-        o0, c0 = self.m15.open[0], self.m15.close[0]
-        if is_bullish:
-            return (c1 < o1) and (c0 > o0) and (c0 > o1) and (o0 < c1)
-        return (c1 > o1) and (c0 < o0) and (c0 < o1) and (o0 > c1)
-
-    def next(self):
-        # Execute logic at M1 tick level
-        self.check_drawdowns()
-        
-        if self.trading_disabled_today or self.trading_disabled_this_week:
-            return
-
-        pos = self.getposition()
-        current_equity = self.broker.getvalue()
-        
-        # --- BASKET MANAGEMENT ---
-        if self.basket_direction != 0 and pos.size != 0:
-            unrealized_pnl = current_equity - self.initial_equity_basket
-            target_profit = self.initial_equity_basket * self.p.target_profit_pct
+        # Track Drawdown
+        if equity > peak_equity: peak_equity = equity
+        current_dd = (peak_equity - equity) / peak_equity
+        if current_dd > max_dd: max_dd = current_dd
             
-            # Emergency Stop logic
-            if self.adx_m15[0] > 35: 
-                self.close()
-                self.basket_direction = 0
-                self.grid_levels_open = 0
-                return
-
-            # Target Reached
-            if unrealized_pnl >= target_profit:
-                self.close()
-                self.basket_direction = 0
-                self.grid_levels_open = 0
-                return
+        # --- 1. MANAGE OPEN BASKET ---
+        if basket_dir != 0:
+            # Calculate floating PnL
+            unrealized = 0.0
+            for p, s in positions:
+                unrealized += (price - p) * s * basket_dir * (1/pip_val) # rough pip-to-dollar calc for simplicity
+                
+            target_profit = basket_start_equity * target_profit_pct
+            
+            # Emergency Exit OR Target Reached
+            if unrealized >= target_profit or adx[i] > 35:
+                equity += unrealized
+                if unrealized > 0: winning_baskets += 1
+                else: losing_baskets += 1
+                
+                basket_dir = 0
+                positions.clear()
+                continue
                 
             # Grid Scaling
-            if self.grid_levels_open < self.p.max_levels:
-                current_price = self.data.close[0]
-                grid_dist = self.get_dynamic_grid_distance()
+            levels_open = len(positions)
+            if levels_open < max_levels:
+                last_price = positions[-1][0]
                 
-                # Basket Protection Limit
-                if unrealized_pnl < (-2 * target_profit):
-                    return 
+                # Dynamic Grid Distance
+                dist_pips = (0.8 * atr_14_m5[i]) / pip_val
+                dist_pips = max(25, min(dist_pips, 45))
+                grid_dist = dist_pips * pip_val
                 
-                if self.basket_direction == 1 and current_price <= (self.last_trade_price - grid_dist):
-                    new_lot = self.initial_lot * self.p.grid_multipliers[self.grid_levels_open]
-                    self.buy(size=new_lot)
-                    self.last_trade_price = current_price
-                    self.grid_levels_open += 1
-                        
-                elif self.basket_direction == -1 and current_price >= (self.last_trade_price + grid_dist):
-                    new_lot = self.initial_lot * self.p.grid_multipliers[self.grid_levels_open]
-                    self.sell(size=new_lot)
-                    self.last_trade_price = current_price
-                    self.grid_levels_open += 1
-            return
+                if basket_dir == 1 and price <= (last_price - grid_dist):
+                    new_size = 10 * grid_multipliers[levels_open] # base size 10 
+                    positions.append((price, new_size))
+                    total_trades += 1
+                    
+                elif basket_dir == -1 and price >= (last_price + grid_dist):
+                    new_size = 10 * grid_multipliers[levels_open]
+                    positions.append((price, new_size))
+                    total_trades += 1
+            
+            continue # If basket open, skip initial entry logic
 
-        # --- ENTRY CONDITIONS ---
+        # --- 2. INITIAL ENTRY ---
         # Session Filter (London 08:00 - 17:00)
-        curr_time = self.data.datetime.time(0)
-        if not (datetime.time(8, 0) <= curr_time <= datetime.time(17, 0)):
-            return
-
-        # Wait for Indicators
-        if len(self.ema200_h4) < 200 or len(self.atr100_m15) < 100:
-            return
-
-        price = self.m15.close[0]
+        if not (8 <= hours[i] <= 17): continue
+        # Friday after noon
+        if days[i] == 4 and hours[i] >= 12: continue
         
-        # Long Entry
-        if price > self.ema200_h4[0]:
-            if self.rsi_m15[0] < 28 and self.adx_m15[0] < 25:
-                if price < self.bbands_m15.lines.bot[0]: 
-                    if self.atr100_m15[0] < (1.3 * self.atr100_m15[-1]): 
-                        if self.check_candle_pattern(is_bullish=True):
-                            self.initial_equity_basket = current_equity
-                            self.initial_lot = self.get_initial_lot_size()
-                            self.buy(size=self.initial_lot)
-                            self.basket_direction = 1
-                            self.grid_levels_open = 1
-                            self.last_trade_price = self.data.close[0]
-                            return
+        if adx[i] < 25 and atr_100[i] < (1.3 * atr_100[i-1]):
+            # Buy Logic
+            if price > ema200[i] and rsi[i] < 28 and price < bb_bot[i] and bull_eng[i]:
+                basket_dir = 1
+                basket_start_equity = equity
+                positions.append((price, 10)) # Base unit
+                total_trades += 1
+                
+            # Sell Logic
+            elif price < ema200[i] and rsi[i] > 72 and price > bb_top[i] and bear_eng[i]:
+                basket_dir = -1
+                basket_start_equity = equity
+                positions.append((price, 10))
+                total_trades += 1
 
-        # Short Entry
-        if price < self.ema200_h4[0]:
-            if self.rsi_m15[0] > 72 and self.adx_m15[0] < 25:
-                if price > self.bbands_m15.lines.top[0]:
-                    if self.atr100_m15[0] < (1.3 * self.atr100_m15[-1]):
-                        if self.check_candle_pattern(is_bullish=False):
-                            self.initial_equity_basket = current_equity
-                            self.initial_lot = self.get_initial_lot_size()
-                            self.sell(size=self.initial_lot)
-                            self.basket_direction = -1
-                            self.grid_levels_open = 1
-                            self.last_trade_price = self.data.close[0]
-                            return
+    return equity, max_dd, total_trades, winning_baskets, losing_baskets
 
 # ==========================================
-# 3. EXECUTION BOOTSTRAPPER
+# BOOTSTRAPPER
 # ==========================================
 if __name__ == '__main__':
-    pair_to_test = 'AUDNZD' # You can change this to EURGBP or EURUSD based on files
-    
+    pair_to_test = 'AUDNZD' 
     print("="*50)
-    print("Starting Professional Backtest Pipeline")
+    print("ULTRA-FAST PROFESSIONAL BACKTEST PIPELINE")
     print("="*50)
     
     try:
-        df = load_historical_data(pair=pair_to_test, data_dir='data')
+        raw_df = load_historical_data(pair=pair_to_test, data_dir='data')
+        ready_df = prepare_multi_timeframe_data(raw_df)
+        
+        final_equity, mdd, t_trades, w_baskets, l_baskets = run_fast_backtest(ready_df, pair_to_test)
+        
+        print("\n" + "="*50)
+        print(f"BACKTEST RESULTS: {pair_to_test}")
+        print("="*50)
+        print(f"Final Balance:    ${final_equity:.2f}")
+        print(f"Max Drawdown:     {mdd*100:.2f}%")
+        print(f"Total Grids/Trades: {w_baskets + l_baskets} / {t_trades}")
+        
+        total_baskets = w_baskets + l_baskets
+        if total_baskets > 0:
+            win_rate = (w_baskets / total_baskets) * 100
+            print(f"Basket Win Rate:  {win_rate:.2f}%")
+        
+        print("="*50)
+        
     except Exception as e:
-        print(f"Error loading data: {e}")
-        exit()
-
-    cerebro = bt.Cerebro(stdstats=False)
-    cerebro.broker.setcash(10000.0)
-    cerebro.broker.setcommission(commission=0.00005, margin=100.0, mult=1.0)
-    
-    # Add Data0 (M1 Feed)
-    data_m1 = bt.feeds.PandasData(dataname=df, timeframe=bt.TimeFrame.Minutes, compression=1)
-    cerebro.adddata(data_m1)
-
-    # Resample Timeframes (No lookahead bias)
-    cerebro.resampledata(data_m1, timeframe=bt.TimeFrame.Minutes, compression=5)   # Data1
-    cerebro.resampledata(data_m1, timeframe=bt.TimeFrame.Minutes, compression=15)  # Data2
-    cerebro.resampledata(data_m1, timeframe=bt.TimeFrame.Minutes, compression=240) # Data3
-
-    # Add Strategy & Analyzers
-    cerebro.addstrategy(ProfessionalMartingale, pair=pair_to_test)
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-
-    print("\n[*] Initializing Engine (This might take time based on RAM and CPU)...")
-    results = cerebro.run()
-    strat = results[0]
-
-    # --- Print Professional Report ---
-    print("\n" + "="*50)
-    print("BACKTEST RESULTS")
-    print("="*50)
-    
-    dd = strat.analyzers.drawdown.get_analysis()
-    trades = strat.analyzers.trades.get_analysis()
-    
-    print(f"Final Balance: ${cerebro.broker.getvalue():.2f}")
-    print(f"Max Drawdown:  {dd.max.drawdown:.2f}%")
-    
-    if 'total' in trades and trades.total.closed > 0:
-        print(f"Total Trades:  {trades.total.closed}")
-        print(f"Win Rate:      {(trades.won.total / trades.total.closed) * 100:.2f}%")
-    else:
-        print("Total Trades:  0 (No entries triggered)")
-    
-    print("="*50)
+        print(f"Error during execution: {e}")
