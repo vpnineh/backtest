@@ -11,13 +11,23 @@ class MeanReversionStrategy:
         logger.info("Calculating Mean Reversion indicators (Bollinger Bands, RSI)...")
         p = self.params
 
-        # 1. Bollinger Bands
+        # 1. Bollinger Bands (Raw)
         df = df.with_columns([
-            pl.col("close").rolling_mean(window_size=p.bb_period).alias("bb_middle"),
+            pl.col("close").rolling_mean(window_size=p.bb_period).alias("bb_middle_raw"),
             pl.col("close").rolling_std(window_size=p.bb_period).alias("bb_std"),
         ]).with_columns([
-            (pl.col("bb_middle") + (p.bb_std_dev * pl.col("bb_std"))).alias("bb_upper"),
-            (pl.col("bb_middle") - (p.bb_std_dev * pl.col("bb_std"))).alias("bb_lower"),
+            (pl.col("bb_middle_raw") + (p.bb_std_dev * pl.col("bb_std"))).alias("bb_upper_raw"),
+            (pl.col("bb_middle_raw") - (p.bb_std_dev * pl.col("bb_std"))).alias("bb_lower_raw"),
+        ])
+
+        # 🔥 CRITICAL FIX: Shift bands by 1 to eliminate Exit Look-Ahead Bias.
+        # At the open of candle N, the final close of candle N is unknown, 
+        # so the exact bb_middle for candle N is unknown. 
+        # We must use the bands calculated up to candle N-1.
+        df = df.with_columns([
+            pl.col("bb_middle_raw").shift(1).alias("bb_middle"),
+            pl.col("bb_upper_raw").shift(1).alias("bb_upper"),
+            pl.col("bb_lower_raw").shift(1).alias("bb_lower"),
         ])
 
         # 2. RSI
@@ -37,19 +47,15 @@ class MeanReversionStrategy:
         df = df.with_columns(pl.col("datetime").dt.hour().alias("hour"))
         active_mask = (pl.col("hour") >= p.london_start_hour) & (pl.col("hour") <= p.london_end_hour)
 
-        # 4. Raw entry conditions
-        # Buy: Price touches lower band AND RSI is oversold
+        # 4. Raw entry conditions (Using shifted bands)
         buy_cond = (pl.col("close") <= pl.col("bb_lower")) & (pl.col("rsi") <= p.rsi_oversold) & active_mask
-        
-        # Sell: Price touches upper band AND RSI is overbought
         sell_cond = (pl.col("close") >= pl.col("bb_upper")) & (pl.col("rsi") >= p.rsi_overbought) & active_mask
 
         df = df.with_columns(
             pl.when(buy_cond).then(1).when(sell_cond).then(-1).otherwise(0).alias("raw_signal")
         )
 
-        # 🔥 CRITICAL: Shift signal by 1 candle to eliminate look-ahead bias
-        # Signal generated at close of candle N will be executed at open of candle N+1
+        # 🔥 CRITICAL: Shift signal by 1 candle to eliminate entry look-ahead bias
         df = df.with_columns(
             pl.col("raw_signal").shift(1).fill_null(0).alias("signal")
         )
