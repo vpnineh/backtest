@@ -5,8 +5,8 @@ from pathlib import Path
 # ==========================================
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
-SYMBOL = "AUDUSD"
-TIMEFRAME = "M15"
+SYMBOL = "EURGBP"
+TIMEFRAME = "M1"
 START_YEAR = 2012
 END_YEAR = 2025
 # ==========================================
