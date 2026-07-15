@@ -7,7 +7,7 @@ from src.config import TradingCosts, StrategyParams, BacktestSettings
 
 @dataclass
 class Trade:
-    """Standardized Trade Dataclass. No temporary fields."""
+    """Standardized Trade Dataclass."""
     entry_time: Any
     exit_time: Any = None
     side: int = 0
@@ -35,23 +35,21 @@ class RealisticBacktestEngine:
 
     def _calculate_lot_size(self, current_atr: float) -> float:
         """
-        Strict Fixed Fractional Position Sizing (1% Risk).
-        🔥 FIX: Accepts current_atr directly instead of relying on Trade object.
+        🔥 STRESS TEST MODE: Fixed Lot Size.
+        Comment out the compounding logic to see the TRUE expectancy of the strategy.
         """
-        risk_amount = self.balance * self.settings.risk_per_trade_percent
+        # 🔥 CHANGE THIS VALUE to test different fixed sizes (e.g., 0.1, 0.5, 1.0)
+        FIXED_LOT_SIZE = 0.1 
         
-        # Initial SL distance in price
-        sl_distance_price = self.params.initial_sl_atr_mult * current_atr 
+        return FIXED_LOT_SIZE
         
-        # Convert to pips for lot size calculation
-        sl_pips = sl_distance_price / self.pip_size
-        
-        # Prevent division by zero in case of bad data
-        if sl_pips <= 0:
-            return 0.0
-            
-        lot_size = risk_amount / (sl_pips * self.costs.pip_value_usd_per_lot)
-        return round(lot_size, 2)
+        # --- OLD COMPOUNDING LOGIC (KEPT FOR REFERENCE, DO NOT USE) ---
+        # risk_amount = self.balance * self.settings.risk_per_trade_percent
+        # sl_distance_price = self.params.initial_sl_atr_mult * current_atr 
+        # sl_pips = sl_distance_price / self.pip_size
+        # if sl_pips <= 0: return 0.0
+        # lot_size = risk_amount / (sl_pips * self.costs.pip_value_usd_per_lot)
+        # return round(lot_size, 2)
 
     def _apply_entry_costs(self, price: float, side: int) -> float:
         spread_price = self.costs.spread_pips * self.pip_size
@@ -95,7 +93,7 @@ class RealisticBacktestEngine:
         self.open_trade = None
 
     def run(self, df: pl.DataFrame) -> Dict[str, Any]:
-        logger.info("Starting Event-Driven Engine with ATR Trailing Stop...")
+        logger.info("Starting Event-Driven Engine with FIXED LOT SIZE (Stress Test)...")
         data = df.to_dicts()
         
         for row in data:
@@ -113,43 +111,32 @@ class RealisticBacktestEngine:
                 trail_distance = current_atr * self.params.trail_atr_mult
                 
                 if trade.side == 1: # Buy
-                    # Calculate new trailing stop
                     new_sl = current_high - trail_distance
-                    # Only move stop UP, never down
                     if new_sl > trade.sl_price:
                         trade.sl_price = new_sl
-                    
-                    # Check if stopped out
                     if current_low <= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
-                        
                 else: # Sell
-                    # Calculate new trailing stop
                     new_sl = current_low + trail_distance
-                    # Only move stop DOWN, never up
                     if new_sl < trade.sl_price:
                         trade.sl_price = new_sl
-                        
-                    # Check if stopped out
                     if current_high >= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
                         
             # 2. Check for New Entry
             if not self.open_trade and signal != 0:
-                # 🔥 FIX: Calculate lot size BEFORE creating the Trade object
                 lot_size = self._calculate_lot_size(current_atr)
                 
                 if lot_size > 0:
                     self.open_trade = Trade(
                         entry_time=current_time,
                         side=signal,
-                        lot_size=lot_size  # Directly pass calculated lot size
+                        lot_size=lot_size
                     )
                     
                     actual_entry = self._apply_entry_costs(current_open, signal)
                     self.open_trade.entry_price = actual_entry
                     
-                    # Set Initial Stop Loss
                     initial_sl_distance = current_atr * self.params.initial_sl_atr_mult
                     if signal == 1:
                         self.open_trade.sl_price = actual_entry - initial_sl_distance
