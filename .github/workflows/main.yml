@@ -25,7 +25,7 @@ jobs:
 
     - name: Run Backtest Pipeline
       run: |
-        python main.py | tee backtest_report.txt
+        python -u main.py | tee backtest_report.txt
 
     - name: Upload Backtest Report
       uses: actions/upload-artifact@v4
