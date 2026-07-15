@@ -6,7 +6,7 @@ from pathlib import Path
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
 SYMBOL = "EURGBP"
-TIMEFRAME = "M1"
+TIMEFRAME = "H1"
 START_YEAR = 2012
 END_YEAR = 2025
 # ==========================================
