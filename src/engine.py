@@ -13,7 +13,7 @@ class Trade:
     entry_price: float = 0.0
     exit_price: float = 0.0
     lot_size: float = 0.0
-    sl_price: float = 0.0  # Added for Hard Stop Loss
+    sl_price: float = 0.0
     pnl: float = 0.0
     martingale_level: int = 0
     bars_held: int = 0
@@ -55,8 +55,8 @@ class RealisticBacktestEngine:
         else:
             risk_amount = base_risk_amount
 
-        # Hard SL for Mean Reversion (e.g., 3 * ATR)
-        sl_pips = (current_atr * 3.0) / self.pip_size if current_atr > 0 else 20.0
+        # Hard SL for Mean Reversion (3 * ATR)
+        sl_pips = (current_atr * 3.0) / self.pip_size if current_atr > 0 else 30.0
         risk_per_lot_usd = sl_pips * self.costs.pip_value_usd_per_lot
 
         if risk_per_lot_usd <= 0:
@@ -149,18 +149,23 @@ class RealisticBacktestEngine:
             current_low = row["low"]
             current_close = row["close"]
             current_bb_middle = row["bb_middle"]
-            current_atr = row["atr"] # Needed for SL calculation if not stored in trade
+            
+            # 🔥 FIX: Safe ATR access with fallback
+            current_atr = row.get("atr", 0.0)
+            if current_atr is None or current_atr <= 0:
+                current_atr = 30.0 * self.pip_size  # Fallback to 30 pips
+            
             signal = row["signal"]
 
             if self.open_trade:
                 trade = self.open_trade
                 trade.bars_held += 1
 
-                # 🔥 FIX 1: Check Hard Stop Loss FIRST (Intrabar safety)
+                # 🔥 FIX 1: Check Hard Stop Loss FIRST
                 if trade.side == 1:  # Buy
                     if current_low <= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
-                        continue # Skip target check if stopped out
+                        continue
                     # 🔥 FIX 2: Check Mean Reversion Target
                     elif current_low <= current_bb_middle:
                         self._close_trade(current_bb_middle, current_time)
@@ -184,10 +189,8 @@ class RealisticBacktestEngine:
                     actual_entry = self._apply_entry_costs(current_open, signal)
                     self.open_trade.entry_price = actual_entry
                     
-                    # 🔥 FIX 3: Set Hard Stop Loss on Entry (e.g., 3 * ATR)
-                    # If ATR is not available, fallback to a fixed 30 pips
-                    sl_distance = (current_atr * 3.0) if current_atr > 0 else (30.0 * self.pip_size)
-                    
+                    # 🔥 FIX 3: Set Hard Stop Loss on Entry (3 * ATR)
+                    sl_distance = current_atr * 3.0
                     if signal == 1:
                         self.open_trade.sl_price = actual_entry - sl_distance
                     else:
