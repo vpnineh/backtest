@@ -2,9 +2,9 @@
 import sys
 from pathlib import Path
 from loguru import logger
-from src.config import TradingCosts, StrategyParams, BacktestSettings, MartingaleConfig
+from src.config import TradingCosts, StrategyParams, BacktestSettings
 from src.etl import extract_histdata_to_parquet
-from src.strategy import MeanReversionStrategy
+from src.strategy import TrendFollowingStrategy
 from src.engine import RealisticBacktestEngine
 import polars as pl
 
@@ -26,12 +26,11 @@ def print_report(report: dict):
     print(f"Profit Factor:        {report['profit_factor']:.2f}")
     print(f"Expectancy per Trade: ${report['expectancy']:.2f}")
     print("-" * 60)
+    print(f"Average Win:          ${report['avg_win']:,.2f}")
+    print(f"Average Loss:         ${report['avg_loss']:,.2f}")
+    print("-" * 60)
     print(f"Max Drawdown ($):     ${report['max_drawdown_usd']:,.2f}")
     print(f"Max Drawdown (%):     {report['max_drawdown_pct']:.2f}%")
-    print("-" * 60)
-    print("📈 MARTINGALE STATS:")
-    print(f"Max Level Reached:    {report['max_martingale_level_reached']}")
-    print(f"Circuit Breaker Hit:  {'🚨 YES (Trading Halted)' if report['halted_by_circuit_breaker'] else '✅ NO'}")
     print("-" * 60)
     print("💸 REALISTIC COST BREAKDOWN:")
     print(f"Total Spread Paid:    ${report['total_spread_cost']:,.2f}")
@@ -42,12 +41,11 @@ def print_report(report: dict):
 
 def main():
     setup_logger()
-    logger.info("Initializing Realistic Forex Backtesting System with Martingale...")
+    logger.info("Initializing Institutional Trend Following System...")
     
     costs = TradingCosts()
     params = StrategyParams()
     settings = BacktestSettings()
-    martingale = MartingaleConfig() # 🔥 NEW: Load Martingale Config
     
     logger.info(f"Target: {settings.symbol} | Timeframe: {settings.timeframe} | Years: {settings.start_year}-{settings.end_year}")
     
@@ -56,11 +54,10 @@ def main():
     logger.info("Loading Parquet data into memory...")
     df = pl.read_parquet(parquet_path)
     
-    strategy = MeanReversionStrategy(params)
+    strategy = TrendFollowingStrategy(params)
     df_signals = strategy.generate_signals(df)
     
-    # 🔥 FIX: Pass 'martingale' to the engine
-    engine = RealisticBacktestEngine(costs, params, settings, martingale)
+    engine = RealisticBacktestEngine(costs, params, settings)
     report = engine.run(df_signals)
     
     print_report(report)
