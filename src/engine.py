@@ -15,6 +15,8 @@ class Trade:
     lot_size: float = 0.0
     sl_price: float = 0.0
     pnl: float = 0.0
+    # 🔥 FIX: Added initial_atr to store ATR value at entry for position sizing
+    initial_atr: float = 0.0 
 
 class RealisticBacktestEngine:
     def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
@@ -39,6 +41,11 @@ class RealisticBacktestEngine:
         sl_distance_price = self.params.initial_sl_atr_mult * self.open_trade.initial_atr 
         # Convert to pips for lot size calculation
         sl_pips = sl_distance_price / self.pip_size
+        
+        # Prevent division by zero in case of bad data
+        if sl_pips == 0:
+            return 0.0
+            
         lot_size = risk_amount / (sl_pips * self.costs.pip_value_usd_per_lot)
         return round(lot_size, 2)
 
@@ -128,7 +135,7 @@ class RealisticBacktestEngine:
                 self.open_trade = Trade(
                     entry_time=current_time,
                     side=signal,
-                    initial_atr=current_atr # Store ATR for lot size calc
+                    initial_atr=current_atr # 🔥 Now this will work perfectly
                 )
                 
                 actual_entry = self._apply_entry_costs(current_open, signal)
