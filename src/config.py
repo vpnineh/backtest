@@ -5,78 +5,68 @@ from pathlib import Path
 # ==========================================
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
-SYMBOL = "EURGBP"
-TIMEFRAME = "H1"
+SYMBOL = "AUDNZD"       # رنج‌ترین جفت‌ارز
+TIMEFRAME = "H1"        # تایم‌فریم بالاتر برای کاهش نویز
 START_YEAR = 2012
 END_YEAR = 2025
 # ==========================================
 
 class TradingCosts(BaseModel):
     """
-    Realistic trading costs for AUDUSD (major pair, USD is quote currency).
-    🔥 FIXED: قبلاً این مقادیر برای AUDNZD کالیبره شده بودند ولی روی
-    AUDUSD اعمال می‌شدند (ناسازگاری کامل بین کامنت‌ها و نماد واقعی).
-    الان مقادیر برای AUDUSD واقعی است.
+    Realistic trading costs for AUDNZD.
     """
-    spread_pips: float = Field(default=0.9, description="AUDUSD typical retail/ECN spread")
-    slippage_pips: float = Field(default=0.2, description="Average slippage per execution")
-    commission_per_lot_usd: float = Field(default=5.0, description="Commission per 1 Lot per side (ECN-style account)")
-
-    # 🔥 FIX: چون quote currency خود AUDUSD همان USD است:
-    # 1 pip (0.0001) روی 1 لات استاندارد (100,000 واحد) = دقیقاً 10 دلار.
-    # (برخلاف AUDNZD که نیاز به تبدیل نرخ NZD/USD داشت)
-    pip_value_usd_per_lot: float = Field(default=10.0, description="Value of 1 pip for 1 Lot in USD (AUDUSD)")
-    pip_size: float = Field(default=0.0001, description="0.0001 for 4-digit pairs like AUDUSD")
+    spread_pips: float = Field(default=1.8, description="AUDNZD typical spread")
+    slippage_pips: float = Field(default=0.3, description="Average slippage per execution")
+    commission_per_lot_usd: float = Field(default=5.0, description="Commission per 1 Lot per side")
+    
+    # AUDNZD: 1 pip (0.0001) on 1 lot = 10 NZD ≈ $6 USD
+    pip_value_usd_per_lot: float = Field(default=6.0, description="Value of 1 pip for 1 Lot in USD (AUDNZD)")
+    pip_size: float = Field(default=0.0001, description="0.0001 for 4-digit pairs")
 
 
 class StrategyParams(BaseModel):
     """
-    Trend Following Strategy Parameters.
-
-    ⚠️ هشدار Overfitting:
-    این پارامترها عیناً از تست روی EURGBP کپی شده‌اند تا robustness
-    استراتژی سنجیده شود. این رویکرد فقط زمانی معتبر است که این اعداد
-    هرگز بر اساس نتیجه‌ی بک‌تست روی AUDUSD یا همین بازه‌ی زمانی دوباره
-    tune نشوند. اگر بعداً این مقادیر را برای بهتر شدن نتیجه تغییر دادید،
-    دیگر این یک تست robustness نیست بلکه curve-fitting روی داده‌ی
-    تاریخی است.
+    Mean Reversion Strategy Parameters for Range-Bound Pairs.
     """
-    ema_trend_period: int = 200
-    donchian_period: int = 20
-
-    atr_period: int = 14
-    initial_sl_atr_mult: float = 2.0
-    trail_atr_mult: float = 2.5
-
-    # Time filters (UTC) - فقط برای مجاز بودن ورود جدید استفاده می‌شود،
-    # نه برای فیلتر کردن کل داده (نگاه کن به strategy.py)
+    # Bollinger Bands
+    bb_period: int = 50
+    bb_std_dev: float = 2.5  # انحراف معیار بالاتر برای فیلتر نویز
+    
+    # RSI
+    rsi_period: int = 14
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
+    
+    # Time filters (UTC)
     london_start_hour: int = 7
     london_end_hour: int = 16
 
 
+class MartingaleConfig(BaseModel):
+    """
+    Principled Martingale Configuration.
+    """
+    enabled: bool = Field(default=True, description="Enable Martingale on losses")
+    multiplier: float = Field(default=1.3, gt=1.0, le=2.0, description="Volume multiplier after a loss (Soft Martingale)")
+    max_levels: int = Field(default=3, ge=1, le=5, description="Maximum consecutive loss levels")
+    reset_on_win: bool = Field(default=True, description="Reset to level 0 after a win")
+    circuit_breaker_dd_percent: float = Field(default=0.30, gt=0, le=0.50, description="Max drawdown % to halt trading")
+
+
 class BacktestSettings(BaseModel):
     initial_balance: float = 10000.0
-    risk_per_trade_percent: float = 0.01
-
-    # 🔥 NEW: کنترل صریح روش تعیین حجم معامله
-    # False -> لات ثابت (fixed_lot_size)، برای سنجش expectancy خام
-    #          استراتژی مستقل از اثر money management.
-    #          ⚠️ در این حالت total_return_pct و max_drawdown_pct معیار
-    #          ریسک واقعی حساب حقیقی نیستند.
-    # True  -> position sizing واقعی بر اساس risk_per_trade_percent و ATR
-    #          لحظه‌ی ورود. این حالت باید برای گزارش نهایی و تصمیم واقعی
-    #          استفاده شود.
-    use_dynamic_position_sizing: bool = False
+    base_risk_per_trade_percent: float = 0.01  # ریسک پایه 1% (قبل از اعمال مارتینگل)
+    
+    use_dynamic_position_sizing: bool = True
     fixed_lot_size: float = 0.1
-
+    
     data_dir: Path = Path("data")
-
+    
     symbol: str = SYMBOL
     timeframe: str = TIMEFRAME
     start_year: int = START_YEAR
     end_year: int = END_YEAR
-
+    
     @property
     def parquet_filename(self) -> str:
-        # Will generate: AUDUSD_M15_2012_2025.parquet
         return f"{self.symbol}_{self.timeframe}_{self.start_year}_{self.end_year}.parquet"
