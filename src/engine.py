@@ -1,9 +1,9 @@
-# src/engine.py (FINAL PRODUCTION-READY VERSION - v3, intrabar look-ahead fixed)
+# src/engine.py
 import polars as pl
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from loguru import logger
-from src.config import TradingCosts, StrategyParams, BacktestSettings
+from src.config import TradingCosts, StrategyParams, BacktestSettings, MartingaleConfig
 
 @dataclass
 class Trade:
@@ -13,52 +13,62 @@ class Trade:
     entry_price: float = 0.0
     exit_price: float = 0.0
     lot_size: float = 0.0
-    sl_price: float = 0.0
     pnl: float = 0.0
+    martingale_level: int = 0
     bars_held: int = 0
 
 class RealisticBacktestEngine:
-    def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
+    def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings, martingale: MartingaleConfig):
         self.costs = costs
         self.params = params
         self.settings = settings
+        self.martingale = martingale
 
         self.balance = settings.initial_balance
+        self.initial_balance = settings.initial_balance
         self.equity_curve: List[float] = []
         self.trades: List[Trade] = []
         self.open_trade: Optional[Trade] = None
 
+        # Martingale State
+        self.current_martingale_level = 0
+        self.is_halted_by_circuit_breaker = False
+
+        # Cost trackers
         self.total_spread_cost = 0.0
         self.total_slippage_cost = 0.0
         self.total_commission = 0.0
         self.pip_size = costs.pip_size
 
-    def _calculate_lot_size(self, current_atr: float) -> float:
+    def _calculate_lot_size(self) -> float:
+        """Calculate lot size with Martingale applied."""
+        if self.is_halted_by_circuit_breaker:
+            return 0.0
+
         if not self.settings.use_dynamic_position_sizing:
-            # STRESS TEST MODE: لات ثابت - برای سنجش expectancy خام
-            # سیگنال، مستقل از اثر money management.
-            # ⚠️ در این حالت total_return_pct و max_drawdown_pct معیار
-            # ریسک واقعی حساب نیستند (چون حجم معامله با رشد/افت بالانس
-            # تغییر نمی‌کند). فقط برای مقایسه‌ی کیفیت خام سیگنال مناسب
-            # است.
             return self.settings.fixed_lot_size
 
-        # --- Position sizing واقعی بر اساس ریسک ثابت هر معامله ---
-        if current_atr is None or current_atr <= 0:
-            return 0.0
+        # Base risk amount
+        base_risk_amount = self.balance * self.settings.base_risk_per_trade_percent
 
-        risk_amount_usd = self.balance * self.settings.risk_per_trade_percent
-        sl_distance_price = current_atr * self.params.initial_sl_atr_mult
-        sl_distance_pips = sl_distance_price / self.pip_size
+        # Apply Martingale multiplier if enabled
+        if self.martingale.enabled and self.current_martingale_level > 0:
+            effective_level = min(self.current_martingale_level, self.martingale.max_levels)
+            multiplier_factor = self.martingale.multiplier ** effective_level
+            risk_amount = base_risk_amount * multiplier_factor
+            logger.debug(f"Martingale Level {effective_level} | Multiplier: {multiplier_factor:.2f}")
+        else:
+            risk_amount = base_risk_amount
 
-        if sl_distance_pips <= 0:
-            return 0.0
+        # For Mean Reversion, we use a fixed SL distance (e.g., 20 pips)
+        # This is different from Trend Following which uses ATR
+        sl_pips = 20.0  # Fixed SL for mean reversion
+        risk_per_lot_usd = sl_pips * self.costs.pip_value_usd_per_lot
 
-        risk_per_lot_usd = sl_distance_pips * self.costs.pip_value_usd_per_lot
         if risk_per_lot_usd <= 0:
             return 0.0
 
-        lot_size = risk_amount_usd / risk_per_lot_usd
+        lot_size = risk_amount / risk_per_lot_usd
         lot_size = max(0.01, round(lot_size, 2))
         return lot_size
 
@@ -107,62 +117,62 @@ class RealisticBacktestEngine:
         gross_pnl = pip_diff * self.costs.pip_value_usd_per_lot * trade.lot_size
 
         trade.pnl = gross_pnl
+        trade.martingale_level = self.current_martingale_level
         self.balance += trade.pnl
+
+        # 🔥 MARTINGALE STATE UPDATE
+        if self.martingale.enabled:
+            if trade.pnl > 0:  # WIN
+                if self.martingale.reset_on_win and self.current_martingale_level > 0:
+                    logger.info(f"Win detected. Resetting Martingale level from {self.current_martingale_level} to 0.")
+                self.current_martingale_level = 0
+            elif trade.pnl < 0:  # LOSS
+                if self.current_martingale_level < self.martingale.max_levels:
+                    self.current_martingale_level += 1
+                    logger.warning(f"Loss detected. Martingale level increased to {self.current_martingale_level}.")
+                else:
+                    logger.warning(f"Max Martingale level ({self.martingale.max_levels}) reached. Capping volume.")
+
+        # 🔥 CIRCUIT BREAKER CHECK
+        current_dd = (self.initial_balance - self.balance) / self.initial_balance
+        if current_dd >= self.martingale.circuit_breaker_dd_percent:
+            self.is_halted_by_circuit_breaker = True
+            logger.error(f"🚨 CIRCUIT BREAKER TRIGGERED! Drawdown: {current_dd:.2%}. Trading Halted.")
+
         self.trades.append(trade)
         self.open_trade = None
 
     def run(self, df: pl.DataFrame) -> Dict[str, Any]:
-        mode_label = (
-            "DYNAMIC RISK-BASED SIZING (realistic)"
-            if self.settings.use_dynamic_position_sizing
-            else "FIXED LOT (stress test) - %% metrics are NOT real risk-adjusted"
-        )
-        logger.info(f"Starting Event-Driven Engine | Sizing mode: {mode_label}")
+        logger.info("Starting Mean Reversion Engine with Martingale...")
         data = df.to_dicts()
 
         for row in data:
+            if self.is_halted_by_circuit_breaker:
+                self.equity_curve.append(self.balance)
+                continue
+
             current_time = row["datetime"]
             current_open = row["open"]
             current_high = row["high"]
             current_low = row["low"]
             current_close = row["close"]
-            current_atr = row["atr"]
+            current_bb_middle = row["bb_middle"]
             signal = row["signal"]
 
             if self.open_trade:
                 trade = self.open_trade
                 trade.bars_held += 1
 
-                # 🔥 FIX (Intrabar Look-ahead Bias):
-                # قبلاً کد ابتدا SL جدید را با high/low همین کندل محاسبه
-                # می‌کرد و بلافاصله با low/high همان کندل چک می‌کرد. این
-                # فرض می‌کند ترتیب رخداد high و low داخل کندل مشخص است
-                # (مثلاً high قبل از low اتفاق افتاده) که هیچ تضمینی
-                # ندارد و یک نوع look-ahead ظریف است.
-                #
-                # روش صحیح: ابتدا SL که از پایان کندل قبلی باقی‌مانده
-                # (و قبل از دیدن اطلاعات این کندل تعیین شده بود) چک
-                # می‌شود. فقط اگر معامله زنده ماند، SL برای کندل‌های
-                # بعدی با اکسترمم همین کندل به‌روزرسانی می‌شود.
+                # 🔥 EXIT CONDITION: Price reaches middle band (mean reversion target)
                 if trade.side == 1:  # Buy
-                    if current_low <= trade.sl_price:
-                        self._close_trade(trade.sl_price, current_time)
-                    else:
-                        trail_distance = current_atr * self.params.trail_atr_mult
-                        new_sl = current_high - trail_distance
-                        if new_sl > trade.sl_price:
-                            trade.sl_price = new_sl
+                    if current_low <= current_bb_middle:  # Price dropped to middle
+                        self._close_trade(current_bb_middle, current_time)
                 else:  # Sell
-                    if current_high >= trade.sl_price:
-                        self._close_trade(trade.sl_price, current_time)
-                    else:
-                        trail_distance = current_atr * self.params.trail_atr_mult
-                        new_sl = current_low + trail_distance
-                        if new_sl < trade.sl_price:
-                            trade.sl_price = new_sl
+                    if current_high >= current_bb_middle:  # Price rose to middle
+                        self._close_trade(current_bb_middle, current_time)
 
             if not self.open_trade and signal != 0:
-                lot_size = self._calculate_lot_size(current_atr)
+                lot_size = self._calculate_lot_size()
                 if lot_size > 0:
                     self.open_trade = Trade(
                         entry_time=current_time,
@@ -172,12 +182,7 @@ class RealisticBacktestEngine:
                     actual_entry = self._apply_entry_costs(current_open, signal)
                     self.open_trade.entry_price = actual_entry
 
-                    initial_sl_distance = current_atr * self.params.initial_sl_atr_mult
-                    if signal == 1:
-                        self.open_trade.sl_price = actual_entry - initial_sl_distance
-                    else:
-                        self.open_trade.sl_price = actual_entry + initial_sl_distance
-
+            # Track Equity
             floating_pnl = 0.0
             if self.open_trade:
                 price_diff = (current_close - self.open_trade.entry_price) * self.open_trade.side
@@ -215,27 +220,17 @@ class RealisticBacktestEngine:
                 max_dd_pct = dd_pct
 
         avg_bars_held = sum(t.bars_held for t in self.trades) / total_trades
-        avg_bars_win = (
-            sum(t.bars_held for t in self.trades if t.pnl > 0) / len(wins) if wins else 0
-        )
-        avg_bars_loss = (
-            sum(t.bars_held for t in self.trades if t.pnl <= 0) / len(losses) if losses else 0
-        )
+        max_level_reached = max([t.martingale_level for t in self.trades]) if self.trades else 0
 
         total_hidden_costs = self.total_spread_cost + self.total_slippage_cost + self.total_commission
         net_pnl = self.balance - self.settings.initial_balance
-        # 🔥 NEW: تخمین PnL خام (بدون احتساب هزینه‌ها) برای تشخیص اینکه
-        # آیا ادج استراتژی واقعی است و فقط هزینه‌ها آن را می‌خورند، یا
-        # اینکه حتی بدون هزینه هم استراتژی edge منفی دارد.
         estimated_gross_pnl = net_pnl + total_hidden_costs
 
         return {
             "symbol": self.settings.symbol,
             "timeframe": self.settings.timeframe,
             "years": f"{self.settings.start_year}-{self.settings.end_year}",
-            "sizing_mode": (
-                "dynamic_risk_based" if self.settings.use_dynamic_position_sizing else "fixed_lot_stress_test"
-            ),
+            "sizing_mode": "martingale_mean_reversion",
             "initial_balance": self.settings.initial_balance,
             "final_balance": self.balance,
             "total_return_pct": ((self.balance - self.settings.initial_balance) / self.settings.initial_balance) * 100,
@@ -249,8 +244,8 @@ class RealisticBacktestEngine:
             "avg_loss": sum(losses) / len(losses) if losses else 0,
             "payoff_ratio": (sum(wins) / len(wins)) / abs(sum(losses) / len(losses)) if losses and wins else 0,
             "avg_bars_held": avg_bars_held,
-            "avg_bars_held_winners": avg_bars_win,
-            "avg_bars_held_losers": avg_bars_loss,
+            "max_martingale_level_reached": max_level_reached,
+            "halted_by_circuit_breaker": self.is_halted_by_circuit_breaker,
             "total_spread_cost": self.total_spread_cost,
             "total_slippage_cost": self.total_slippage_cost,
             "total_commission": self.total_commission,
