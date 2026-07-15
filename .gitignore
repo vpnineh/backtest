@@ -1,0 +1,13 @@
+# Data files (Keep repo clean)
+data/*.parquet
+data/*.zip
+data/*.csv
+
+# Logs and Reports
+backtest.log
+report.txt
+
+# Python
+__pycache__/
+*.pyc
+.env
