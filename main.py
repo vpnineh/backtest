@@ -106,12 +106,11 @@ def prepare_multi_timeframe_data(df):
     return merged
 
 # ==========================================
-# 3. HIGH-SPEED ENGINE (NUMPY ITERATION)
+# 3. HIGH-SPEED ENGINE (REALISTIC BROKER SIMULATION)
 # ==========================================
 def run_fast_backtest(df, pair):
     print(f"[*] Starting High-Speed Backtest Engine over {len(df)} 1-Minute candles...")
     
-    # Extract columns to raw numpy arrays for C-level speed
     closes = df['close'].values
     ema200 = df['ema_200'].values
     atr_100 = df['atr_100'].values
@@ -128,40 +127,53 @@ def run_fast_backtest(df, pair):
     grid_multipliers = [1.00, 1.35, 1.80, 2.40, 3.20, 4.30, 5.0]
     max_levels = 7
     target_profit_pct = 0.01 # 1% Target
+    usd_per_pip_per_lot = 10.0 # Standard approximation (1 lot = $10/pip)
+    base_lot = 0.1 # 0.1 Lots per initial entry
     
     # Account State
-    equity = 10000.0
+    balance = 10000.0
     
     basket_dir = 0
-    positions = [] # list of tuples: (entry_price, size)
-    basket_start_equity = 0.0
+    positions = [] # (entry_price, lot_size)
+    basket_start_balance = 0.0
     
-    # Stats
     total_trades = 0
     winning_baskets = 0
     losing_baskets = 0
     max_dd = 0.0
-    peak_equity = equity
+    peak_equity = balance
     
     for i in range(100, len(closes)):
         price = closes[i]
         
-        # Track Drawdown
-        if equity > peak_equity: peak_equity = equity
-        current_dd = (peak_equity - equity) / peak_equity
-        if current_dd > max_dd: max_dd = current_dd
+        # --- CALCULATE FLOATING EQUITY ---
+        unrealized = 0.0
+        if basket_dir != 0:
+            for p, size in positions:
+                pips_moved = (price - p) / pip_val
+                unrealized += (pips_moved * size * usd_per_pip_per_lot) * basket_dir
+
+        current_equity = balance + unrealized
+        
+        # --- TICK-BY-TICK DRAWDOWN & MARGIN CALL ---
+        if current_equity > peak_equity: 
+            peak_equity = current_equity
             
+        current_dd = (peak_equity - current_equity) / peak_equity
+        if current_dd > max_dd: 
+            max_dd = current_dd
+            
+        if current_equity <= 0:
+            print("\n[!!!] MARGIN CALL [!!!] ACCOUNT BLOWN UP!")
+            return 0.0, max_dd, total_trades, winning_baskets, losing_baskets
+
         # --- 1. MANAGE OPEN BASKET ---
         if basket_dir != 0:
-            unrealized = 0.0
-            for p, s in positions:
-                unrealized += (price - p) * s * basket_dir * (1/pip_val) 
-                
-            target_profit = basket_start_equity * target_profit_pct
+            target_profit = basket_start_balance * target_profit_pct
             
-            # Emergency Exit (ADX spikes over 35 indicating strong trend) OR Target Reached
+            # Exit Logic
             if unrealized >= target_profit or adx[i] > 35:
-                equity += unrealized
+                balance += unrealized
                 if unrealized > 0: winning_baskets += 1
                 else: losing_baskets += 1
                 
@@ -174,53 +186,46 @@ def run_fast_backtest(df, pair):
             if levels_open < max_levels:
                 last_price = positions[-1][0]
                 
-                # Dynamic Grid Distance based on M5 ATR
                 dist_pips = (0.8 * atr_14_m5[i]) / pip_val
                 dist_pips = max(25, min(dist_pips, 45))
                 grid_dist = dist_pips * pip_val
                 
                 if basket_dir == 1 and price <= (last_price - grid_dist):
-                    new_size = 10 * grid_multipliers[levels_open] 
+                    new_size = base_lot * grid_multipliers[levels_open] 
                     positions.append((price, new_size))
                     total_trades += 1
                     
                 elif basket_dir == -1 and price >= (last_price + grid_dist):
-                    new_size = 10 * grid_multipliers[levels_open]
+                    new_size = base_lot * grid_multipliers[levels_open]
                     positions.append((price, new_size))
                     total_trades += 1
             
             continue 
 
         # --- 2. INITIAL ENTRY ---
-        # Session Filter (London 08:00 - 17:00)
         if not (8 <= hours[i] <= 17): continue
-        # Friday after London noon
         if days[i] == 4 and hours[i] >= 12: continue
         
-        # Volatility and Trend Filters
         if adx[i] < 25 and atr_100[i] < (1.3 * atr_100[i-1]):
-            
-            # Buy Logic
             if price > ema200[i] and buy_sig[i]:
                 basket_dir = 1
-                basket_start_equity = equity
-                positions.append((price, 10)) # Base lot unit
+                basket_start_balance = balance
+                positions.append((price, base_lot))
                 total_trades += 1
                 
-            # Sell Logic
             elif price < ema200[i] and sell_sig[i]:
                 basket_dir = -1
-                basket_start_equity = equity
-                positions.append((price, 10))
+                basket_start_balance = balance
+                positions.append((price, base_lot))
                 total_trades += 1
 
-    return equity, max_dd, total_trades, winning_baskets, losing_baskets
+    final_equity = balance + unrealized if basket_dir != 0 else balance
+    return final_equity, max_dd, total_trades, winning_baskets, losing_baskets
 
 # ==========================================
 # BOOTSTRAPPER
 # ==========================================
 if __name__ == '__main__':
-    # You can change the pair to EURGBP if needed
     pair_to_test = 'AUDNZD' 
     
     print("="*50)
@@ -236,7 +241,11 @@ if __name__ == '__main__':
         print("\n" + "="*50)
         print(f"BACKTEST RESULTS: {pair_to_test}")
         print("="*50)
-        print(f"Final Balance:    ${final_equity:.2f}")
+        if final_equity == 0.0:
+            print("STATUS: ACCOUNT BLOWN UP (MARGIN CALL)")
+        else:
+            print(f"Final Balance:    ${final_equity:.2f}")
+            
         print(f"Max Drawdown:     {mdd*100:.2f}%")
         print(f"Total Grids/Trades: {w_baskets + l_baskets} / {t_trades}")
         
