@@ -1,7 +1,7 @@
-# src/engine.py (FINAL PRODUCTION-READY VERSION - v2, look-ahead bias fixed)
+# src/engine.py (FINAL PRODUCTION-READY VERSION - v3, intrabar look-ahead fixed)
 import polars as pl
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from loguru import logger
 from src.config import TradingCosts, StrategyParams, BacktestSettings
 
@@ -15,6 +15,7 @@ class Trade:
     lot_size: float = 0.0
     sl_price: float = 0.0
     pnl: float = 0.0
+    bars_held: int = 0
 
 class RealisticBacktestEngine:
     def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
@@ -25,7 +26,7 @@ class RealisticBacktestEngine:
         self.balance = settings.initial_balance
         self.equity_curve: List[float] = []
         self.trades: List[Trade] = []
-        self.open_trade: Trade | None = None
+        self.open_trade: Optional[Trade] = None
 
         self.total_spread_cost = 0.0
         self.total_slippage_cost = 0.0
@@ -58,17 +59,12 @@ class RealisticBacktestEngine:
             return 0.0
 
         lot_size = risk_amount_usd / risk_per_lot_usd
-        # گرد کردن به step معمول بروکر (0.01) و حداقل منطقی برای جلوگیری
-        # از لات صفر روی حساب‌های خیلی کوچک یا استاپ خیلی گشاد
         lot_size = max(0.01, round(lot_size, 2))
         return lot_size
 
     def _apply_entry_costs(self, price: float, side: int) -> float:
-        # Spread is paid on entry (full spread impact)
         spread_cost_usd = self.costs.spread_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
-        # Slippage on entry
         slippage_entry_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
-        # Commission (usually charged per side, so half of round-trip here)
         comm_entry_usd = (self.costs.commission_per_lot_usd / 2) * self.open_trade.lot_size
 
         self.total_spread_cost += spread_cost_usd
@@ -79,15 +75,13 @@ class RealisticBacktestEngine:
         price_impact_pips = total_entry_cost_usd / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
         price_impact_price = price_impact_pips * self.pip_size
 
-        if side == 1:  # Buy
+        if side == 1:
             return price + price_impact_price
-        else:          # Sell
+        else:
             return price - price_impact_price
 
     def _apply_exit_costs(self, price: float, side: int) -> float:
-        # Slippage on exit
         slippage_exit_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
-        # Commission on exit (second half)
         comm_exit_usd = (self.costs.commission_per_lot_usd / 2) * self.open_trade.lot_size
 
         self.total_slippage_cost += slippage_exit_usd
@@ -97,9 +91,9 @@ class RealisticBacktestEngine:
         price_impact_pips = total_exit_cost_usd / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
         price_impact_price = price_impact_pips * self.pip_size
 
-        if side == 1:  # Buy (Exit by Selling)
+        if side == 1:
             return price - price_impact_price
-        else:          # Sell (Exit by Buying)
+        else:
             return price + price_impact_price
 
     def _close_trade(self, exit_price: float, exit_time: Any):
@@ -137,20 +131,35 @@ class RealisticBacktestEngine:
 
             if self.open_trade:
                 trade = self.open_trade
-                trail_distance = current_atr * self.params.trail_atr_mult
+                trade.bars_held += 1
 
+                # 🔥 FIX (Intrabar Look-ahead Bias):
+                # قبلاً کد ابتدا SL جدید را با high/low همین کندل محاسبه
+                # می‌کرد و بلافاصله با low/high همان کندل چک می‌کرد. این
+                # فرض می‌کند ترتیب رخداد high و low داخل کندل مشخص است
+                # (مثلاً high قبل از low اتفاق افتاده) که هیچ تضمینی
+                # ندارد و یک نوع look-ahead ظریف است.
+                #
+                # روش صحیح: ابتدا SL که از پایان کندل قبلی باقی‌مانده
+                # (و قبل از دیدن اطلاعات این کندل تعیین شده بود) چک
+                # می‌شود. فقط اگر معامله زنده ماند، SL برای کندل‌های
+                # بعدی با اکسترمم همین کندل به‌روزرسانی می‌شود.
                 if trade.side == 1:  # Buy
-                    new_sl = current_high - trail_distance
-                    if new_sl > trade.sl_price:
-                        trade.sl_price = new_sl
                     if current_low <= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
+                    else:
+                        trail_distance = current_atr * self.params.trail_atr_mult
+                        new_sl = current_high - trail_distance
+                        if new_sl > trade.sl_price:
+                            trade.sl_price = new_sl
                 else:  # Sell
-                    new_sl = current_low + trail_distance
-                    if new_sl < trade.sl_price:
-                        trade.sl_price = new_sl
                     if current_high >= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
+                    else:
+                        trail_distance = current_atr * self.params.trail_atr_mult
+                        new_sl = current_low + trail_distance
+                        if new_sl < trade.sl_price:
+                            trade.sl_price = new_sl
 
             if not self.open_trade and signal != 0:
                 lot_size = self._calculate_lot_size(current_atr)
@@ -205,6 +214,21 @@ class RealisticBacktestEngine:
             if dd_pct > max_dd_pct:
                 max_dd_pct = dd_pct
 
+        avg_bars_held = sum(t.bars_held for t in self.trades) / total_trades
+        avg_bars_win = (
+            sum(t.bars_held for t in self.trades if t.pnl > 0) / len(wins) if wins else 0
+        )
+        avg_bars_loss = (
+            sum(t.bars_held for t in self.trades if t.pnl <= 0) / len(losses) if losses else 0
+        )
+
+        total_hidden_costs = self.total_spread_cost + self.total_slippage_cost + self.total_commission
+        net_pnl = self.balance - self.settings.initial_balance
+        # 🔥 NEW: تخمین PnL خام (بدون احتساب هزینه‌ها) برای تشخیص اینکه
+        # آیا ادج استراتژی واقعی است و فقط هزینه‌ها آن را می‌خورند، یا
+        # اینکه حتی بدون هزینه هم استراتژی edge منفی دارد.
+        estimated_gross_pnl = net_pnl + total_hidden_costs
+
         return {
             "symbol": self.settings.symbol,
             "timeframe": self.settings.timeframe,
@@ -223,8 +247,14 @@ class RealisticBacktestEngine:
             "max_drawdown_pct": max_dd_pct * 100,
             "avg_win": sum(wins) / len(wins) if wins else 0,
             "avg_loss": sum(losses) / len(losses) if losses else 0,
+            "payoff_ratio": (sum(wins) / len(wins)) / abs(sum(losses) / len(losses)) if losses and wins else 0,
+            "avg_bars_held": avg_bars_held,
+            "avg_bars_held_winners": avg_bars_win,
+            "avg_bars_held_losers": avg_bars_loss,
             "total_spread_cost": self.total_spread_cost,
             "total_slippage_cost": self.total_slippage_cost,
             "total_commission": self.total_commission,
-            "total_hidden_costs": self.total_spread_cost + self.total_slippage_cost + self.total_commission
+            "total_hidden_costs": total_hidden_costs,
+            "net_pnl": net_pnl,
+            "estimated_gross_pnl_before_costs": estimated_gross_pnl,
         }
