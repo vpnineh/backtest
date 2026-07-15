@@ -1,7 +1,6 @@
 name: Realistic Forex Backtest Pipeline
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
@@ -25,7 +24,7 @@ jobs:
 
     - name: Run Backtest
       run: |
-        python main.py
+        python -u main.py
 
     - name: Upload Report Artifact
       uses: actions/upload-artifact@v4
