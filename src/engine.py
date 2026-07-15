@@ -3,7 +3,7 @@ import polars as pl
 from dataclasses import dataclass
 from typing import List, Dict, Any
 from loguru import logger
-from src.config import TradingCosts, StrategyParams, BacktestSettings, MartingaleConfig
+from src.config import TradingCosts, StrategyParams, BacktestSettings
 
 @dataclass
 class Trade:
@@ -14,58 +14,32 @@ class Trade:
     exit_price: float = 0.0
     lot_size: float = 0.0
     sl_price: float = 0.0
-    tp_price: float = 0.0
     pnl: float = 0.0
-    martingale_level: int = 0  # Track which level this trade was taken at
 
 class RealisticBacktestEngine:
-    def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings, martingale: MartingaleConfig):
+    def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
         self.costs = costs
         self.params = params
         self.settings = settings
-        self.martingale = martingale
         
         self.balance = settings.initial_balance
-        self.initial_balance = settings.initial_balance
         self.equity_curve: List[float] = []
         self.trades: List[Trade] = []
         self.open_trade: Trade | None = None
         
-        # Martingale State
-        self.current_martingale_level = 0
-        self.is_halted_by_circuit_breaker = False
-        
-        # Cost trackers
         self.total_spread_cost = 0.0
         self.total_slippage_cost = 0.0
         self.total_commission = 0.0
         self.pip_size = costs.pip_size
 
     def _calculate_lot_size(self) -> float:
-        """Calculates lot size with Principled Martingale applied."""
-        if self.is_halted_by_circuit_breaker:
-            return 0.0
-            
-        # Base risk amount (1% of current balance)
-        base_risk_amount = self.balance * self.settings.risk_per_trade_percent
-        
-        # Apply Martingale Multiplier if enabled
-        if self.martingale.enabled and self.current_martingale_level > 0:
-            # Cap the level at max_levels
-            effective_level = min(self.current_martingale_level, self.martingale.max_levels)
-            multiplier_factor = self.martingale.multiplier ** effective_level
-            risk_amount = base_risk_amount * multiplier_factor
-            logger.debug(f"Martingale Level {effective_level} applied. Multiplier: {multiplier_factor:.2f}")
-        else:
-            risk_amount = base_risk_amount
-            
-        # Calculate lot size based on SL
-        lot_size = risk_amount / (self.params.sl_pips * self.costs.pip_value_usd_per_lot)
-        
-        # Hard cap: Never risk more than 10% of balance in a single trade (Safety net)
-        max_lot = (self.balance * 0.10) / (self.params.sl_pips * self.costs.pip_value_usd_per_lot)
-        lot_size = min(lot_size, max_lot)
-        
+        """Strict Fixed Fractional Position Sizing (1% Risk)."""
+        risk_amount = self.balance * self.settings.risk_per_trade_percent
+        # Initial SL distance in price
+        sl_distance_price = self.params.initial_sl_atr_mult * self.open_trade.initial_atr 
+        # Convert to pips for lot size calculation
+        sl_pips = sl_distance_price / self.pip_size
+        lot_size = risk_amount / (sl_pips * self.costs.pip_value_usd_per_lot)
         return round(lot_size, 2)
 
     def _apply_entry_costs(self, price: float, side: int) -> float:
@@ -105,83 +79,70 @@ class RealisticBacktestEngine:
         gross_pnl = pip_diff * self.costs.pip_value_usd_per_lot * trade.lot_size
         
         trade.pnl = gross_pnl
-        trade.martingale_level = self.current_martingale_level
-        
         self.balance += trade.pnl
-        
-        # 🔥 MARTINGALE STATE UPDATE
-        if self.martingale.enabled:
-            if trade.pnl > 0:  # WIN
-                if self.martingale.reset_on_win and self.current_martingale_level > 0:
-                    logger.info(f"Win detected. Resetting Martingale level from {self.current_martingale_level} to 0.")
-                self.current_martingale_level = 0
-            elif trade.pnl < 0:  # LOSS
-                if self.current_martingale_level < self.martingale.max_levels:
-                    self.current_martingale_level += 1
-                    logger.warning(f"Loss detected. Martingale level increased to {self.current_martingale_level}.")
-                else:
-                    logger.warning(f"Max Martingale level ({self.martingale.max_levels}) reached. Capping volume.")
-                    
-        # 🔥 CIRCUIT BREAKER CHECK
-        current_dd = (self.initial_balance - self.balance) / self.initial_balance
-        if current_dd >= self.martingale.circuit_breaker_dd_percent:
-            self.is_halted_by_circuit_breaker = True
-            logger.error(f"🚨 CIRCUIT BREAKER TRIGGERED! Drawdown: {current_dd:.2%}. Trading Halted to prevent ruin.")
-            
         self.trades.append(trade)
         self.open_trade = None
 
     def run(self, df: pl.DataFrame) -> Dict[str, Any]:
-        logger.info("Starting Event-Driven Backtest Engine with Martingale...")
+        logger.info("Starting Event-Driven Engine with ATR Trailing Stop...")
         data = df.to_dicts()
         
         for row in data:
-            if self.is_halted_by_circuit_breaker:
-                # If halted, just track equity curve without opening new trades
-                self.equity_curve.append(self.balance)
-                continue
-
             current_time = row["datetime"]
             current_open = row["open"]
             current_high = row["high"]
             current_low = row["low"]
             current_close = row["close"]
+            current_atr = row["atr"]
             signal = row["signal"]
             
+            # 1. Manage Open Trade (Trailing Stop Logic)
             if self.open_trade:
                 trade = self.open_trade
+                trail_distance = current_atr * self.params.trail_atr_mult
+                
                 if trade.side == 1: # Buy
+                    # Calculate new trailing stop
+                    new_sl = current_high - trail_distance
+                    # Only move stop UP, never down
+                    if new_sl > trade.sl_price:
+                        trade.sl_price = new_sl
+                    
+                    # Check if stopped out
                     if current_low <= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
-                    elif current_high >= trade.tp_price:
-                        self._close_trade(trade.tp_price, current_time)
+                        
                 else: # Sell
+                    # Calculate new trailing stop
+                    new_sl = current_low + trail_distance
+                    # Only move stop DOWN, never up
+                    if new_sl < trade.sl_price:
+                        trade.sl_price = new_sl
+                        
+                    # Check if stopped out
                     if current_high >= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
-                    elif current_low <= trade.tp_price:
-                        self._close_trade(trade.tp_price, current_time)
                         
+            # 2. Check for New Entry
             if not self.open_trade and signal != 0:
-                lot_size = self._calculate_lot_size()
-                if lot_size > 0:
-                    self.open_trade = Trade(
-                        entry_time=current_time,
-                        side=signal,
-                        lot_size=lot_size
-                    )
-                    actual_entry = self._apply_entry_costs(current_open, signal)
-                    self.open_trade.entry_price = actual_entry
-                    
-                    sl_distance = self.params.sl_pips * self.pip_size
-                    tp_distance = self.params.tp_pips * self.pip_size
-                    
-                    if signal == 1:
-                        self.open_trade.sl_price = actual_entry - sl_distance
-                        self.open_trade.tp_price = actual_entry + tp_distance
-                    else:
-                        self.open_trade.sl_price = actual_entry + sl_distance
-                        self.open_trade.tp_price = actual_entry - tp_distance
+                self.open_trade = Trade(
+                    entry_time=current_time,
+                    side=signal,
+                    initial_atr=current_atr # Store ATR for lot size calc
+                )
+                
+                actual_entry = self._apply_entry_costs(current_open, signal)
+                self.open_trade.entry_price = actual_entry
+                self.open_trade.lot_size = self._calculate_lot_size()
+                
+                # Set Initial Stop Loss
+                initial_sl_distance = current_atr * self.params.initial_sl_atr_mult
+                if signal == 1:
+                    self.open_trade.sl_price = actual_entry - initial_sl_distance
+                else:
+                    self.open_trade.sl_price = actual_entry + initial_sl_distance
 
+            # Track Equity
             floating_pnl = 0.0
             if self.open_trade:
                 price_diff = (current_close - self.open_trade.entry_price) * self.open_trade.side
@@ -215,9 +176,6 @@ class RealisticBacktestEngine:
             if dd > max_dd: max_dd = dd
             if dd_pct > max_dd_pct: max_dd_pct = dd_pct
 
-        # Martingale specific stats
-        max_level_reached = max([t.martingale_level for t in self.trades]) if self.trades else 0
-
         return {
             "symbol": self.settings.symbol,
             "timeframe": self.settings.timeframe,
@@ -231,8 +189,8 @@ class RealisticBacktestEngine:
             "expectancy": sum(pnls) / total_trades,
             "max_drawdown_usd": max_dd,
             "max_drawdown_pct": max_dd_pct * 100,
-            "max_martingale_level_reached": max_level_reached,
-            "halted_by_circuit_breaker": self.is_halted_by_circuit_breaker,
+            "avg_win": sum(wins)/len(wins) if wins else 0,
+            "avg_loss": sum(losses)/len(losses) if losses else 0,
             "total_spread_cost": self.total_spread_cost,
             "total_slippage_cost": self.total_slippage_cost,
             "total_commission": self.total_commission,
