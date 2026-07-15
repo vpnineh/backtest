@@ -13,6 +13,7 @@ class Trade:
     entry_price: float = 0.0
     exit_price: float = 0.0
     lot_size: float = 0.0
+    sl_price: float = 0.0  # Added for Hard Stop Loss
     pnl: float = 0.0
     martingale_level: int = 0
     bars_held: int = 0
@@ -30,39 +31,32 @@ class RealisticBacktestEngine:
         self.trades: List[Trade] = []
         self.open_trade: Optional[Trade] = None
 
-        # Martingale State
         self.current_martingale_level = 0
         self.is_halted_by_circuit_breaker = False
 
-        # Cost trackers
         self.total_spread_cost = 0.0
         self.total_slippage_cost = 0.0
         self.total_commission = 0.0
         self.pip_size = costs.pip_size
 
-    def _calculate_lot_size(self) -> float:
-        """Calculate lot size with Martingale applied."""
+    def _calculate_lot_size(self, current_atr: float) -> float:
         if self.is_halted_by_circuit_breaker:
             return 0.0
 
         if not self.settings.use_dynamic_position_sizing:
             return self.settings.fixed_lot_size
 
-        # Base risk amount
         base_risk_amount = self.balance * self.settings.base_risk_per_trade_percent
 
-        # Apply Martingale multiplier if enabled
         if self.martingale.enabled and self.current_martingale_level > 0:
             effective_level = min(self.current_martingale_level, self.martingale.max_levels)
             multiplier_factor = self.martingale.multiplier ** effective_level
             risk_amount = base_risk_amount * multiplier_factor
-            logger.debug(f"Martingale Level {effective_level} | Multiplier: {multiplier_factor:.2f}")
         else:
             risk_amount = base_risk_amount
 
-        # For Mean Reversion, we use a fixed SL distance (e.g., 20 pips)
-        # This is different from Trend Following which uses ATR
-        sl_pips = 20.0  # Fixed SL for mean reversion
+        # Hard SL for Mean Reversion (e.g., 3 * ATR)
+        sl_pips = (current_atr * 3.0) / self.pip_size if current_atr > 0 else 20.0
         risk_per_lot_usd = sl_pips * self.costs.pip_value_usd_per_lot
 
         if risk_per_lot_usd <= 0:
@@ -120,20 +114,18 @@ class RealisticBacktestEngine:
         trade.martingale_level = self.current_martingale_level
         self.balance += trade.pnl
 
-        # 🔥 MARTINGALE STATE UPDATE
         if self.martingale.enabled:
-            if trade.pnl > 0:  # WIN
+            if trade.pnl > 0:
                 if self.martingale.reset_on_win and self.current_martingale_level > 0:
                     logger.info(f"Win detected. Resetting Martingale level from {self.current_martingale_level} to 0.")
                 self.current_martingale_level = 0
-            elif trade.pnl < 0:  # LOSS
+            elif trade.pnl < 0:
                 if self.current_martingale_level < self.martingale.max_levels:
                     self.current_martingale_level += 1
                     logger.warning(f"Loss detected. Martingale level increased to {self.current_martingale_level}.")
                 else:
                     logger.warning(f"Max Martingale level ({self.martingale.max_levels}) reached. Capping volume.")
 
-        # 🔥 CIRCUIT BREAKER CHECK
         current_dd = (self.initial_balance - self.balance) / self.initial_balance
         if current_dd >= self.martingale.circuit_breaker_dd_percent:
             self.is_halted_by_circuit_breaker = True
@@ -143,7 +135,7 @@ class RealisticBacktestEngine:
         self.open_trade = None
 
     def run(self, df: pl.DataFrame) -> Dict[str, Any]:
-        logger.info("Starting Mean Reversion Engine with Martingale...")
+        logger.info("Starting Mean Reversion Engine with HARD STOP LOSS & Martingale...")
         data = df.to_dicts()
 
         for row in data:
@@ -157,22 +149,32 @@ class RealisticBacktestEngine:
             current_low = row["low"]
             current_close = row["close"]
             current_bb_middle = row["bb_middle"]
+            current_atr = row["atr"] # Needed for SL calculation if not stored in trade
             signal = row["signal"]
 
             if self.open_trade:
                 trade = self.open_trade
                 trade.bars_held += 1
 
-                # 🔥 EXIT CONDITION: Price reaches middle band (mean reversion target)
+                # 🔥 FIX 1: Check Hard Stop Loss FIRST (Intrabar safety)
                 if trade.side == 1:  # Buy
-                    if current_low <= current_bb_middle:  # Price dropped to middle
+                    if current_low <= trade.sl_price:
+                        self._close_trade(trade.sl_price, current_time)
+                        continue # Skip target check if stopped out
+                    # 🔥 FIX 2: Check Mean Reversion Target
+                    elif current_low <= current_bb_middle:
                         self._close_trade(current_bb_middle, current_time)
+                        continue
                 else:  # Sell
-                    if current_high >= current_bb_middle:  # Price rose to middle
+                    if current_high >= trade.sl_price:
+                        self._close_trade(trade.sl_price, current_time)
+                        continue
+                    elif current_high >= current_bb_middle:
                         self._close_trade(current_bb_middle, current_time)
+                        continue
 
             if not self.open_trade and signal != 0:
-                lot_size = self._calculate_lot_size()
+                lot_size = self._calculate_lot_size(current_atr)
                 if lot_size > 0:
                     self.open_trade = Trade(
                         entry_time=current_time,
@@ -181,8 +183,16 @@ class RealisticBacktestEngine:
                     )
                     actual_entry = self._apply_entry_costs(current_open, signal)
                     self.open_trade.entry_price = actual_entry
+                    
+                    # 🔥 FIX 3: Set Hard Stop Loss on Entry (e.g., 3 * ATR)
+                    # If ATR is not available, fallback to a fixed 30 pips
+                    sl_distance = (current_atr * 3.0) if current_atr > 0 else (30.0 * self.pip_size)
+                    
+                    if signal == 1:
+                        self.open_trade.sl_price = actual_entry - sl_distance
+                    else:
+                        self.open_trade.sl_price = actual_entry + sl_distance
 
-            # Track Equity
             floating_pnl = 0.0
             if self.open_trade:
                 price_diff = (current_close - self.open_trade.entry_price) * self.open_trade.side
