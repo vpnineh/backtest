@@ -6,46 +6,39 @@ from pathlib import Path
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
 SYMBOL = "EURGBP"
-TIMEFRAME = "M5"      
-START_YEAR = 2018     
+TIMEFRAME = "H1"      # 🔥 CRITICAL: Moved to H1 to eliminate spread noise
+START_YEAR = 2012     # Let's test the full 10+ years on H1
 END_YEAR = 2025       
 # ==========================================
 
 class TradingCosts(BaseModel):
-    """Realistic trading costs for EURGBP."""
-    spread_pips: float = Field(default=1.2, description="Average spread in pips")
-    slippage_pips: float = Field(default=0.3, description="Average slippage per execution")
-    commission_per_lot_usd: float = Field(default=5.0, description="Commission per 1 Lot per side")
-    pip_value_usd_per_lot: float = Field(default=12.5, description="Value of 1 pip for 1 Lot in USD")
-    pip_size: float = Field(default=0.0001, description="0.0001 for 4-digit pairs, 0.01 for 5-digit")
+    """Realistic trading costs."""
+    spread_pips: float = Field(default=1.2)
+    slippage_pips: float = Field(default=0.3)
+    commission_per_lot_usd: float = Field(default=5.0)
+    pip_value_usd_per_lot: float = Field(default=12.5)
+    pip_size: float = Field(default=0.0001)
 
 class StrategyParams(BaseModel):
-    """Mean Reversion Strategy Parameters - OPTIMIZED FOR M5"""
-    ema_trend_period: int = 50      
-    bb_period: int = 50             
-    bb_std_dev: float = 2.0         
+    """Trend Following Strategy Parameters (Donchian Breakout + ATR Trailing)"""
+    # Trend Filter
+    ema_trend_period: int = 200      # Only trade in direction of long-term trend
     
-    rsi_period: int = 14
-    rsi_oversold: float = 35.0      
-    rsi_overbought: float = 65.0    
+    # Breakout Logic
+    donchian_period: int = 20        # Breakout of 20-period high/low
     
-    sl_pips: float = 8.0            
-    tp_pips: float = 12.0           
+    # Volatility & Risk Management (ATR-based)
+    atr_period: int = 14
+    initial_sl_atr_mult: float = 2.0 # Initial Stop Loss = 2 * ATR
+    trail_atr_mult: float = 2.5      # Trailing Stop distance = 2.5 * ATR
     
+    # Time filters (UTC)
     london_start_hour: int = 7
     london_end_hour: int = 16
 
-class MartingaleConfig(BaseModel):
-    """Principled Martingale Configuration."""
-    enabled: bool = Field(default=True, description="Enable Martingale on losses")
-    multiplier: float = Field(default=1.3, gt=1.0, le=2.0, description="Volume multiplier after a loss (Soft Martingale)")
-    max_levels: int = Field(default=3, ge=1, le=5, description="Maximum consecutive loss levels before capping volume")
-    reset_on_win: bool = Field(default=True, description="Reset to level 0 after a win")
-    circuit_breaker_dd_percent: float = Field(default=0.20, gt=0, le=0.50, description="Max drawdown % to halt trading completely (Safety Net)")
-
 class BacktestSettings(BaseModel):
     initial_balance: float = 10000.0
-    risk_per_trade_percent: float = 0.01  # 1% risk per trade (Base risk)
+    risk_per_trade_percent: float = 0.01  # Strict 1% risk per trade (No Martingale!)
     data_dir: Path = Path("data")
     
     symbol: str = SYMBOL
