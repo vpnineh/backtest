@@ -1,55 +1,36 @@
-name: Hedge-Grid Strategy Backtest
+name: Realistic Forex Backtest Pipeline
 
 on:
+  push:
   workflow_dispatch:
-    inputs:
-      exit_mode:
-        description: "Exit mode (A, B, C, D)"
-        required: false
-        default: "A"
-      scale_factor:
-        description: "Scale factor for pyramid/martingale"
-        required: false
-        default: "1.20"
-      grid_distance_pips:
-        description: "Grid distance in pips"
-        required: false
-        default: "15"
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-      - name: Override config with workflow inputs
-        run: |
-          python - <<'PY'
-          import yaml
-          with open("config.yaml") as f:
-              cfg = yaml.safe_load(f)
-          cfg["exit"]["mode"] = "${{ github.event.inputs.exit_mode }}"
-          cfg["strategy"]["scale_factor"] = float("${{ github.event.inputs.scale_factor }}")
-          cfg["strategy"]["grid_distance_pips"] = float("${{ github.event.inputs.grid_distance_pips }}")
-          with open("config.yaml", "w") as f:
-              yaml.safe_dump(cfg, f)
-          PY
+    - name: Run Backtest
+      run: |
+        python main.py
 
-      - name: Run backtest
-        run: python -u main.py --config config.yaml
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results-${{ github.run_number }}
-          path: results/
-          retention-days: 30
+    - name: Upload Report Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: backtest-report
+        path: |
+          report.txt
+          backtest.log
