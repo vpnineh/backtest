@@ -8,7 +8,7 @@ class MeanReversionStrategy:
         self.params = params
 
     def generate_signals(self, df: pl.DataFrame) -> pl.DataFrame:
-        logger.info("Calculating Mean Reversion indicators (Bollinger Bands, RSI)...")
+        logger.info("Calculating Mean Reversion indicators (Bollinger Bands, RSI, ATR)...")
         p = self.params
 
         # 1. Bollinger Bands (Raw)
@@ -21,9 +21,6 @@ class MeanReversionStrategy:
         ])
 
         # 🔥 CRITICAL FIX: Shift bands by 1 to eliminate Exit Look-Ahead Bias.
-        # At the open of candle N, the final close of candle N is unknown, 
-        # so the exact bb_middle for candle N is unknown. 
-        # We must use the bands calculated up to candle N-1.
         df = df.with_columns([
             pl.col("bb_middle_raw").shift(1).alias("bb_middle"),
             pl.col("bb_upper_raw").shift(1).alias("bb_upper"),
@@ -43,11 +40,24 @@ class MeanReversionStrategy:
             (100 - (100 / (1 + (pl.col("avg_gain") / pl.col("avg_loss"))))).alias("rsi"),
         ])
 
+        # 🔥 FIX: Add ATR calculation for Hard Stop Loss
+        df = df.with_columns([
+            (pl.col("high") - pl.col("low")).alias("tr_hl"),
+            (pl.col("high") - pl.col("close").shift(1)).abs().alias("tr_hc"),
+            (pl.col("low") - pl.col("close").shift(1)).abs().alias("tr_lc")
+        ]).with_columns([
+            pl.max_horizontal(["tr_hl", "tr_hc", "tr_lc"]).alias("tr")
+        ]).with_columns([
+            pl.col("tr").rolling_mean(window_size=14).alias("atr_raw")
+        ]).with_columns([
+            pl.col("atr_raw").shift(1).alias("atr")  # Shift to avoid look-ahead
+        ])
+
         # 3. Time Filter
         df = df.with_columns(pl.col("datetime").dt.hour().alias("hour"))
         active_mask = (pl.col("hour") >= p.london_start_hour) & (pl.col("hour") <= p.london_end_hour)
 
-        # 4. Raw entry conditions (Using shifted bands)
+        # 4. Raw entry conditions
         buy_cond = (pl.col("close") <= pl.col("bb_lower")) & (pl.col("rsi") <= p.rsi_oversold) & active_mask
         sell_cond = (pl.col("close") >= pl.col("bb_upper")) & (pl.col("rsi") >= p.rsi_overbought) & active_mask
 
@@ -55,13 +65,13 @@ class MeanReversionStrategy:
             pl.when(buy_cond).then(1).when(sell_cond).then(-1).otherwise(0).alias("raw_signal")
         )
 
-        # 🔥 CRITICAL: Shift signal by 1 candle to eliminate entry look-ahead bias
+        # 🔥 CRITICAL: Shift signal by 1 candle
         df = df.with_columns(
             pl.col("raw_signal").shift(1).fill_null(0).alias("signal")
         )
 
         # Drop warmup nulls
-        df = df.drop_nulls(subset=["bb_middle", "bb_upper", "bb_lower", "rsi"])
+        df = df.drop_nulls(subset=["bb_middle", "bb_upper", "bb_lower", "rsi", "atr"])
 
         logger.success(f"Signal generation done. Total rows for engine: {df.height}")
         return df
