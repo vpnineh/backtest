@@ -5,8 +5,8 @@ from pathlib import Path
 # ==========================================
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
-SYMBOL = "AUDNZD"       # رنج‌ترین جفت‌ارز
-TIMEFRAME = "H1"        # تایم‌فریم بالاتر برای کاهش نویز
+SYMBOL = "AUDNZD"   
+TIMEFRAME = "M15"    
 START_YEAR = 2012
 END_YEAR = 2025
 # ==========================================
