@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 from loguru import logger
-from src.config import TradingCosts, StrategyParams, BacktestSettings
+from src.config import TradingCosts, StrategyParams, BacktestSettings, MartingaleConfig
 from src.etl import extract_histdata_to_parquet
 from src.strategy import MeanReversionStrategy
 from src.engine import RealisticBacktestEngine
@@ -29,6 +29,10 @@ def print_report(report: dict):
     print(f"Max Drawdown ($):     ${report['max_drawdown_usd']:,.2f}")
     print(f"Max Drawdown (%):     {report['max_drawdown_pct']:.2f}%")
     print("-" * 60)
+    print("📈 MARTINGALE STATS:")
+    print(f"Max Level Reached:    {report['max_martingale_level_reached']}")
+    print(f"Circuit Breaker Hit:  {'🚨 YES (Trading Halted)' if report['halted_by_circuit_breaker'] else '✅ NO'}")
+    print("-" * 60)
     print("💸 REALISTIC COST BREAKDOWN:")
     print(f"Total Spread Paid:    ${report['total_spread_cost']:,.2f}")
     print(f"Total Slippage Paid:  ${report['total_slippage_cost']:,.2f}")
@@ -38,11 +42,12 @@ def print_report(report: dict):
 
 def main():
     setup_logger()
-    logger.info("Initializing Realistic Forex Backtesting System...")
+    logger.info("Initializing Realistic Forex Backtesting System with Martingale...")
     
     costs = TradingCosts()
     params = StrategyParams()
     settings = BacktestSettings()
+    martingale = MartingaleConfig() # 🔥 NEW: Load Martingale Config
     
     logger.info(f"Target: {settings.symbol} | Timeframe: {settings.timeframe} | Years: {settings.start_year}-{settings.end_year}")
     
@@ -54,8 +59,8 @@ def main():
     strategy = MeanReversionStrategy(params)
     df_signals = strategy.generate_signals(df)
     
-    # 🔥 FIX: Pass 'params' to the engine
-    engine = RealisticBacktestEngine(costs, params, settings)
+    # 🔥 FIX: Pass 'martingale' to the engine
+    engine = RealisticBacktestEngine(costs, params, settings, martingale)
     report = engine.run(df_signals)
     
     print_report(report)
