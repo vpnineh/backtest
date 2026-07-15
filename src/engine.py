@@ -7,6 +7,7 @@ from src.config import TradingCosts, StrategyParams, BacktestSettings
 
 @dataclass
 class Trade:
+    """Standardized Trade Dataclass. No temporary fields."""
     entry_time: Any
     exit_time: Any = None
     side: int = 0
@@ -15,8 +16,6 @@ class Trade:
     lot_size: float = 0.0
     sl_price: float = 0.0
     pnl: float = 0.0
-    # 🔥 FIX: Added initial_atr to store ATR value at entry for position sizing
-    initial_atr: float = 0.0 
 
 class RealisticBacktestEngine:
     def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
@@ -34,16 +33,21 @@ class RealisticBacktestEngine:
         self.total_commission = 0.0
         self.pip_size = costs.pip_size
 
-    def _calculate_lot_size(self) -> float:
-        """Strict Fixed Fractional Position Sizing (1% Risk)."""
+    def _calculate_lot_size(self, current_atr: float) -> float:
+        """
+        Strict Fixed Fractional Position Sizing (1% Risk).
+        🔥 FIX: Accepts current_atr directly instead of relying on Trade object.
+        """
         risk_amount = self.balance * self.settings.risk_per_trade_percent
+        
         # Initial SL distance in price
-        sl_distance_price = self.params.initial_sl_atr_mult * self.open_trade.initial_atr 
+        sl_distance_price = self.params.initial_sl_atr_mult * current_atr 
+        
         # Convert to pips for lot size calculation
         sl_pips = sl_distance_price / self.pip_size
         
         # Prevent division by zero in case of bad data
-        if sl_pips == 0:
+        if sl_pips <= 0:
             return 0.0
             
         lot_size = risk_amount / (sl_pips * self.costs.pip_value_usd_per_lot)
@@ -132,22 +136,25 @@ class RealisticBacktestEngine:
                         
             # 2. Check for New Entry
             if not self.open_trade and signal != 0:
-                self.open_trade = Trade(
-                    entry_time=current_time,
-                    side=signal,
-                    initial_atr=current_atr # 🔥 Now this will work perfectly
-                )
+                # 🔥 FIX: Calculate lot size BEFORE creating the Trade object
+                lot_size = self._calculate_lot_size(current_atr)
                 
-                actual_entry = self._apply_entry_costs(current_open, signal)
-                self.open_trade.entry_price = actual_entry
-                self.open_trade.lot_size = self._calculate_lot_size()
-                
-                # Set Initial Stop Loss
-                initial_sl_distance = current_atr * self.params.initial_sl_atr_mult
-                if signal == 1:
-                    self.open_trade.sl_price = actual_entry - initial_sl_distance
-                else:
-                    self.open_trade.sl_price = actual_entry + initial_sl_distance
+                if lot_size > 0:
+                    self.open_trade = Trade(
+                        entry_time=current_time,
+                        side=signal,
+                        lot_size=lot_size  # Directly pass calculated lot size
+                    )
+                    
+                    actual_entry = self._apply_entry_costs(current_open, signal)
+                    self.open_trade.entry_price = actual_entry
+                    
+                    # Set Initial Stop Loss
+                    initial_sl_distance = current_atr * self.params.initial_sl_atr_mult
+                    if signal == 1:
+                        self.open_trade.sl_price = actual_entry - initial_sl_distance
+                    else:
+                        self.open_trade.sl_price = actual_entry + initial_sl_distance
 
             # Track Equity
             floating_pnl = 0.0
