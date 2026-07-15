@@ -1,4 +1,4 @@
-# src/engine.py
+# src/engine.py (FINAL PRODUCTION-READY VERSION)
 import polars as pl
 from dataclasses import dataclass
 from typing import List, Dict, Any
@@ -7,7 +7,6 @@ from src.config import TradingCosts, StrategyParams, BacktestSettings
 
 @dataclass
 class Trade:
-    """Standardized Trade Dataclass."""
     entry_time: Any
     exit_time: Any = None
     side: int = 0
@@ -34,44 +33,47 @@ class RealisticBacktestEngine:
         self.pip_size = costs.pip_size
 
     def _calculate_lot_size(self, current_atr: float) -> float:
-        """
-        🔥 STRESS TEST MODE: Fixed Lot Size to find TRUE expectancy.
-        """
+        # STRESS TEST MODE: Fixed Lot Size to prove TRUE expectancy
         FIXED_LOT_SIZE = 0.1 
         return FIXED_LOT_SIZE
 
     def _apply_entry_costs(self, price: float, side: int) -> float:
-        """🔥 FIX: Correct dollar calculation for spread and slippage."""
-        spread_cost_usd = (self.costs.spread_pips / 2) * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
-        slippage_cost_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
+        # Spread is paid on entry (full spread impact)
+        spread_cost_usd = self.costs.spread_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
+        # Slippage on entry
+        slippage_entry_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
+        # Commission (usually charged per side, so half of round-trip here)
+        comm_entry_usd = (self.costs.commission_per_lot_usd / 2) * self.open_trade.lot_size
         
         self.total_spread_cost += spread_cost_usd
-        self.total_slippage_cost += slippage_cost_usd
+        self.total_slippage_cost += slippage_entry_usd
+        self.total_commission += comm_entry_usd
         
-        # Convert dollar cost back to price impact for execution price
-        price_impact_pips = (spread_cost_usd + slippage_cost_usd) / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
+        total_entry_cost_usd = spread_cost_usd + slippage_entry_usd + comm_entry_usd
+        price_impact_pips = total_entry_cost_usd / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
         price_impact_price = price_impact_pips * self.pip_size
         
-        if side == 1:  # Buy (pays spread + slippage)
+        if side == 1:  # Buy
             return price + price_impact_price
-        else:          # Sell (pays spread + slippage)
+        else:          # Sell
             return price - price_impact_price
 
     def _apply_exit_costs(self, price: float, side: int) -> float:
-        """🔥 FIX: Correct dollar calculation for exit slippage and commission."""
-        slippage_cost_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
-        comm_cost_usd = self.costs.commission_per_lot_usd * self.open_trade.lot_size
+        # Slippage on exit
+        slippage_exit_usd = self.costs.slippage_pips * self.costs.pip_value_usd_per_lot * self.open_trade.lot_size
+        # Commission on exit (second half)
+        comm_exit_usd = (self.costs.commission_per_lot_usd / 2) * self.open_trade.lot_size
         
-        self.total_slippage_cost += slippage_cost_usd
-        self.total_commission += comm_cost_usd
+        self.total_slippage_cost += slippage_exit_usd
+        self.total_commission += comm_exit_usd
         
-        # Convert dollar slippage back to price impact
-        price_impact_pips = slippage_cost_usd / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
+        total_exit_cost_usd = slippage_exit_usd + comm_exit_usd
+        price_impact_pips = total_exit_cost_usd / (self.costs.pip_value_usd_per_lot * self.open_trade.lot_size)
         price_impact_price = price_impact_pips * self.pip_size
         
-        if side == 1:  # Buy (Exit by Selling, loses slippage)
+        if side == 1:  # Buy (Exit by Selling)
             return price - price_impact_price
-        else:          # Sell (Exit by Buying, loses slippage)
+        else:          # Sell (Exit by Buying)
             return price + price_impact_price
 
     def _close_trade(self, exit_price: float, exit_time: Any):
@@ -90,7 +92,7 @@ class RealisticBacktestEngine:
         self.open_trade = None
 
     def run(self, df: pl.DataFrame) -> Dict[str, Any]:
-        logger.info("Starting Event-Driven Engine with FIXED LOT SIZE & CORRECTED COSTS...")
+        logger.info("Starting FINAL Event-Driven Engine with FIXED LOT & 100% REALISTIC COSTS...")
         data = df.to_dicts()
         
         for row in data:
@@ -102,7 +104,6 @@ class RealisticBacktestEngine:
             current_atr = row["atr"]
             signal = row["signal"]
             
-            # 1. Manage Open Trade (Trailing Stop Logic)
             if self.open_trade:
                 trade = self.open_trade
                 trail_distance = current_atr * self.params.trail_atr_mult
@@ -120,17 +121,14 @@ class RealisticBacktestEngine:
                     if current_high >= trade.sl_price:
                         self._close_trade(trade.sl_price, current_time)
                         
-            # 2. Check for New Entry
             if not self.open_trade and signal != 0:
                 lot_size = self._calculate_lot_size(current_atr)
-                
                 if lot_size > 0:
                     self.open_trade = Trade(
                         entry_time=current_time,
                         side=signal,
                         lot_size=lot_size
                     )
-                    
                     actual_entry = self._apply_entry_costs(current_open, signal)
                     self.open_trade.entry_price = actual_entry
                     
@@ -140,7 +138,6 @@ class RealisticBacktestEngine:
                     else:
                         self.open_trade.sl_price = actual_entry + initial_sl_distance
 
-            # Track Equity
             floating_pnl = 0.0
             if self.open_trade:
                 price_diff = (current_close - self.open_trade.entry_price) * self.open_trade.side
@@ -154,7 +151,7 @@ class RealisticBacktestEngine:
         return self._generate_report()
 
     def _generate_report(self) -> Dict[str, Any]:
-        logger.info("Generating detailed performance report...")
+        logger.info("Generating final performance report...")
         if not self.trades:
             return {"error": "No trades executed."}
 
