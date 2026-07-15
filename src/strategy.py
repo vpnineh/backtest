@@ -3,83 +3,59 @@ import polars as pl
 from loguru import logger
 from src.config import StrategyParams
 
-class TrendFollowingStrategy:
+class MeanReversionStrategy:
     def __init__(self, params: StrategyParams):
         self.params = params
 
     def generate_signals(self, df: pl.DataFrame) -> pl.DataFrame:
-        logger.info("Calculating Trend Following indicators (EMA, Donchian, ATR)...")
+        logger.info("Calculating Mean Reversion indicators (Bollinger Bands, RSI)...")
         p = self.params
 
-        # 1. Trend Filter (EMA) - بر اساس close همان کندل.
-        #    این خودش مشکلی ندارد چون فقط برای ساخت raw_signal استفاده
-        #    می‌شود و raw_signal در ادامه یک کندل به جلو shift می‌شود.
-        df = df.with_columns(
-            pl.col("close").ewm_mean(span=p.ema_trend_period, adjust=False).alias("ema_trend")
-        )
-
-        # 2. Donchian Channels (Breakout levels)
-        # rolling_max/min شامل کندل جاری هم می‌شود، اما shift(1) این را
-        # جبران می‌کند => donchian_upper[N] = max(high[N-donchian_period..N-1])
+        # 1. Bollinger Bands
         df = df.with_columns([
-            pl.col("high").rolling_max(window_size=p.donchian_period).shift(1).alias("donchian_upper"),
-            pl.col("low").rolling_min(window_size=p.donchian_period).shift(1).alias("donchian_lower")
+            pl.col("close").rolling_mean(window_size=p.bb_period).alias("bb_middle"),
+            pl.col("close").rolling_std(window_size=p.bb_period).alias("bb_std"),
+        ]).with_columns([
+            (pl.col("bb_middle") + (p.bb_std_dev * pl.col("bb_std"))).alias("bb_upper"),
+            (pl.col("bb_middle") - (p.bb_std_dev * pl.col("bb_std"))).alias("bb_lower"),
         ])
 
-        # 3. ATR (Average True Range) خام - بر اساس high/low کندل جاری
+        # 2. RSI
         df = df.with_columns([
-            (pl.col("high") - pl.col("low")).alias("tr_hl"),
-            (pl.col("high") - pl.col("close").shift(1)).abs().alias("tr_hc"),
-            (pl.col("low") - pl.col("close").shift(1)).abs().alias("tr_lc")
+            pl.col("close").diff().alias("delta"),
         ]).with_columns([
-            pl.max_horizontal(["tr_hl", "tr_hc", "tr_lc"]).alias("tr")
+            pl.when(pl.col("delta") > 0).then(pl.col("delta")).otherwise(0.0).alias("gain"),
+            pl.when(pl.col("delta") < 0).then(pl.col("delta").abs()).otherwise(0.0).alias("loss"),
         ]).with_columns([
-            pl.col("tr").rolling_mean(window_size=p.atr_period).alias("atr_raw")
+            pl.col("gain").ewm_mean(span=p.rsi_period, adjust=False).alias("avg_gain"),
+            pl.col("loss").ewm_mean(span=p.rsi_period, adjust=False).alias("avg_loss"),
+        ]).with_columns([
+            (100 - (100 / (1 + (pl.col("avg_gain") / pl.col("avg_loss"))))).alias("rsi"),
         ])
 
-        # 🔥 FIX (Look-ahead Bias #1 - ATR):
-        # atr_raw در ردیف N از high/low خود ردیف N ساخته می‌شود که تا
-        # close نهایی آن ردیف مشخص نیست. با shift(1)، مقدار "atr" در
-        # ردیف N برابر می‌شود با آخرین ATR کاملاً شناخته‌شده در لحظه‌ی
-        # OPEN ردیف N (یعنی محاسبه‌شده از داده‌های بسته‌شده تا ردیف N-1).
-        # همین مقدار هم برای فاصله‌ی SL اولیه و هم برای trailing در طول
-        # engine استفاده می‌شود.
-        df = df.with_columns(
-            pl.col("atr_raw").shift(1).alias("atr")
-        )
-
-        # 4. Time Filter
-        # این mask فقط تعیین می‌کند "چه زمانی مجاز است سیگنال جدید صادر
-        # شود"، دیگر برای فیلتر کردن کل دیتافریم استفاده نمی‌شود؛ چون
-        # engine باید تمام کندل‌ها (از جمله خارج از ساعت لندن) را برای
-        # مدیریت درست trailing stop معاملات باز ببیند.
+        # 3. Time Filter
         df = df.with_columns(pl.col("datetime").dt.hour().alias("hour"))
         active_mask = (pl.col("hour") >= p.london_start_hour) & (pl.col("hour") <= p.london_end_hour)
 
-        # 5. Raw entry conditions - بر اساس اطلاعاتی که فقط در لحظه‌ی
-        #    CLOSE شدن کندل جاری قابل شناخت هستند.
-        buy_cond = (pl.col("close") > pl.col("donchian_upper")) & (pl.col("close") > pl.col("ema_trend")) & active_mask
-        sell_cond = (pl.col("close") < pl.col("donchian_lower")) & (pl.col("close") < pl.col("ema_trend")) & active_mask
+        # 4. Raw entry conditions
+        # Buy: Price touches lower band AND RSI is oversold
+        buy_cond = (pl.col("close") <= pl.col("bb_lower")) & (pl.col("rsi") <= p.rsi_oversold) & active_mask
+        
+        # Sell: Price touches upper band AND RSI is overbought
+        sell_cond = (pl.col("close") >= pl.col("bb_upper")) & (pl.col("rsi") >= p.rsi_overbought) & active_mask
 
         df = df.with_columns(
             pl.when(buy_cond).then(1).when(sell_cond).then(-1).otherwise(0).alias("raw_signal")
         )
 
-        # 🔥 FIX (Look-ahead Bias #2 - این باگ اصلی و بحرانی بود):
-        # raw_signal در ردیف N فقط بعد از بسته شدن کامل ردیف N قابل
-        # مشاهده است. engine قبلاً معامله را با OPEN همان ردیفی باز
-        # می‌کرد که raw_signal آن != 0 بود که معادل معامله کردن با قیمتی
-        # است که زمانی قبل از تولید سیگنال رخ داده. با shift(1) سیگنال
-        # یک کندل به جلو منتقل می‌شود تا ورود واقعی روی OPEN کندل N+1
-        # انجام شود - اولین لحظه‌ای که این اطلاعات واقعاً قابل اجراست.
+        # 🔥 CRITICAL: Shift signal by 1 candle to eliminate look-ahead bias
+        # Signal generated at close of candle N will be executed at open of candle N+1
         df = df.with_columns(
             pl.col("raw_signal").shift(1).fill_null(0).alias("signal")
         )
 
-        # Drop warmup nulls (شامل نال‌های ناشی از shift های جدید هم می‌شود)
-        df = df.drop_nulls(subset=["ema_trend", "donchian_upper", "donchian_lower", "atr"])
+        # Drop warmup nulls
+        df = df.drop_nulls(subset=["bb_middle", "bb_upper", "bb_lower", "rsi"])
 
-        logger.success(
-            f"Signal generation done. Total rows for engine (no time-based row filtering): {df.height}"
-        )
+        logger.success(f"Signal generation done. Total rows for engine: {df.height}")
         return df
