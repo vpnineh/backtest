@@ -8,7 +8,7 @@ from pathlib import Path
 SYMBOL = "EURGBP"
 # Options: "M1", "M5", "M15", "H1", "H4", "D1"
 # Note: The system will automatically read M1 data and resample it if you choose > M1.
-TIMEFRAME = "M1"      
+TIMEFRAME = "M5"      
 START_YEAR = 2012     # Inclusive
 END_YEAR = 2025       # Inclusive
 # ==========================================
