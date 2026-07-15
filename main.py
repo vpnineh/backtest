@@ -15,9 +15,6 @@ def setup_logger():
     logger.add("backtest.log", rotation="10 MB", level="DEBUG")
 
 def print_report(report: dict):
-    # 🔥 FIX: اگر هیچ معامله‌ای انجام نشده باشد، _generate_report فقط
-    # {"error": "..."} برمی‌گرداند. بدون این گارد، دسترسی به report['symbol']
-    # و بقیه کلیدها باعث KeyError می‌شد.
     if "error" in report:
         print("\n" + "="*60)
         print("⚠️  BACKTEST FAILED")
@@ -38,9 +35,14 @@ def print_report(report: dict):
     print(f"Win Rate:             {report['win_rate_pct']:.2f}%")
     print(f"Profit Factor:        {report['profit_factor']:.2f}")
     print(f"Expectancy per Trade: ${report['expectancy']:.2f}")
+    print(f"Payoff Ratio (W/L):   {report['payoff_ratio']:.2f}")
     print("-" * 60)
     print(f"Average Win:          ${report['avg_win']:,.2f}")
     print(f"Average Loss:         ${report['avg_loss']:,.2f}")
+    print("-" * 60)
+    print(f"Avg Bars Held (All):     {report['avg_bars_held']:.1f}")
+    print(f"Avg Bars Held (Winners): {report['avg_bars_held_winners']:.1f}")
+    print(f"Avg Bars Held (Losers):  {report['avg_bars_held_losers']:.1f}")
     print("-" * 60)
     print(f"Max Drawdown ($):     ${report['max_drawdown_usd']:,.2f}")
     print(f"Max Drawdown (%):     {report['max_drawdown_pct']:.2f}%")
@@ -50,14 +52,17 @@ def print_report(report: dict):
     print(f"Total Slippage Paid:  ${report['total_slippage_cost']:,.2f}")
     print(f"Total Commission:     ${report['total_commission']:,.2f}")
     print(f"TOTAL HIDDEN COSTS:   ${report['total_hidden_costs']:,.2f}")
+    print("-" * 60)
+    print(f"Net PnL (with costs):        ${report['net_pnl']:,.2f}")
+    print(f"Est. Gross PnL (no costs):   ${report['estimated_gross_pnl_before_costs']:,.2f}")
     print("="*60 + "\n")
 
     if report.get('sizing_mode') == 'fixed_lot_stress_test':
         print("⚠️  NOTE: Sizing mode = FIXED LOT. Total Return %% and Max Drawdown %%")
         print("   are NOT representative of real account risk. Use only to judge")
-        print("   raw signal quality (Expectancy, Win Rate, Profit Factor).")
-        print("   Set use_dynamic_position_sizing=True in config.py for realistic\n"
-              "   risk-adjusted results.\n")
+        print("   raw signal quality (Expectancy, Payoff Ratio, Win Rate).")
+        print("   Set use_dynamic_position_sizing=True in config.py for realistic")
+        print("   risk-adjusted results.\n")
 
 def main():
     setup_logger()
@@ -78,12 +83,13 @@ def main():
     strategy = TrendFollowingStrategy(params)
     df_signals = strategy.generate_signals(df)
 
+    logger.info(f"Signal distribution: {df_signals['signal'].value_counts()}")
+
     engine = RealisticBacktestEngine(costs, params, settings)
     report = engine.run(df_signals)
 
     print_report(report)
 
-    # 🔥 FIX: ذخیره به‌صورت JSON خوانا به‌جای str(dict) خام
     with open("report.txt", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str, ensure_ascii=False)
 
