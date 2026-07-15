@@ -3,7 +3,7 @@ import polars as pl
 from dataclasses import dataclass
 from typing import List, Dict, Any
 from loguru import logger
-from src.config import TradingCosts, BacktestSettings
+from src.config import TradingCosts, StrategyParams, BacktestSettings
 
 @dataclass
 class Trade:
@@ -18,8 +18,10 @@ class Trade:
     pnl: float = 0.0
 
 class RealisticBacktestEngine:
-    def __init__(self, costs: TradingCosts, settings: BacktestSettings):
+    # 🔥 FIX: Added 'params' to the constructor
+    def __init__(self, costs: TradingCosts, params: StrategyParams, settings: BacktestSettings):
         self.costs = costs
+        self.params = params  # Store strategy params
         self.settings = settings
         self.balance = settings.initial_balance
         self.equity_curve: List[float] = []
@@ -29,12 +31,12 @@ class RealisticBacktestEngine:
         self.total_spread_cost = 0.0
         self.total_slippage_cost = 0.0
         self.total_commission = 0.0
-        self.pip_size = costs.pip_size # Dynamic pip size
+        self.pip_size = costs.pip_size
 
     def _calculate_lot_size(self) -> float:
         risk_amount = self.balance * self.settings.risk_per_trade_percent
-        # Risk in USD = (SL in pips * pip_value_per_lot) * lot_size
-        lot_size = risk_amount / (self.costs.sl_pips * self.costs.pip_value_usd_per_lot)
+        # 🔥 FIX: Use self.params.sl_pips instead of self.costs.sl_pips
+        lot_size = risk_amount / (self.params.sl_pips * self.costs.pip_value_usd_per_lot)
         return round(lot_size, 2)
 
     def _apply_entry_costs(self, price: float, side: int) -> float:
@@ -112,8 +114,9 @@ class RealisticBacktestEngine:
                 actual_entry = self._apply_entry_costs(current_open, signal)
                 self.open_trade.entry_price = actual_entry
                 
-                sl_distance = self.costs.sl_pips * self.pip_size
-                tp_distance = self.costs.tp_pips * self.pip_size
+                # 🔥 FIX: Use self.params for sl_pips and tp_pips
+                sl_distance = self.params.sl_pips * self.pip_size
+                tp_distance = self.params.tp_pips * self.pip_size
                 
                 if signal == 1:
                     self.open_trade.sl_price = actual_entry - sl_distance
