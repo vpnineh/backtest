@@ -30,7 +30,7 @@ def read_m1_data(settings: BacktestSettings) -> pl.DataFrame:
         "low": pl.Float32, "close": pl.Float32, "volume": pl.Int32
     }
     
-    # 1. Filter strictly by SYMBOL and M1 to avoid reading other pairs (like AUDNZD)
+    # 1. Filter strictly by SYMBOL and M1 to avoid reading other pairs
     zip_files = sorted(data_dir.glob(f"*{symbol}*M1*.zip"))
     if not zip_files:
         raise FileNotFoundError(f"No M1 ZIP files found for {symbol} in {data_dir}.")
@@ -65,10 +65,9 @@ def read_m1_data(settings: BacktestSettings) -> pl.DataFrame:
                     ignore_errors=True
                 )
             finally:
-                # Clean up temp file
                 os.remove(tmp_path)
                 
-            # Standardize columns (Handle 5 or 6 column variations)
+            # Standardize columns
             if df_chunk.shape[1] == 5:
                 df_chunk.columns = ["datetime", "open", "high", "low", "close"]
                 df_chunk = df_chunk.with_columns(pl.lit(0).alias("volume").cast(pl.Int32))
@@ -91,6 +90,11 @@ def read_m1_data(settings: BacktestSettings) -> pl.DataFrame:
     df = df.with_columns(
         pl.col("datetime").str.strptime(pl.Datetime, "%Y%m%d %H%M%S").alias("datetime")
     )
+    
+    # 🔥 THE FIX: Explicitly tell Polars that the datetime column is sorted.
+    # This is an O(1) metadata operation, extremely fast and required for group_by_dynamic.
+    df = df.set_sorted("datetime")
+    
     return df
 
 def extract_histdata_to_parquet(settings: BacktestSettings) -> Path:
