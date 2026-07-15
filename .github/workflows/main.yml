@@ -1,35 +1,727 @@
-name: Realistic Forex Backtest Pipeline
+name: Professional Martingale Strategy Backtest
 
 on:
+  # Manual trigger with inputs
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: false
+        default: '2018-01-01'
+      end_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: false
+        default: '2024-12-31'
+      pairs:
+        description: 'Pairs to test (space separated)'
+        required: false
+        default: 'EURGBP AUDNZD'
+      years:
+        description: 'Specific years (space separated, empty = all)'
+        required: false
+        default: ''
+      initial_capital:
+        description: 'Initial capital in USD'
+        required: false
+        default: '10000'
+      log_level:
+        description: 'Log level'
+        required: false
+        default: 'INFO'
+        type: choice
+        options:
+          - INFO
+          - DEBUG
+          - WARNING
+
+  # Auto run on push to main (only if strategy files changed)
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - 'config.py'
+      - 'main.py'
+      - '.github/workflows/backtest.yml'
+
+  # Auto run on PR
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - 'config.py'
+      - 'main.py'
+
+  # Scheduled: every Sunday 02:00 UTC
+  schedule:
+    - cron: '0 2 * * 0'
+
+# Cancel previous runs if new one starts
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  backtest:
+  # ─────────────────────────────────────────────
+  # JOB 1: Run unit tests first
+  # ─────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (No Look-Ahead Verification)
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 10
+
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: 'pip'
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-html
 
-    - name: Run Backtest
-      run: |
-        python -u main.py
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --html=test-report.html \
+            --self-contained-html
 
-    - name: Upload Report Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: backtest-report
-        path: |
-          report.txt
-          backtest.log
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report
+          path: |
+            test-report.html
+            coverage.xml
+          retention-days: 30
+
+      - name: Check coverage threshold
+        run: |
+          python -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          root = tree.getroot()
+          rate = float(root.attrib.get('line-rate', 0)) * 100
+          print(f'Coverage: {rate:.1f}%')
+          if rate < 60:
+              print('WARNING: Coverage below 60%')
+          else:
+              print('Coverage OK')
+          "
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Prepare data
+  # ─────────────────────────────────────────────
+  prepare-data:
+    name: Prepare & Validate Data
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    timeout-minutes: 30
+
+    outputs:
+      data_available: ${{ steps.check_data.outputs.available }}
+      eurgbp_years: ${{ steps.check_data.outputs.eurgbp_years }}
+      audnzd_years: ${{ steps.check_data.outputs.audnzd_years }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Check data files
+        id: check_data
+        run: |
+          python - <<'EOF'
+          import os
+          import json
+          import glob
+
+          data_dir = "data"
+          pairs = ["EURGBP", "AUDNZD"]
+          result = {}
+          all_ok = True
+
+          for pair in pairs:
+              years_found = []
+              for year in range(2010, 2026):
+                  patterns = [
+                      f"{data_dir}/HISTDATA_COM_ASCII_{pair}_M1{year}.zip",
+                      f"{data_dir}/HISTDATA_COM_ASCII_{pair}_M12{str(year)[1:]}.zip",
+                      f"{data_dir}/DAT_ASCII_{pair}_M1_{year}.csv",
+                  ]
+                  for p in patterns:
+                      if os.path.exists(p):
+                          size = os.path.getsize(p)
+                          if size > 1000:  # > 1KB = valid file
+                              years_found.append(year)
+                          break
+
+              result[pair] = sorted(years_found)
+              print(f"{pair}: {len(years_found)} years found: {years_found}")
+              if len(years_found) == 0:
+                  all_ok = False
+
+          # Set outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"available={'true' if all_ok else 'false'}\n")
+              f.write(f"eurgbp_years={json.dumps(result.get('EURGBP', []))}\n")
+              f.write(f"audnzd_years={json.dumps(result.get('AUDNZD', []))}\n")
+
+          if not all_ok:
+              print("WARNING: Some pairs have no data!")
+          EOF
+
+      - name: Validate CSV format
+        if: steps.check_data.outputs.available == 'true'
+        run: |
+          python - <<'EOF'
+          import os
+          import zipfile
+          import io
+          import pandas as pd
+
+          data_dir = "data"
+          errors = []
+
+          for filename in sorted(os.listdir(data_dir)):
+              if not (filename.endswith('.zip') or filename.endswith('.csv')):
+                  continue
+              if 'EURGBP' not in filename and 'AUDNZD' not in filename:
+                  continue
+
+              filepath = os.path.join(data_dir, filename)
+              try:
+                  if filename.endswith('.zip'):
+                      with zipfile.ZipFile(filepath) as zf:
+                          csv_files = [n for n in zf.namelist() if n.endswith('.csv')]
+                          if not csv_files:
+                              errors.append(f"{filename}: No CSV inside ZIP")
+                              continue
+                          with zf.open(csv_files[0]) as f:
+                              content = f.read(2048).decode('utf-8', errors='replace')
+                  else:
+                      with open(filepath, 'r') as f:
+                          content = f.read(2048)
+
+                  # Check format
+                  lines = [l.strip() for l in content.split('\n') if l.strip()]
+                  if lines:
+                      first = lines[0]
+                      parts = first.replace(';', ',').split(',')
+                      if len(parts) < 5:
+                          errors.append(f"{filename}: Bad format: {first[:80]}")
+                      else:
+                          print(f"  OK: {filename} | sample: {first[:60]}")
+
+              except Exception as e:
+                  errors.append(f"{filename}: {e}")
+
+          if errors:
+              print("\nERRORS FOUND:")
+              for e in errors:
+                  print(f"  ERROR: {e}")
+          else:
+              print("\nAll data files validated OK")
+          EOF
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Run backtest
+  # ─────────────────────────────────────────────
+  backtest:
+    name: Run Backtest
+    runs-on: ubuntu-latest
+    needs: prepare-data
+    if: needs.prepare-data.outputs.data_available == 'true'
+    timeout-minutes: 360  # 6 hours max for full backtest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create results directory
+        run: mkdir -p results
+
+      - name: Set backtest parameters
+        id: params
+        run: |
+          # Use workflow_dispatch inputs if available, else defaults
+          START="${{ github.event.inputs.start_date || '2018-01-01' }}"
+          END="${{ github.event.inputs.end_date || '2024-12-31' }}"
+          PAIRS="${{ github.event.inputs.pairs || 'EURGBP AUDNZD' }}"
+          CAPITAL="${{ github.event.inputs.initial_capital || '10000' }}"
+          LOGLEVEL="${{ github.event.inputs.log_level || 'INFO' }}"
+          YEARS="${{ github.event.inputs.years || '' }}"
+
+          echo "start=$START"           >> $GITHUB_OUTPUT
+          echo "end=$END"               >> $GITHUB_OUTPUT
+          echo "pairs=$PAIRS"           >> $GITHUB_OUTPUT
+          echo "capital=$CAPITAL"       >> $GITHUB_OUTPUT
+          echo "log_level=$LOGLEVEL"    >> $GITHUB_OUTPUT
+          echo "years=$YEARS"           >> $GITHUB_OUTPUT
+
+          echo "=== Backtest Parameters ==="
+          echo "  Start:   $START"
+          echo "  End:     $END"
+          echo "  Pairs:   $PAIRS"
+          echo "  Capital: $CAPITAL"
+          echo "  Years:   ${YEARS:-all}"
+
+      - name: Run backtest
+        id: run_backtest
+        run: |
+          # Build command
+          CMD="python main.py"
+          CMD="$CMD --data-dir data"
+          CMD="$CMD --start ${{ steps.params.outputs.start }}"
+          CMD="$CMD --end ${{ steps.params.outputs.end }}"
+          CMD="$CMD --capital ${{ steps.params.outputs.capital }}"
+          CMD="$CMD --output-dir results"
+          CMD="$CMD --log-level ${{ steps.params.outputs.log_level }}"
+          CMD="$CMD --pairs ${{ steps.params.outputs.pairs }}"
+
+          # Add years if specified
+          YEARS="${{ steps.params.outputs.years }}"
+          if [ -n "$YEARS" ]; then
+            CMD="$CMD --years $YEARS"
+          fi
+
+          echo "Running: $CMD"
+          echo "---"
+
+          # Run with timing
+          START_TIME=$(date +%s)
+          $CMD 2>&1 | tee results/backtest_output.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
+
+          echo "elapsed_seconds=$ELAPSED" >> $GITHUB_OUTPUT
+          echo "exit_code=$EXIT_CODE"     >> $GITHUB_OUTPUT
+          echo ""
+          echo "=== Backtest completed in ${ELAPSED}s ==="
+
+          exit $EXIT_CODE
+
+      - name: Parse and display summary
+        if: always()
+        run: |
+          python - <<'EOF'
+          import os
+          import csv
+          import json
+
+          summary_file = "results/summary.csv"
+          if not os.path.exists(summary_file):
+              print("No summary.csv found - backtest may have failed")
+              exit(0)
+
+          with open(summary_file) as f:
+              reader = csv.DictReader(f)
+              rows = list(reader)
+
+          if not rows:
+              print("Empty summary file")
+              exit(0)
+
+          row = rows[0]
+
+          print("=" * 55)
+          print("  BACKTEST RESULTS SUMMARY")
+          print("=" * 55)
+
+          fields = [
+              ("Initial Capital",       "initial_capital",      "${:,.2f}"),
+              ("Final Equity",          "final_equity",         "${:,.2f}"),
+              ("Total Return",          "total_return_pct",     "{:+.2f}%"),
+              ("Max Drawdown",          "max_drawdown_pct",     "{:.2f}%"),
+              ("Total Baskets",         "total_baskets",        "{:}"),
+              ("Winning Baskets",       "winning_baskets",      "{:}"),
+              ("Losing Baskets",        "losing_baskets",       "{:}"),
+              ("Win Rate",              "win_rate_pct",         "{:.1f}%"),
+              ("Avg Win (USD)",         "avg_win_usd",          "${:,.2f}"),
+              ("Avg Loss (USD)",        "avg_loss_usd",         "${:,.2f}"),
+              ("Profit Factor",         "profit_factor",        "{:.2f}"),
+              ("Avg Levels/Basket",     "avg_levels_per_basket","{:.2f}"),
+              ("Emergency Exits",       "emergency_exits",      "{:}"),
+              ("Total P&L",             "total_pnl_usd",        "${:+,.2f}"),
+          ]
+
+          for label, key, fmt in fields:
+              val = row.get(key, "N/A")
+              try:
+                  val_f = float(val)
+                  formatted = fmt.format(val_f)
+              except (ValueError, TypeError):
+                  formatted = str(val)
+              print(f"  {label:<28} {formatted}")
+
+          print("=" * 55)
+
+          # Write to step summary
+          summary_md = os.environ.get('GITHUB_STEP_SUMMARY', '')
+          if summary_md:
+              with open(summary_md, 'a') as f:
+                  f.write("## Backtest Results\n\n")
+                  f.write("| Metric | Value |\n")
+                  f.write("|--------|-------|\n")
+                  for label, key, fmt in fields:
+                      val = row.get(key, "N/A")
+                      try:
+                          val_f = float(val)
+                          formatted = fmt.format(val_f)
+                      except:
+                          formatted = str(val)
+                      f.write(f"| {label} | {formatted} |\n")
+          EOF
+
+      - name: Add run info to results
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          info = {
+              "run_date":      datetime.now(timezone.utc).isoformat(),
+              "commit_sha":    os.environ.get("GITHUB_SHA", "unknown")[:8],
+              "commit_ref":    os.environ.get("GITHUB_REF_NAME", "unknown"),
+              "actor":         os.environ.get("GITHUB_ACTOR", "unknown"),
+              "workflow":      os.environ.get("GITHUB_WORKFLOW", "unknown"),
+              "run_id":        os.environ.get("GITHUB_RUN_ID", "unknown"),
+              "start_date":    "${{ steps.params.outputs.start }}",
+              "end_date":      "${{ steps.params.outputs.end }}",
+              "pairs":         "${{ steps.params.outputs.pairs }}",
+              "capital":       "${{ steps.params.outputs.capital }}",
+              "elapsed_secs":  "${{ steps.run_backtest.outputs.elapsed_seconds }}",
+          }
+
+          with open("results/run_info.json", "w") as f:
+              json.dump(info, f, indent=2)
+
+          print(json.dumps(info, indent=2))
+          EOF
+
+      - name: Upload all results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backtest-results-${{ github.run_id }}
+          path: results/
+          retention-days: 90
+
+      - name: Upload charts only (for quick preview)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: charts-${{ github.run_id }}
+          path: results/*.png
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Analyze results & quality checks
+  # ─────────────────────────────────────────────
+  analyze:
+    name: Analyze Results
+    runs-on: ubuntu-latest
+    needs: backtest
+    if: always() && needs.backtest.result == 'success'
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_id }}
+          path: results/
+
+      - name: Quality analysis
+        id: quality
+        run: |
+          python - <<'PYEOF'
+          import os
+          import csv
+          import json
+          import sys
+
+          # ── Load summary ──────────────────────────────────────
+          summary_file = "results/summary.csv"
+          if not os.path.exists(summary_file):
+              print("No summary.csv - skipping quality check")
+              sys.exit(0)
+
+          with open(summary_file) as f:
+              row = list(csv.DictReader(f))[0]
+
+          def fv(key):
+              try:
+                  return float(row.get(key, 0))
+              except:
+                  return 0.0
+
+          # ── Quality thresholds ────────────────────────────────
+          checks = {
+              "win_rate_above_60pct":       fv("win_rate_pct")         >= 60.0,
+              "max_dd_below_25pct":         fv("max_drawdown_pct")     <= 25.0,
+              "profit_factor_above_1":      fv("profit_factor")        >= 1.0,
+              "not_negative_return":        fv("total_return_pct")     >  -20.0,
+              "avg_levels_below_4":         fv("avg_levels_per_basket")<= 4.0,
+              "has_enough_baskets":         fv("total_baskets")        >= 10,
+              "emergency_exits_below_15pct":(
+                  fv("emergency_exits") / max(fv("total_baskets"), 1) * 100 <= 15.0
+              ),
+          }
+
+          print("\n── Quality Checks ──────────────────────────")
+          passed = 0
+          failed = 0
+          warnings = []
+
+          for name, result in checks.items():
+              icon = "✅" if result else "❌"
+              print(f"  {icon} {name}: {'PASS' if result else 'FAIL'}")
+              if result:
+                  passed += 1
+              else:
+                  failed += 1
+                  warnings.append(name)
+
+          print(f"\n  Passed: {passed}/{len(checks)}")
+
+          # ── Warning levels ────────────────────────────────────
+          warn_checks = {
+              "max_dd_above_15pct":    fv("max_drawdown_pct") > 15.0,
+              "win_rate_below_70pct":  fv("win_rate_pct")     < 70.0,
+              "pf_below_1_5":          fv("profit_factor")    < 1.5,
+              "high_avg_levels":       fv("avg_levels_per_basket") > 3.0,
+          }
+
+          print("\n── Warnings ─────────────────────────────────")
+          for name, condition in warn_checks.items():
+              if condition:
+                  print(f"  ⚠️  {name}")
+
+          # ── GitHub Step Summary ────────────────────────────────
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path:
+              with open(summary_path, "a") as f:
+                  f.write("\n## Quality Checks\n\n")
+                  f.write("| Check | Result |\n")
+                  f.write("|-------|--------|\n")
+                  for name, result in checks.items():
+                      icon = "✅ PASS" if result else "❌ FAIL"
+                      f.write(f"| {name} | {icon} |\n")
+                  f.write(f"\n**{passed}/{len(checks)} checks passed**\n")
+
+                  if warnings:
+                      f.write("\n### Failed Checks\n")
+                      for w in warnings:
+                          f.write(f"- ❌ {w}\n")
+
+          # ── Output for next steps ─────────────────────────────
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"passed={passed}\n")
+              f.write(f"failed={failed}\n")
+              f.write(f"quality_ok={'true' if failed == 0 else 'false'}\n")
+
+          PYEOF
+
+      - name: Detailed trade analysis
+        run: |
+          python - <<'PYEOF'
+          import os
+          import csv
+          from collections import defaultdict
+
+          trade_file = "results/trade_log.csv"
+          basket_file = "results/basket_log.csv"
+
+          # ── Basket analysis ───────────────────────────────────
+          if os.path.exists(basket_file):
+              with open(basket_file) as f:
+                  baskets = list(csv.DictReader(f))
+
+              if baskets:
+                  by_pair = defaultdict(list)
+                  by_direction = defaultdict(list)
+                  by_reason = defaultdict(int)
+
+                  for b in baskets:
+                      pair = b.get("pair", "?")
+                      direction = b.get("direction", "?")
+                      pnl = float(b.get("pnl_usd", 0))
+                      reason = b.get("close_reason", "?")
+
+                      by_pair[pair].append(pnl)
+                      by_direction[direction].append(pnl)
+                      by_reason[reason] += 1
+
+                  print("\n── Results by Pair ──────────────────────────")
+                  for pair, pnls in sorted(by_pair.items()):
+                      wins = sum(1 for p in pnls if p > 0)
+                      total = len(pnls)
+                      total_pnl = sum(pnls)
+                      wr = wins / total * 100 if total > 0 else 0
+                      print(
+                          f"  {pair:10} | {total:4d} baskets | "
+                          f"WR: {wr:.1f}% | P&L: ${total_pnl:+,.2f}"
+                      )
+
+                  print("\n── Results by Direction ─────────────────────")
+                  for direction, pnls in sorted(by_direction.items()):
+                      wins = sum(1 for p in pnls if p > 0)
+                      total = len(pnls)
+                      total_pnl = sum(pnls)
+                      wr = wins / total * 100 if total > 0 else 0
+                      print(
+                          f"  {direction:6} | {total:4d} baskets | "
+                          f"WR: {wr:.1f}% | P&L: ${total_pnl:+,.2f}"
+                      )
+
+                  print("\n── Exit Reasons ─────────────────────────────")
+                  for reason, count in sorted(
+                      by_reason.items(), key=lambda x: -x[1]
+                  ):
+                      pct = count / len(baskets) * 100
+                      print(f"  {reason:20} {count:4d} ({pct:.1f}%)")
+
+          # ── Yearly breakdown ──────────────────────────────────
+          if os.path.exists(basket_file):
+              by_year = defaultdict(list)
+              for b in baskets:
+                  ot = b.get("open_time", "")
+                  if len(ot) >= 4:
+                      year = ot[:4]
+                      pnl = float(b.get("pnl_usd", 0))
+                      by_year[year].append(pnl)
+
+              print("\n── Yearly Performance ───────────────────────")
+              print(f"  {'Year':<6} {'Baskets':>8} {'Win%':>7} {'P&L':>12}")
+              print("  " + "-" * 38)
+              for year in sorted(by_year.keys()):
+                  pnls  = by_year[year]
+                  wins  = sum(1 for p in pnls if p > 0)
+                  total = len(pnls)
+                  wr    = wins / total * 100 if total > 0 else 0
+                  pnl_s = sum(pnls)
+                  print(
+                      f"  {year:<6} {total:>8d} {wr:>6.1f}% "
+                      f"  ${pnl_s:>+10,.2f}"
+                  )
+
+          PYEOF
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Notify on failure
+  # ─────────────────────────────────────────────
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [unit-tests, backtest, analyze]
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Build status report
+        run: |
+          python - <<'PYEOF'
+          import os
+
+          tests_result   = "${{ needs.unit-tests.result }}"
+          backtest_result= "${{ needs.backtest.result }}"
+          analyze_result = "${{ needs.analyze.result }}"
+
+          run_url = (
+              f"https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}"
+              f"/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}"
+          )
+
+          status_icon = {
+              "success": "✅",
+              "failure": "❌",
+              "skipped": "⏭️",
+              "cancelled": "🚫",
+          }
+
+          print("=" * 55)
+          print("  PIPELINE STATUS")
+          print("=" * 55)
+          print(f"  {status_icon.get(tests_result,'?')} Unit Tests:   {tests_result}")
+          print(f"  {status_icon.get(backtest_result,'?')} Backtest:     {backtest_result}")
+          print(f"  {status_icon.get(analyze_result,'?')} Analysis:     {analyze_result}")
+          print(f"\n  Run URL: {run_url}")
+          print("=" * 55)
+
+          # Write to step summary
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path:
+              overall = (
+                  "✅ SUCCESS"
+                  if all(r == "success" for r in [tests_result, backtest_result])
+                  else "❌ FAILED"
+              )
+              with open(summary_path, "a") as f:
+                  f.write(f"\n## Pipeline Status: {overall}\n\n")
+                  f.write(f"| Job | Status |\n")
+                  f.write(f"|-----|--------|\n")
+                  f.write(
+                      f"| Unit Tests | "
+                      f"{status_icon.get(tests_result,'?')} {tests_result} |\n"
+                  )
+                  f.write(
+                      f"| Backtest | "
+                      f"{status_icon.get(backtest_result,'?')} {backtest_result} |\n"
+                  )
+                  f.write(
+                      f"| Analysis | "
+                      f"{status_icon.get(analyze_result,'?')} {analyze_result} |\n"
+                  )
+                  f.write(f"\n[View Full Run]({run_url})\n")
+          PYEOF
