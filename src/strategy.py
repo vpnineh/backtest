@@ -3,44 +3,55 @@ import polars as pl
 from loguru import logger
 from src.config import StrategyParams
 
-class MeanReversionStrategy:
+class TrendFollowingStrategy:
     def __init__(self, params: StrategyParams):
         self.params = params
 
     def generate_signals(self, df: pl.DataFrame) -> pl.DataFrame:
-        logger.info("Calculating indicators...")
+        logger.info("Calculating Trend Following indicators (EMA, Donchian, ATR)...")
         p = self.params
         
+        # 1. Trend Filter (EMA)
+        df = df.with_columns(
+            pl.col("close").ewm_mean(span=p.ema_trend_period, adjust=False).alias("ema_trend")
+        )
+        
+        # 2. Donchian Channels (Breakout levels)
         df = df.with_columns([
-            pl.col("close").ewm_mean(span=p.ema_trend_period, adjust=False).alias("ema_trend"),
-            pl.col("close").rolling_mean(window_size=p.bb_period).alias("bb_middle"),
-            pl.col("close").rolling_std(window_size=p.bb_period).alias("bb_std"),
-            pl.col("close").diff().alias("delta"),
-            pl.col("datetime").dt.hour().alias("hour")
+            pl.col("high").rolling_max(window_size=p.donchian_period).shift(1).alias("donchian_upper"),
+            pl.col("low").rolling_min(window_size=p.donchian_period).shift(1).alias("donchian_lower")
         ])
         
+        # 3. ATR (Average True Range) for dynamic stops
         df = df.with_columns([
-            pl.when(pl.col("delta") > 0).then(pl.col("delta")).otherwise(0.0).alias("gain"),
-            pl.when(pl.col("delta") < 0).then(pl.col("delta").abs()).otherwise(0.0).alias("loss"),
+            (pl.col("high") - pl.col("low")).alias("tr_hl"),
+            (pl.col("high") - pl.col("close").shift(1)).abs().alias("tr_hc"),
+            (pl.col("low") - pl.col("close").shift(1)).abs().alias("tr_lc")
         ]).with_columns([
-            pl.col("gain").ewm_mean(span=p.rsi_period, adjust=False).alias("avg_gain"),
-            pl.col("loss").ewm_mean(span=p.rsi_period, adjust=False).alias("avg_loss"),
+            pl.max_horizontal(["tr_hl", "tr_hc", "tr_lc"]).alias("tr")
         ]).with_columns([
-            (100 - (100 / (1 + (pl.col("avg_gain") / pl.col("avg_loss"))))).alias("rsi"),
-            (pl.col("bb_middle") + (p.bb_std_dev * pl.col("bb_std"))).alias("bb_upper"),
-            (pl.col("bb_middle") - (p.bb_std_dev * pl.col("bb_std"))).alias("bb_lower"),
+            pl.col("tr").rolling_mean(window_size=p.atr_period).alias("atr")
         ])
         
+        # 4. Time Filter
+        df = df.with_columns(pl.col("datetime").dt.hour().alias("hour"))
         active_mask = (pl.col("hour") >= p.london_start_hour) & (pl.col("hour") <= p.london_end_hour)
         
-        buy_cond = (pl.col("close") > pl.col("ema_trend")) & (pl.col("close") <= pl.col("bb_lower")) & (pl.col("rsi") <= p.rsi_oversold) & active_mask
-        sell_cond = (pl.col("close") < pl.col("ema_trend")) & (pl.col("close") >= pl.col("bb_upper")) & (pl.col("rsi") >= p.rsi_overbought) & active_mask
+        # 5. Generate Entry Signals
+        # Buy: Close breaks above Donchian Upper AND is above EMA trend
+        buy_cond = (pl.col("close") > pl.col("donchian_upper")) & (pl.col("close") > pl.col("ema_trend")) & active_mask
+        
+        # Sell: Close breaks below Donchian Lower AND is below EMA trend
+        sell_cond = (pl.col("close") < pl.col("donchian_lower")) & (pl.col("close") < pl.col("ema_trend")) & active_mask
         
         df = df.with_columns(
             pl.when(buy_cond).then(1).when(sell_cond).then(-1).otherwise(0).alias("signal")
         )
         
-        df = df.drop_nulls(subset=["ema_trend", "rsi"])
+        # Drop warmup nulls
+        df = df.drop_nulls(subset=["ema_trend", "donchian_upper", "atr"])
+        
+        # Filter to active hours to speed up engine
         df_filtered = df.filter(active_mask | (pl.col("signal") != 0))
         
         logger.success(f"Signal generation done. Active rows for engine: {df_filtered.height}")
