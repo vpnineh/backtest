@@ -5,8 +5,8 @@ from pathlib import Path
 # ==========================================
 # 🎯 USER CONFIGURATION (CHANGE THESE)
 # ==========================================
-SYMBOL = "AUDNZD"       # 🔥 Changed to AUDNZD
-TIMEFRAME = "M5"        # Keeping H1 to test the exact same logic
+SYMBOL = "EURUSD"       # 🔥 Changed to AUDNZD
+TIMEFRAME = "M15"        # Keeping H1 to test the exact same logic
 START_YEAR = 2012       # Full available data range
 END_YEAR = 2025       
 # ==========================================
