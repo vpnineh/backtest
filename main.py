@@ -1,10 +1,11 @@
 import os
 import glob
 import zipfile
-import datetime
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
+from ta.trend import EMAIndicator, ADXIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
 
 # ==========================================
 # 1. FAST DATA INGESTION
@@ -21,11 +22,11 @@ def load_historical_data(pair, data_dir='data'):
                     with z.open(file_info) as f:
                         df = pd.read_csv(f, sep=';', header=None,
                                          names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
-                                         engine='c', on_bad_lines='skip') # Using 'c' engine for max speed
+                                         engine='c', on_bad_lines='skip')
                         all_dfs.append(df)
 
     if not all_dfs:
-        raise FileNotFoundError(f"[!] No data found for {pair}.")
+        raise FileNotFoundError(f"[!] No data found for {pair} in '{data_dir}'.")
 
     print(f"[*] Merging and sorting data...")
     master_df = pd.concat(all_dfs, ignore_index=True)
@@ -42,25 +43,24 @@ def prepare_multi_timeframe_data(df):
     print("[*] Calculating Multi-Timeframe Indicators (Vectorized)...")
     
     # --- H4 Calculations ---
-    # Resample to 4H, calc EMA200, shift by 4H so it's only available AFTER the candle closes
     df_h4 = df['close'].resample('4h', label='left', closed='left').last().to_frame(name='close')
-    df_h4['ema_200'] = ta.ema(df_h4['close'], length=200)
+    df_h4['ema_200'] = EMAIndicator(close=df_h4['close'], window=200).ema_indicator()
     df_h4.index = df_h4.index + pd.Timedelta(hours=4) 
 
     # --- M15 Calculations ---
     df_m15 = df.resample('15min', label='left', closed='left').agg({'open':'first', 'high':'max', 'low':'min', 'close':'last'})
-    df_m15['rsi'] = ta.rsi(df_m15['close'], length=14)
-    bbands = ta.bbands(df_m15['close'], length=20, std=2.0)
-    if bbands is not None:
-        df_m15['bb_bot'] = bbands.iloc[:, 0] # Lower band
-        df_m15['bb_top'] = bbands.iloc[:, 2] # Upper band
-    else:
-        df_m15['bb_bot'] = np.nan
-        df_m15['bb_top'] = np.nan
+    
+    df_m15['rsi'] = RSIIndicator(close=df_m15['close'], window=14).rsi()
+    
+    bb = BollingerBands(close=df_m15['close'], window=20, window_dev=2.0)
+    df_m15['bb_bot'] = bb.bollinger_lband()
+    df_m15['bb_top'] = bb.bollinger_hband()
         
-    df_m15['atr_100'] = ta.atr(df_m15['high'], df_m15['low'], df_m15['close'], length=100)
-    adx = ta.adx(df_m15['high'], df_m15['low'], df_m15['close'], length=14)
-    df_m15['adx'] = adx.iloc[:, 0] if adx is not None else np.nan
+    atr100 = AverageTrueRange(high=df_m15['high'], low=df_m15['low'], close=df_m15['close'], window=100)
+    df_m15['atr_100'] = atr100.average_true_range()
+    
+    adx = ADXIndicator(high=df_m15['high'], low=df_m15['low'], close=df_m15['close'], window=14)
+    df_m15['adx'] = adx.adx()
     
     # Simple Engulfing Pattern Logic
     df_m15['prev_open'] = df_m15['open'].shift(1)
@@ -68,25 +68,24 @@ def prepare_multi_timeframe_data(df):
     df_m15['bull_engulf'] = (df_m15['prev_close'] < df_m15['prev_open']) & (df_m15['close'] > df_m15['open']) & (df_m15['close'] > df_m15['prev_open']) & (df_m15['open'] < df_m15['prev_close'])
     df_m15['bear_engulf'] = (df_m15['prev_close'] > df_m15['prev_open']) & (df_m15['close'] < df_m15['open']) & (df_m15['close'] < df_m15['prev_open']) & (df_m15['open'] > df_m15['prev_close'])
     
-    # Shift M15 by 15 mins to prevent look-ahead bias
     df_m15.index = df_m15.index + pd.Timedelta(minutes=15)
 
     # --- M5 Calculations ---
     df_m5 = df.resample('5min', label='left', closed='left').agg({'high':'max', 'low':'min', 'close':'last'})
-    df_m5['atr_14_m5'] = ta.atr(df_m5['high'], df_m5['low'], df_m5['close'], length=14)
+    atr14 = AverageTrueRange(high=df_m5['high'], low=df_m5['low'], close=df_m5['close'], window=14)
+    df_m5['atr_14_m5'] = atr14.average_true_range()
     df_m5.index = df_m5.index + pd.Timedelta(minutes=5)
 
     # --- Merge All to M1 ---
     print("[*] Merging Timeframes without bias...")
     merged = df.copy()
     
-    # Join and Forward Fill (ffill)
     merged = merged.join(df_h4[['ema_200']], how='left')
     merged = merged.join(df_m15[['rsi', 'bb_bot', 'bb_top', 'atr_100', 'adx', 'bull_engulf', 'bear_engulf']], how='left')
     merged = merged.join(df_m5[['atr_14_m5']], how='left')
     
     merged.ffill(inplace=True)
-    merged.dropna(inplace=True) # Drop initial rows where indicators are calculating
+    merged.dropna(inplace=True) 
     
     return merged
 
@@ -96,7 +95,6 @@ def prepare_multi_timeframe_data(df):
 def run_fast_backtest(df, pair):
     print(f"[*] Starting High-Speed Backtest Engine over {len(df)} 1-Minute candles...")
     
-    # Extract to fast Numpy arrays
     closes = df['close'].values
     ema200 = df['ema_200'].values
     rsi = df['rsi'].values
@@ -110,20 +108,16 @@ def run_fast_backtest(df, pair):
     
     hours = df.index.hour.values
     days = df.index.dayofweek.values
-    dates = df.index.date
     
-    # Settings
     pip_val = 0.0001 if 'JPY' not in pair else 0.01
     grid_multipliers = [1.00, 1.35, 1.80, 2.40, 3.20, 4.30, 5.0]
     max_levels = 7
     target_profit_pct = 0.01
     
-    # Account State
     equity = 10000.0
-    initial_equity = 10000.0
     
     basket_dir = 0
-    positions = [] # list of tuples: (price, size)
+    positions = [] 
     basket_start_equity = 0.0
     
     total_trades = 0
@@ -135,21 +129,17 @@ def run_fast_backtest(df, pair):
     for i in range(100, len(closes)):
         price = closes[i]
         
-        # Track Drawdown
         if equity > peak_equity: peak_equity = equity
         current_dd = (peak_equity - equity) / peak_equity
         if current_dd > max_dd: max_dd = current_dd
             
-        # --- 1. MANAGE OPEN BASKET ---
         if basket_dir != 0:
-            # Calculate floating PnL
             unrealized = 0.0
             for p, s in positions:
-                unrealized += (price - p) * s * basket_dir * (1/pip_val) # rough pip-to-dollar calc for simplicity
+                unrealized += (price - p) * s * basket_dir * (1/pip_val) 
                 
             target_profit = basket_start_equity * target_profit_pct
             
-            # Emergency Exit OR Target Reached
             if unrealized >= target_profit or adx[i] > 35:
                 equity += unrealized
                 if unrealized > 0: winning_baskets += 1
@@ -159,18 +149,16 @@ def run_fast_backtest(df, pair):
                 positions.clear()
                 continue
                 
-            # Grid Scaling
             levels_open = len(positions)
             if levels_open < max_levels:
                 last_price = positions[-1][0]
                 
-                # Dynamic Grid Distance
                 dist_pips = (0.8 * atr_14_m5[i]) / pip_val
                 dist_pips = max(25, min(dist_pips, 45))
                 grid_dist = dist_pips * pip_val
                 
                 if basket_dir == 1 and price <= (last_price - grid_dist):
-                    new_size = 10 * grid_multipliers[levels_open] # base size 10 
+                    new_size = 10 * grid_multipliers[levels_open] 
                     positions.append((price, new_size))
                     total_trades += 1
                     
@@ -179,23 +167,18 @@ def run_fast_backtest(df, pair):
                     positions.append((price, new_size))
                     total_trades += 1
             
-            continue # If basket open, skip initial entry logic
+            continue 
 
-        # --- 2. INITIAL ENTRY ---
-        # Session Filter (London 08:00 - 17:00)
         if not (8 <= hours[i] <= 17): continue
-        # Friday after noon
         if days[i] == 4 and hours[i] >= 12: continue
         
         if adx[i] < 25 and atr_100[i] < (1.3 * atr_100[i-1]):
-            # Buy Logic
             if price > ema200[i] and rsi[i] < 28 and price < bb_bot[i] and bull_eng[i]:
                 basket_dir = 1
                 basket_start_equity = equity
-                positions.append((price, 10)) # Base unit
+                positions.append((price, 10)) 
                 total_trades += 1
                 
-            # Sell Logic
             elif price < ema200[i] and rsi[i] > 72 and price > bb_top[i] and bear_eng[i]:
                 basket_dir = -1
                 basket_start_equity = equity
@@ -204,9 +187,6 @@ def run_fast_backtest(df, pair):
 
     return equity, max_dd, total_trades, winning_baskets, losing_baskets
 
-# ==========================================
-# BOOTSTRAPPER
-# ==========================================
 if __name__ == '__main__':
     pair_to_test = 'AUDNZD' 
     print("="*50)
