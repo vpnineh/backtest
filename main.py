@@ -54,7 +54,8 @@ def main():
     strategy = MeanReversionStrategy(params)
     df_signals = strategy.generate_signals(df)
     
-    engine = RealisticBacktestEngine(costs, settings)
+    # 🔥 FIX: Pass 'params' to the engine
+    engine = RealisticBacktestEngine(costs, params, settings)
     report = engine.run(df_signals)
     
     print_report(report)
