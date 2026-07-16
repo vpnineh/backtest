@@ -7,6 +7,14 @@ name: Adaptive Recovery Grid Backtest
 on:
   workflow_dispatch:
     inputs:
+      config_profile:
+        description: "Which config profile to use as the base"
+        required: true
+        default: "frequency"
+        type: choice
+        options:
+          - default
+          - frequency
       symbol:
         description: "Symbol to backtest"
         required: true
@@ -16,11 +24,12 @@ on:
           - EURGBP
           - AUDNZD
       timeframe:
-        description: "Timeframe to backtest on (built from M1 data)"
+        description: "Timeframe (or 'from_config' to use the chosen profile's own timeframe)"
         required: true
-        default: "H1"
+        default: "from_config"
         type: choice
         options:
+          - from_config
           - M5
           - M15
           - M30
@@ -43,7 +52,13 @@ on:
   # Optional: also run a quick sanity check whenever the strategy code
   # itself changes, using the same defaults as above. Remove this block
   # if you only want manual runs.
-
+  push:
+    branches: [main]
+    paths:
+      - "backtest/**"
+      - "config/**"
+      - "run_backtest.py"
+      - ".github/workflows/backtest.yml"
 
 jobs:
   backtest:
@@ -76,9 +91,15 @@ jobs:
 
       - name: Run backtest
         run: |
+          CONFIG_FILE="config/${{ inputs.config_profile || 'frequency' }}.yaml"
+          TF_ARG=""
+          if [ "${{ inputs.timeframe || 'from_config' }}" != "from_config" ]; then
+            TF_ARG="--timeframe ${{ inputs.timeframe }}"
+          fi
           python run_backtest.py \
+            --config "$CONFIG_FILE" \
             --symbol "${{ inputs.symbol || 'EURGBP' }}" \
-            --timeframe "${{ inputs.timeframe || 'H1' }}" \
+            $TF_ARG \
             --start-year "${{ inputs.start_year || '2020' }}" \
             --end-year "${{ inputs.end_year || '2024' }}" \
             --initial-balance "${{ inputs.initial_balance || '10000' }}" \
@@ -88,7 +109,7 @@ jobs:
       - name: Upload backtest artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results-${{ inputs.symbol || 'EURGBP' }}-${{ inputs.timeframe || 'H1' }}-${{ inputs.start_year || '2020' }}-${{ inputs.end_year || '2024' }}
+          name: backtest-results-${{ inputs.config_profile || 'frequency' }}-${{ inputs.symbol || 'EURGBP' }}-${{ inputs.timeframe || 'from_config' }}-${{ inputs.start_year || '2020' }}-${{ inputs.end_year || '2024' }}
           path: output/
           retention-days: 30
 
