@@ -43,13 +43,7 @@ on:
   # Optional: also run a quick sanity check whenever the strategy code
   # itself changes, using the same defaults as above. Remove this block
   # if you only want manual runs.
-  push:
-    branches: [main]
-    paths:
-      - "backtest/**"
-      - "config/**"
-      - "run_backtest.py"
-      - ".github/workflows/backtest.yml"
+
 
 jobs:
   backtest:
@@ -82,7 +76,7 @@ jobs:
 
       - name: Run backtest
         run: |
-          python -u run_backtest.py \
+          python run_backtest.py \
             --symbol "${{ inputs.symbol || 'EURGBP' }}" \
             --timeframe "${{ inputs.timeframe || 'H1' }}" \
             --start-year "${{ inputs.start_year || '2020' }}" \
