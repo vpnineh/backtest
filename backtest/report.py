@@ -24,6 +24,7 @@ def write_trade_log(trades: List[Trade], out_path: Path):
         rows.append({
             "open_time": t.open_time,
             "close_time": t.close_time,
+            "basket_id": t.basket_id,
             "direction": t.direction,
             "lots": t.lots,
             "entry_price": t.entry_price,
@@ -35,7 +36,7 @@ def write_trade_log(trades: List[Trade], out_path: Path):
     pd.DataFrame(rows).to_csv(out_path, index=False)
 
 
-def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path, cfg, diag: dict = None):
+def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path, cfg, diag: dict = None, trades: List[Trade] = None):
     d = stats_to_dict(stats)
     if diag:
         d["diagnostics"] = diag
@@ -76,6 +77,7 @@ def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path,
             "-" * 70,
             f"Regime distribution:  {diag.get('regime_distribution_pct', {})}",
             f"Baskets opened:       {diag.get('baskets_opened', 0)}",
+            f"Entries skipped (max concurrent baskets reached): {diag.get('entries_skipped_max_concurrent', 0)}",
             f"Recovery add-ons:     {diag.get('recovery_additions', 0)}",
             f"Recovery checks:      {diag.get('recovery_checked', 0)} "
             f"(approved: {diag.get('recovery_approved', 0)})",
@@ -91,7 +93,39 @@ def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path,
             lines.append(f"    {k:<32s} {v:6.3f}%")
         lines.append("=" * 70)
 
+    if trades:
+        import pandas as pd
+        tdf = pd.DataFrame([{"reason": t.reason, "pnl": t.pnl_usd, "lots": t.lots} for t in trades])
+        by_reason = tdf.groupby("reason")["pnl"].agg(["count", "mean", "sum"])
+        lines.append("PNL BY EXIT REASON (sanity check -- 'basket_tp' rows should be")
+        lines.append("clearly positive; if they aren't, fixed costs are eating your TP target):")
+        lines.append("-" * 70)
+        for reason, row in by_reason.iterrows():
+            lines.append(f"    {reason:<22s} n={int(row['count']):<5d} avg=${row['mean']:>8.3f}  sum=${row['sum']:>10.2f}")
+        if "basket_tp" in by_reason.index and by_reason.loc["basket_tp", "mean"] <= 0:
+            avg_lots = tdf["lots"].mean() if len(tdf) else cfg.base_lot
+            # Rough approximation only (assumes ~$10/pip per standard lot,
+            # true value depends on the live GBPUSD/NZDUSD conversion rate
+            # already used correctly inside the engine itself):
+            approx_pip_value_per_lot_usd = 10.0
+            est_cost = avg_lots * (
+                cfg.commission_per_lot_roundturn
+                + (cfg.spread_pips + 2 * cfg.slippage_pips) * approx_pip_value_per_lot_usd
+            )
+            lines.append("-" * 70)
+            lines.append("!! WARNING: average P&L on TP-triggered exits is <= 0. This means")
+            lines.append("   spread + slippage + commission are, on average, larger than the")
+            lines.append("   ATR-based TP distance produces in gross profit at this lot size.")
+            lines.append(f"   Current base_lot={cfg.base_lot}, basket_tp_atr_mult={cfg.basket_tp_atr_mult}.")
+            lines.append(f"   Approx. round-trip cost at avg lot size {avg_lots:.3f}: ~${est_cost:.2f}")
+            lines.append("   (rough estimate, actual cost uses live GBPUSD/NZDUSD conversion).")
+            lines.append("   Fix by RAISING base_lot (more $ per pip) and/or RAISING")
+            lines.append("   basket_tp_atr_mult (wider gross target) -- do not chase this by")
+            lines.append("   cutting costs in the model, the modeled costs are the honest part.")
+            lines.append("-" * 70)
+
     lines += [
+        "=" * 70,
         "NOTES / LIMITATIONS (read before trusting these numbers):",
         " - Costs: spread + commission + slippage are modeled, not scraped from",
         "   a real broker feed (M1 history has no true bid/ask spread ticks).",

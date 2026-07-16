@@ -1,4 +1,10 @@
-# Default backtest configuration.
+# CONSERVATIVE / STRICT baseline configuration -- matches the original
+# spec literally ("ALL filters must agree", one basket at a time).
+# In backtests this trades ~15 times / 5 years on EURGBP H1 (very
+# statistically thin, but maximally selective and low-risk).
+#
+# For a higher trade-frequency profile see config/frequency.yaml.
+#
 # Every value here can be overridden from the CLI, e.g.:
 #   python run_backtest.py --symbol AUDNZD --timeframe M15 --start-year 2018 --end-year 2023
 #
@@ -15,6 +21,8 @@ base_lot: 0.01
 compound_sizing: true
 lot_progression: [1.00, 1.30, 1.70, 2.20, 2.80, 3.60, 4.60]
 max_positions: 7
+max_concurrent_baskets: 1        # strict/conservative baseline: one basket at a time
+min_core_filters_required: 5     # 5-of-5 core filters must agree (original strict spec)
 
 spread_pips: 1.2
 spread_filter_mult: 2.0
