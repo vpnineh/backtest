@@ -95,7 +95,7 @@ def main():
 
     tag = f"{cfg.symbol}_{cfg.timeframe}_{cfg.start_year}-{cfg.end_year}"
     write_trade_log(engine.trades, out_dir / f"trades_{tag}.csv")
-    write_summary(stats, out_dir / f"summary_{tag}.json", out_dir / f"summary_{tag}.txt", cfg)
+    write_summary(stats, out_dir / f"summary_{tag}.json", out_dir / f"summary_{tag}.txt", cfg, diag=engine.diag)
     plot_equity_curve(result_df, out_dir / f"equity_{tag}.png", cfg)
 
     print(f"[run_backtest] artifacts written to {out_dir}/")

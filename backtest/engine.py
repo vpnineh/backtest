@@ -219,6 +219,21 @@ class BacktestEngine:
         self.balance_curve = np.zeros(len(self.df))
         self.regime_series: List[str] = [""] * len(self.df)
 
+        # Pure diagnostics -- never read by the trading logic itself, only
+        # collected so the report can explain *why* the engine traded (or
+        # didn't trade) as much as it did. Safe to ignore for pnl purposes.
+        self.diag = {
+            "baskets_opened": 0,
+            "recovery_checked": 0,
+            "recovery_approved": 0,
+            "recovery_rejected_reasons": {},
+            "recovery_additions": 0,
+            "forced_closes_max_dd": 0,
+            "daily_lock_events": 0,
+            "weekly_lock_events": 0,
+            "breakout_stops_triggered": 0,
+        }
+
         self._compute_indicators()
 
     # -- indicator prep --------------------------------------------------
@@ -393,29 +408,36 @@ class BacktestEngine:
             return "SELL"
         return None
 
+    def _reject_recovery(self, reason: str) -> bool:
+        counts = self.diag["recovery_rejected_reasons"]
+        counts[reason] = counts.get(reason, 0) + 1
+        return False
+
     def _recovery_ok(self, i: int, basket: Basket) -> bool:
         cfg = self.cfg
+        self.diag["recovery_checked"] += 1
+
         if basket.recovery_stopped:
-            return False
+            return self._reject_recovery("recovery_already_stopped_by_breakout")
         if len(basket.positions) >= min(cfg.max_positions, len(cfg.lot_progression)):
-            return False
+            return self._reject_recovery("max_positions_reached")
         regime = self.regime_series[i]
         if regime != "RANGING":
-            return False
+            return self._reject_recovery(f"regime_not_ranging({regime})")
         row = self.df.iloc[i]
         atr_now, atr_avg = row["atr"], row["atr_avg"]
         if pd.isna(atr_now) or pd.isna(atr_avg) or atr_avg == 0:
-            return False
+            return self._reject_recovery("atr_not_ready")
         if (atr_now / atr_avg) >= cfg.atr_extreme_ratio:
-            return False
+            return self._reject_recovery("atr_extreme")
         if row["adx"] >= cfg.adx_entry_max:
-            return False
+            return self._reject_recovery("adx_too_high")
         if self._breakout_detected(i):
-            return False
+            return self._reject_recovery("breakout_detected")
 
         grid_mult = self._grid_atr_mult(i)
         if grid_mult is None:
-            return False
+            return self._reject_recovery("grid_disabled_extreme_volatility")
         grid_distance = grid_mult * atr_now
 
         last_price = basket.last_entry_price()
@@ -429,7 +451,13 @@ class BacktestEngine:
             far_enough = (close - last_price) >= grid_distance
             within_stat_limit = (close - first_price) <= cfg.recovery_stat_limit_atr * atr_now
 
-        return bool(far_enough and within_stat_limit)
+        if not far_enough:
+            return self._reject_recovery("price_not_far_enough_for_next_grid_level")
+        if not within_stat_limit:
+            return self._reject_recovery("beyond_statistical_deviation_limit")
+
+        self.diag["recovery_approved"] += 1
+        return True
 
     # -- sizing / pnl -----------------------------------------------------
     def _lot_for_level(self, level_idx: int, equity: float) -> float:
@@ -459,6 +487,10 @@ class BacktestEngine:
 
         # pre-compute regime for every bar (causal, uses <= i only)
         self.regime_series = [self._classify_regime(i) for i in range(n)]
+        regime_counts = pd.Series(self.regime_series).value_counts()
+        self.diag["regime_distribution_pct"] = {
+            k: round(100.0 * v / n, 2) for k, v in regime_counts.items()
+        }
 
         rates = self.conv_rate_at(df["datetime"]).values
 
@@ -514,8 +546,9 @@ class BacktestEngine:
                 equity_now = balance + floating_usd
 
                 # breakout -> stop recovery permanently for this basket
-                if self._breakout_detected(decision_idx):
+                if self._breakout_detected(decision_idx) and not basket.recovery_stopped:
                     basket.recovery_stopped = True
+                    self.diag["breakout_stops_triggered"] += 1
 
                 # ---- hard risk kill-switch: max floating DD ----
                 dd_pct = -100.0 * floating_usd / max(equity_now, 1.0) if floating_usd < 0 else 0.0
@@ -525,6 +558,7 @@ class BacktestEngine:
                 exit_reason = None
                 if force_close:
                     exit_reason = "max_floating_dd"
+                    self.diag["forced_closes_max_dd"] += 1
                 elif tp_dist is not None:
                     if basket.direction == "BUY" and row["close"] >= avg + tp_dist:
                         exit_reason = "basket_tp"
@@ -608,6 +642,7 @@ class BacktestEngine:
                         lots = self._lot_for_level(level, balance)
                         entry_px = exec_price_base + spread_price / 2 + slip if basket.direction == "BUY" else exec_price_base - spread_price / 2 - slip
                         basket.positions.append(Position(basket.direction, entry_px, lots, row["datetime"], level))
+                        self.diag["recovery_additions"] += 1
 
             # ---- consider new basket entry ----
             elif not daily_locked and not weekly_locked:
@@ -618,6 +653,7 @@ class BacktestEngine:
                         entry_px = exec_price_base + spread_price / 2 + slip if signal == "BUY" else exec_price_base - spread_price / 2 - slip
                         lots = self._lot_for_level(0, balance)
                         basket = Basket(positions=[Position(signal, entry_px, lots, row["datetime"], 0)], direction=signal)
+                        self.diag["baskets_opened"] += 1
 
             # ---- mark-to-market equity curve ----
             if basket.is_open():
@@ -633,14 +669,75 @@ class BacktestEngine:
             # ---- daily / weekly loss lockouts ----
             if day_start_balance > 0:
                 day_loss_pct = 100.0 * (day_start_balance - equity) / day_start_balance
-                if day_loss_pct >= cfg.max_daily_loss_pct:
+                if day_loss_pct >= cfg.max_daily_loss_pct and not daily_locked:
                     daily_locked = True
+                    self.diag["daily_lock_events"] += 1
             if week_start_balance > 0:
                 week_loss_pct = 100.0 * (week_start_balance - equity) / week_start_balance
-                if week_loss_pct >= cfg.max_weekly_loss_pct:
+                if week_loss_pct >= cfg.max_weekly_loss_pct and not weekly_locked:
                     weekly_locked = True
+                    self.diag["weekly_lock_events"] += 1
 
         df["equity"] = self.equity_curve
         df["balance"] = self.balance_curve
         df["regime"] = self.regime_series
+        self.diag["filter_hit_rates_pct"] = self._compute_filter_hit_rates()
         return df
+
+    def _compute_filter_hit_rates(self) -> dict:
+        """Independent (not AND-ed together) pass-rate of each entry
+        filter component, over all bars with valid indicators. Purely
+        diagnostic: shows which single filter is the bottleneck without
+        needing to guess. Does not affect trading decisions."""
+        cfg = self.cfg
+        df = self.df
+        valid = df["rsi"].notna() & df["stoch_k"].notna() & df["bb_upper"].notna() & \
+            df["adx"].notna() & df["ema_slow"].notna()
+        n_valid = int(valid.sum())
+        if n_valid == 0:
+            return {}
+
+        dist_ema200_pips = (df["close"] - df["ema_slow"]) / self.pip
+        bullish_rejection = (df["close"] > df["open"]) & (df["low"] < df["bb_lower"])
+        bearish_rejection = (df["close"] < df["open"]) & (df["high"] > df["bb_upper"])
+        session_ok = (
+            (df["weekday"] != 6)
+            & ~((df["weekday"] == 4) & (df["hour_utc"] >= cfg.avoid_friday_after_hour_utc))
+            & (df["hour_utc"] >= cfg.session_start_hour_utc)
+            & (df["hour_utc"] < cfg.session_end_hour_utc)
+        )
+
+        components = {
+            "adx_below_entry_max": df["adx"] < cfg.adx_entry_max,
+            "session_ok": session_ok,
+            "ema200_dist_ok": dist_ema200_pips.abs() >= cfg.ema200_min_dist_pips,
+            "buy__close_below_bb_lower": df["close"] < df["bb_lower"],
+            "buy__rsi_oversold": df["rsi"] <= cfg.rsi_oversold,
+            "buy__stoch_oversold": df["stoch_k"] <= cfg.stoch_oversold,
+            "buy__bullish_rejection_candle": bullish_rejection,
+            "buy__ALL_COMBINED": None,   # filled below
+            "sell__close_above_bb_upper": df["close"] > df["bb_upper"],
+            "sell__rsi_overbought": df["rsi"] >= cfg.rsi_overbought,
+            "sell__stoch_overbought": df["stoch_k"] >= cfg.stoch_overbought,
+            "sell__bearish_rejection_candle": bearish_rejection,
+            "sell__ALL_COMBINED": None,  # filled below
+        }
+
+        buy_all = (
+            components["adx_below_entry_max"] & components["session_ok"] & components["ema200_dist_ok"]
+            & components["buy__close_below_bb_lower"] & components["buy__rsi_oversold"]
+            & components["buy__stoch_oversold"] & components["buy__bullish_rejection_candle"]
+        )
+        sell_all = (
+            components["adx_below_entry_max"] & components["session_ok"] & components["ema200_dist_ok"]
+            & components["sell__close_above_bb_upper"] & components["sell__rsi_overbought"]
+            & components["sell__stoch_overbought"] & components["sell__bearish_rejection_candle"]
+        )
+        components["buy__ALL_COMBINED"] = buy_all
+        components["sell__ALL_COMBINED"] = sell_all
+
+        out = {}
+        for name, cond in components.items():
+            hits = int((cond & valid).sum())
+            out[name] = round(100.0 * hits / n_valid, 3)
+        return out

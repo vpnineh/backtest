@@ -35,8 +35,10 @@ def write_trade_log(trades: List[Trade], out_path: Path):
     pd.DataFrame(rows).to_csv(out_path, index=False)
 
 
-def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path, cfg):
+def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path, cfg, diag: dict = None):
     d = stats_to_dict(stats)
+    if diag:
+        d["diagnostics"] = diag
     out_path_json.write_text(json.dumps(d, indent=2, default=str))
 
     lines = [
@@ -66,6 +68,30 @@ def write_summary(stats: BacktestStats, out_path_json: Path, out_path_txt: Path,
         f"Calmar ratio:         {stats.calmar_ratio:.2f}",
         f"Recovery factor:      {stats.recovery_factor:.2f}",
         "=" * 70,
+    ]
+
+    if diag:
+        lines += [
+            "DIAGNOSTICS (why the engine did/didn't trade -- debug aid, not P&L):",
+            "-" * 70,
+            f"Regime distribution:  {diag.get('regime_distribution_pct', {})}",
+            f"Baskets opened:       {diag.get('baskets_opened', 0)}",
+            f"Recovery add-ons:     {diag.get('recovery_additions', 0)}",
+            f"Recovery checks:      {diag.get('recovery_checked', 0)} "
+            f"(approved: {diag.get('recovery_approved', 0)})",
+            f"Recovery reject reasons (count): {diag.get('recovery_rejected_reasons', {})}",
+            f"Breakout stops triggered: {diag.get('breakout_stops_triggered', 0)}",
+            f"Forced closes (max floating DD): {diag.get('forced_closes_max_dd', 0)}",
+            f"Daily loss lock events:  {diag.get('daily_lock_events', 0)}",
+            f"Weekly loss lock events: {diag.get('weekly_lock_events', 0)}",
+            "Entry filter independent hit-rates (% of valid bars, NOT AND-ed",
+            "except the *_ALL_COMBINED rows -- use this to spot the bottleneck):",
+        ]
+        for k, v in diag.get("filter_hit_rates_pct", {}).items():
+            lines.append(f"    {k:<32s} {v:6.3f}%")
+        lines.append("=" * 70)
+
+    lines += [
         "NOTES / LIMITATIONS (read before trusting these numbers):",
         " - Costs: spread + commission + slippage are modeled, not scraped from",
         "   a real broker feed (M1 history has no true bid/ask spread ticks).",
