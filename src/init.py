@@ -1,1 +1,0 @@
-"""Martingale Backtest Package."""
