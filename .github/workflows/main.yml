@@ -1,15 +1,7 @@
 name: Algorithmic Trading Backtest
 
+# فقط اجرای دستی از طریق پنل گیت‌هاب
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
-  # امکان اجرای دستی از پنل گیتهاب
   workflow_dispatch:
 
 jobs:
@@ -18,12 +10,12 @@ jobs:
     
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.11'
         
     - name: Install Dependencies
       run: |
@@ -31,13 +23,14 @@ jobs:
         pip install pandas numpy matplotlib
         
     - name: Run Backtest Engine
-      run: python backtest.py
+      run: python -u backtest.py
       
     - name: Upload Backtest Artifacts
       if: always() # حتی اگر کد خطا داد، فایل‌ها را آپلود کن
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: backtest-results
         path: |
           equity_curve.png
           trades_log.csv
+        retention-days: 30
