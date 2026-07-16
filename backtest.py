@@ -7,6 +7,7 @@ import matplotlib
 # تنظیم بک‌اند غیرگرافیکی برای محیط‌های CI/CD مانند GitHub Actions
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import traceback
 
 # ==========================================
 # 1. توابع خواندن دیتا و اندیکاتورها
@@ -14,6 +15,7 @@ import matplotlib.pyplot as plt
 
 def load_hist_data(symbol, start_year, end_year, data_folder="data"):
     """خواندن خودکار فایل‌های CSV یا ZIP از پوشه دیتا"""
+    print(f"[1/4] Loading data for {symbol} ({start_year}-{end_year})...")
     all_data = []
     for year in range(start_year, end_year + 1):
         patterns = [
@@ -47,11 +49,13 @@ def load_hist_data(symbol, start_year, end_year, data_folder="data"):
     df['DateTime'] = pd.to_datetime(df['DateTime'], format='%Y%m%d %H%M%S')
     df.set_index('DateTime', inplace=True)
     df.sort_index(inplace=True)
+    print(f"[1/4] Data loaded successfully. Total M1 rows: {len(df)}")
     return df
 
 def resample_and_indicators(df_m1):
     """تبدیل به مولتی تایم فریم و محاسبه اندیکاتورها بدون Look-ahead"""
-    print("Resampling M1 to M15 and H4...")
+    print("[2/4] Resampling M1 to M15 and H4...")
+    # استفاده از 15min و 4h برای سازگاری با پانداس 2.2+
     df_m15 = df_m1.resample('15min').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
@@ -61,8 +65,8 @@ def resample_and_indicators(df_m1):
     import gc
     gc.collect()
     
-    print("Calculating H4 Trend (EMA 100)...")
-    df_h4 = df_m15.resample('4H').agg({
+    print("[2/4] Calculating H4 Trend (EMA 100)...")
+    df_h4 = df_m15.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
     }).dropna()
     
@@ -75,7 +79,7 @@ def resample_and_indicators(df_m1):
     # ترکیب H4 با M15 (Forward fill پر کردن جاهای خالی با آخرین کندل بسته شده H4)
     df_m15 = df_m15.join(df_h4[['EMA_100', 'Close']].rename(columns={'EMA_100': 'EMA_100_H4', 'Close': 'Close_H4'})).ffill()
     
-    print("Calculating M15 Indicators (ATR, RSI)...")
+    print("[3/4] Calculating M15 Indicators (ATR, RSI)...")
     # ATR
     high_low = df_m15['High'] - df_m15['Low']
     high_close = np.abs(df_m15['High'] - df_m15['Close'].shift())
@@ -94,6 +98,7 @@ def resample_and_indicators(df_m1):
     df_m15['RSI'] = 100 - (100 / (1 + rs))
     
     df_m15.dropna(inplace=True)
+    print(f"[3/4] Indicators calculated. Total valid M15 candles: {len(df_m15)}")
     return df_m15
 
 # ==========================================
@@ -101,7 +106,7 @@ def resample_and_indicators(df_m1):
 # ==========================================
 
 def run_backtest(df, initial_balance=10000, risk_pct=0.01):
-    print("Starting backtest engine...")
+    print("[4/4] Starting backtest engine...")
     equity = initial_balance
     trades = []
     current_trade = None
@@ -199,6 +204,7 @@ def run_backtest(df, initial_balance=10000, risk_pct=0.01):
                     'entry_time': row.Index
                 }
 
+    print(f"[4/4] Backtest finished. Total trades executed: {len(trades)}")
     return trades
 
 # ==========================================
@@ -210,19 +216,15 @@ if __name__ == "__main__":
     START_YEAR = 2015
     END_YEAR = 2023
     
-    print(f"=== Backtest Started for {SYMBOL} ({START_YEAR}-{END_YEAR}) ===")
+    print(f"\n=== Backtest Started for {SYMBOL} ({START_YEAR}-{END_YEAR}) ===\n")
     
     try:
         df_m1 = load_hist_data(SYMBOL, START_YEAR, END_YEAR, data_folder="data")
-        print("Data loaded successfully.")
-        
         df_m15 = resample_and_indicators(df_m1)
-        print(f"Data prepared. Total M15 candles: {len(df_m15)}")
-        
         trades = run_backtest(df_m15, initial_balance=10000, risk_pct=0.01)
         
         if not trades:
-            print("No trades were executed.")
+            print("\nResult: No trades were executed. Check strategy logic or data.")
         else:
             trades_df = pd.DataFrame(trades)
             trades_df.to_csv("trades_log.csv", index=False)
@@ -231,7 +233,10 @@ if __name__ == "__main__":
             win_rate = (trades_df['profit'] > 0).mean() * 100
             total_profit = trades_df['equity'].iloc[-1] - 10000
             max_drawdown = (trades_df['equity'] / trades_df['equity'].cummax() - 1).min() * 100
-            profit_factor = trades_df.loc[trades_df['profit'] > 0, 'profit'].sum() / abs(trades_df.loc[trades_df['profit'] < 0, 'profit'].sum())
+            # مدیریت تقسیم بر صفر در صورت نداشتن ضرر
+            gross_profit = trades_df.loc[trades_df['profit'] > 0, 'profit'].sum()
+            gross_loss = abs(trades_df.loc[trades_df['profit'] < 0, 'profit'].sum())
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
             
             print("\n--- Backtest Results ---")
             print(f"Symbol: {SYMBOL} | Period: {START_YEAR}-{END_YEAR}")
@@ -251,7 +256,10 @@ if __name__ == "__main__":
             plt.ylabel("Balance ($)")
             plt.grid(True)
             plt.savefig("equity_curve.png")
-            print("Equity curve saved as 'equity_curve.png'")
+            print("\nEquity curve saved as 'equity_curve.png'")
+            print("Trades log saved as 'trades_log.csv'")
             
     except Exception as e:
-        print(f"Fatal Error: {e}")
+        print("\n!!! FATAL ERROR OCCURRED !!!")
+        # چاپ کامل خطا برای دیباگ دقیق
+        traceback.print_exc()
