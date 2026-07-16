@@ -1,121 +1,43 @@
-name: Adaptive Recovery Grid Backtest
+name: Algorithmic Trading Backtest
 
-# Manual trigger with configurable symbol / timeframe / year range.
-# Defaults are set below (symbol: EURGBP, timeframe: H1, 2020-2024) but
-# can be overridden per-run from the "Run workflow" button in the
-# Actions tab, or via `gh workflow run` with -f flags.
 on:
-  workflow_dispatch:
-    inputs:
-      config_profile:
-        description: "Which config profile to use as the base"
-        required: true
-        default: "frequency"
-        type: choice
-        options:
-          - default
-          - frequency
-      symbol:
-        description: "Symbol to backtest"
-        required: true
-        default: "EURGBP"
-        type: choice
-        options:
-          - EURGBP
-          - AUDNZD
-      timeframe:
-        description: "Timeframe (or 'from_config' to use the chosen profile's own timeframe)"
-        required: true
-        default: "from_config"
-        type: choice
-        options:
-          - from_config
-          - M5
-          - M15
-          - M30
-          - H1
-          - H4
-          - D1
-      start_year:
-        description: "Start year (inclusive)"
-        required: true
-        default: "2020"
-      end_year:
-        description: "End year (inclusive)"
-        required: true
-        default: "2024"
-      initial_balance:
-        description: "Initial account balance (USD)"
-        required: false
-        default: "10000"
-
-  # Optional: also run a quick sanity check whenever the strategy code
-  # itself changes, using the same defaults as above. Remove this block
-  # if you only want manual runs.
   push:
-    branches: [main]
-    paths:
-      - "backtest/**"
-      - "config/**"
-      - "run_backtest.py"
-      - ".github/workflows/backtest.yml"
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  # امکان اجرای دستی از پنل گیتهاب
+  workflow_dispatch:
 
 jobs:
-  backtest:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    
     steps:
-      - name: Checkout repository (including data/ via Git LFS if used)
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Verify expected data files exist
-        run: |
-          SYMBOL="${{ inputs.symbol || 'EURGBP' }}"
-          START="${{ inputs.start_year || '2020' }}"
-          if [ ! -f "data/HISTDATA_COM_ASCII_${SYMBOL}_M1${START}.zip" ] && \
-             [ ! -f "data/DAT_ASCII_${SYMBOL}_M1_${START}.csv" ]; then
-            echo "::warning::No data file found for ${SYMBOL} ${START} under data/. \
-            The run will fail unless the year range only covers years present in the repo."
-          fi
-
-      - name: Run backtest
-        run: |
-          CONFIG_FILE="config/${{ inputs.config_profile || 'frequency' }}.yaml"
-          TF_ARG=""
-          if [ "${{ inputs.timeframe || 'from_config' }}" != "from_config" ]; then
-            TF_ARG="--timeframe ${{ inputs.timeframe }}"
-          fi
-          python run_backtest.py \
-            --config "$CONFIG_FILE" \
-            --symbol "${{ inputs.symbol || 'EURGBP' }}" \
-            $TF_ARG \
-            --start-year "${{ inputs.start_year || '2020' }}" \
-            --end-year "${{ inputs.end_year || '2024' }}" \
-            --initial-balance "${{ inputs.initial_balance || '10000' }}" \
-            --data-dir data \
-            --output-dir output
-
-      - name: Upload backtest artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results-${{ inputs.config_profile || 'frequency' }}-${{ inputs.symbol || 'EURGBP' }}-${{ inputs.timeframe || 'from_config' }}-${{ inputs.start_year || '2020' }}-${{ inputs.end_year || '2024' }}
-          path: output/
-          retention-days: 30
-
-      - name: Print summary to job log
-        if: always()
-        run: |
-          for f in output/summary_*.txt; do
-            [ -f "$f" ] && cat "$f"
-          done
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas numpy matplotlib
+        
+    - name: Run Backtest Engine
+      run: python backtest.py
+      
+    - name: Upload Backtest Artifacts
+      if: always() # حتی اگر کد خطا داد، فایل‌ها را آپلود کن
+      uses: actions/upload-artifact@v3
+      with:
+        name: backtest-results
+        path: |
+          equity_curve.png
+          trades_log.csv
