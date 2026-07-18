@@ -1,4 +1,4 @@
-# engine/regime_detector.py
+# engine/regime_detector.py - RELAXED VERSION
 import pandas as pd
 import numpy as np
 from .indicators import Indicators
@@ -8,10 +8,8 @@ class RegimeDetector:
         self.ind = Indicators()
     
     def detect(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Detect market regime for each H1 bar
-        Returns: 'TREND', 'RANGE', or 'MOMENTUM'
-        """
+        """Detect market regime - Relaxed version"""
+        
         # Calculate indicators
         df['ema50'] = self.ind.ema(df['close'], 50)
         df['ema200'] = self.ind.ema(df['close'], 200)
@@ -24,7 +22,7 @@ class RegimeDetector:
         df['bb_middle'] = bb_middle
         df['bb_lower'] = bb_lower
         
-        # Calculate BB width
+        # BB width
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
         
         # ATR average
@@ -33,27 +31,27 @@ class RegimeDetector:
         # Candle range
         df['candle_range'] = df['high'] - df['low']
         
-        # Detect regimes
+        # Detect regimes (RELAXED)
         df['regime'] = 'NONE'
         
-        # TREND STATE
+        # TREND STATE (relaxed)
         trend_cond = (
-            (df['adx14'] >= 25) &
-            (np.abs(df['ema50'] - df['ema200']) > df['atr14'] * 0.5)
+            (df['adx14'] >= 20) &  # was 25
+            (np.abs(df['ema50'] - df['ema200']) > df['atr14'] * 0.3)  # was 0.5
         )
         df.loc[trend_cond, 'regime'] = 'TREND'
         
-        # RANGE STATE
+        # RANGE STATE (relaxed)
         range_cond = (
-            (df['adx14'] <= 20) &
-            (df['bb_width'] <= 0.04)
+            (df['adx14'] <= 25) &  # was 20
+            (df['bb_width'] <= 0.06)  # was 0.04
         )
         df.loc[range_cond, 'regime'] = 'RANGE'
         
-        # MOMENTUM STATE
+        # MOMENTUM STATE (relaxed)
         momentum_cond = (
-            (df['atr14'] > df['atr_avg50'] * 1.3) &
-            (df['candle_range'] > df['atr14'] * 1.5)
+            (df['atr14'] > df['atr_avg50'] * 1.2) &  # was 1.3
+            (df['candle_range'] > df['atr14'] * 1.2)  # was 1.5
         )
         df.loc[momentum_cond, 'regime'] = 'MOMENTUM'
         
