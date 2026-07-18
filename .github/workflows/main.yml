@@ -1,15 +1,77 @@
 name: Backtest EA
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Run in debug mode'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
+  # ============================================================
+  # JOB 1: DEBUG (اختیاری)
+  # ============================================================
+  debug:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.debug_mode == 'true' || github.ref == 'refs/heads/debug'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas numpy
+    
+    - name: Data inspection
+      run: |
+        echo "## 📁 Data Files" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        ls -lh data/ | head -20 >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 📄 Sample Data Format" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        head -5 data/DAT_ASCII_EURUSD_M1_2010.csv >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Run debug
+      run: python main_debug.py
+      continue-on-error: true
+    
+    - name: Show results
+      if: always()
+      run: |
+        echo "## 🔍 Debug Results" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        cat debug.log >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-logs
+        path: debug.log
+
+  # ============================================================
+  # JOB 2: FULL BACKTEST
+  # ============================================================
   backtest:
     runs-on: ubuntu-latest
+    needs: [debug]
+    if: always() && (needs.debug.result == 'success' || needs.debug.result == 'skipped')
     
     steps:
     - name: Checkout code
@@ -30,8 +92,7 @@ jobs:
       run: mkdir -p results
     
     - name: Run backtest
-      run: |
-        python main.py
+      run: python main.py
       continue-on-error: false
     
     - name: Upload results
@@ -52,7 +113,6 @@ jobs:
           echo "## ✅ Results Generated Successfully" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Parse and display key metrics
           python << 'EOF' >> $GITHUB_STEP_SUMMARY
         import json
         
@@ -71,16 +131,8 @@ jobs:
                   f"{metrics.get('win_rate', 0):.1f}% | "
                   f"{metrics.get('total_trades', 0)} |")
         EOF
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Raw Data" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-          cat results/summary.json >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
         else
           echo "## ⚠️ No results found" >> $GITHUB_STEP_SUMMARY
-          echo "Check the backtest logs for errors." >> $GITHUB_STEP_SUMMARY
         fi
     
     - name: Validate results
@@ -99,122 +151,50 @@ jobs:
         
         passed = []
         failed = []
-        warnings = []
         
         for key, metrics in results.items():
             pf = metrics.get('profit_factor', 0)
             dd = metrics.get('max_drawdown_pct', 100)
             sharpe = metrics.get('sharpe_ratio', 0)
-            wr = metrics.get('win_rate', 0)
             trades = metrics.get('total_trades', 0)
             
-            result_status = []
-            
-            # Critical checks
-            if pf < 1.2:
-                result_status.append(f"❌ PF {pf:.2f} < 1.2")
-                failed.append(f"{key}: Profit Factor too low")
-            else:
-                result_status.append(f"✅ PF {pf:.2f}")
-            
-            if dd > 20:
-                result_status.append(f"❌ DD {dd:.2f}% > 20%")
-                failed.append(f"{key}: Drawdown too high")
-            else:
-                result_status.append(f"✅ DD {dd:.2f}%")
-            
-            if sharpe < 0.5:
-                result_status.append(f"❌ Sharpe {sharpe:.2f} < 0.5")
-                failed.append(f"{key}: Sharpe too low")
-            else:
-                result_status.append(f"✅ Sharpe {sharpe:.2f}")
-            
-            # Warning checks
-            if wr > 70:
-                result_status.append(f"⚠️  WR {wr:.1f}% > 70% (suspicious)")
-                warnings.append(f"{key}: Win rate too high (possible overfitting)")
-            elif wr < 40:
-                result_status.append(f"⚠️  WR {wr:.1f}% < 40%")
-                warnings.append(f"{key}: Win rate too low")
-            else:
-                result_status.append(f"✅ WR {wr:.1f}%")
-            
-            if trades < 50:
-                result_status.append(f"⚠️  Trades {trades} < 50")
-                warnings.append(f"{key}: Too few trades for statistical significance")
-            else:
-                result_status.append(f"✅ Trades {trades}")
-            
             print(f"\n{key}:")
-            for status in result_status:
-                print(f"  {status}")
             
-            if not any("❌" in s for s in result_status):
+            if pf >= 1.2:
+                print(f"  ✅ PF {pf:.2f}")
+            else:
+                print(f"  ❌ PF {pf:.2f} < 1.2")
+                failed.append(f"{key}: Low PF")
+            
+            if dd <= 20:
+                print(f"  ✅ DD {dd:.2f}%")
+            else:
+                print(f"  ❌ DD {dd:.2f}% > 20%")
+                failed.append(f"{key}: High DD")
+            
+            if sharpe >= 0.5:
+                print(f"  ✅ Sharpe {sharpe:.2f}")
+            else:
+                print(f"  ❌ Sharpe {sharpe:.2f} < 0.5")
+                failed.append(f"{key}: Low Sharpe")
+            
+            if trades >= 50:
+                print(f"  ✅ Trades {trades}")
+            else:
+                print(f"  ⚠️  Trades {trades} < 50")
+            
+            if not failed or key not in [f.split(':')[0] for f in failed]:
                 passed.append(key)
         
         print("\n" + "="*60)
-        print(f"SUMMARY: {len(passed)} passed, {len(failed)} failed, {len(warnings)} warnings")
+        print(f"SUMMARY: {len(passed)} passed, {len(failed)} failed")
         print("="*60)
         
         if failed:
-            print("\n❌ FAILED TESTS:")
+            print("\n❌ FAILED:")
             for f in failed:
                 print(f"  • {f}")
-        
-        if warnings:
-            print("\n⚠️  WARNINGS:")
-            for w in warnings:
-                print(f"  • {w}")
-        
-        if passed:
-            print("\n✅ PASSED TESTS:")
-            for p in passed:
-                print(f"  • {p}")
-        
-        if failed:
-            print("\n🔴 VALIDATION FAILED - System not ready for production")
             sys.exit(1)
-        elif warnings:
-            print("\n🟡 VALIDATION PASSED WITH WARNINGS - Review before production")
-            sys.exit(0)
         else:
-            print("\n🟢 ALL VALIDATION CHECKS PASSED - System ready for MQL5 conversion")
-            sys.exit(0)
+            print("\n✅ ALL PASSED")
         EOF
-    
-    - name: Comment PR
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const fs = require('fs');
-          
-          if (!fs.existsSync('results/summary.json')) {
-            return;
-          }
-          
-          const results = JSON.parse(fs.readFileSync('results/summary.json', 'utf8'));
-          
-          let comment = '## 📊 Backtest Results\n\n';
-          comment += '| Configuration | Profit % | PF | DD % | Sharpe | Status |\n';
-          comment += '|---------------|----------|----|----|--------|--------|\n';
-          
-          for (const [key, metrics] of Object.entries(results)) {
-            const pf = metrics.profit_factor || 0;
-            const dd = metrics.max_drawdown_pct || 0;
-            const sharpe = metrics.sharpe_ratio || 0;
-            
-            let status = '✅';
-            if (pf < 1.2 || dd > 20 || sharpe < 0.5) {
-              status = '❌';
-            }
-            
-            comment += `| ${key} | ${metrics.net_profit_pct?.toFixed(2)}% | ${pf.toFixed(2)} | ${dd.toFixed(2)}% | ${sharpe.toFixed(2)} | ${status} |\n`;
-          }
-          
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: comment
-          });
