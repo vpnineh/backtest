@@ -1,131 +1,119 @@
-# main_debug.py
+# main_debug.py - ENHANCED
 import logging
 import sys
 from pathlib import Path
-import json
 import pandas as pd
 from config import BacktestConfig
 from engine.data_loader import DataLoader, TimeFrameConverter
 from engine.regime_detector import RegimeDetector
+from engine.strategies import ModeA_ConservativeTrend, ModeB_BalancedRange, ModeC_AggressiveMomentum
 
-# Setup detailed logging
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('debug.log')
-    ]
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 logger = logging.getLogger(__name__)
 
-def debug_data_loading():
-    """Test data loading step by step"""
+def debug_full():
+    """Complete debug with signal counting"""
+    
     logger.info("="*60)
-    logger.info("STEP 1: Testing Data Loading")
+    logger.info("LOADING DATA")
     logger.info("="*60)
     
     loader = DataLoader()
+    m1_data = loader.load_symbol('EURUSD', 2020, 2021)  # 2 years for quick test
     
-    try:
-        # Test EURUSD
-        m1_data = loader.load_symbol('EURUSD', 2010, 2011)
+    logger.info(f"✓ Loaded {len(m1_data):,} M1 bars")
+    
+    h1_data = TimeFrameConverter.resample_to_h1(m1_data)
+    logger.info(f"✓ Converted to {len(h1_data):,} H1 bars")
+    
+    logger.info("\n" + "="*60)
+    logger.info("CALCULATING INDICATORS")
+    logger.info("="*60)
+    
+    detector = RegimeDetector()
+    h1_data = detector.detect(h1_data)
+    h1_data = h1_data.dropna().reset_index(drop=True)
+    
+    logger.info(f"✓ Indicators ready: {len(h1_data):,} bars")
+    
+    # Regime distribution
+    regime_counts = h1_data['regime'].value_counts()
+    logger.info(f"\nRegime Distribution:")
+    for regime, count in regime_counts.items():
+        pct = (count / len(h1_data)) * 100
+        logger.info(f"  {regime}: {count} ({pct:.1f}%)")
+    
+    logger.info("\n" + "="*60)
+    logger.info("COUNTING SIGNALS")
+    logger.info("="*60)
+    
+    signals = {
+        'A_BUY': [], 'A_SELL': [],
+        'B_BUY': [], 'B_SELL': [],
+        'C_BUY': [], 'C_SELL': []
+    }
+    
+    for i in range(200, len(h1_data)):
+        current = h1_data.iloc[i]
+        prev = h1_data.iloc[i-1]
         
-        logger.info(f"M1 Data Shape: {m1_data.shape}")
-        logger.info(f"M1 Data Columns: {m1_data.columns.tolist()}")
-        logger.info(f"M1 First 5 rows:\n{m1_data.head()}")
-        logger.info(f"M1 Data types:\n{m1_data.dtypes}")
-        logger.info(f"M1 Date range: {m1_data['time'].min()} to {m1_data['time'].max()}")
+        # Mode A
+        sig_a = ModeA_ConservativeTrend.check_signal(current, prev)
+        if sig_a == 'BUY':
+            signals['A_BUY'].append(i)
+        elif sig_a == 'SELL':
+            signals['A_SELL'].append(i)
         
-        # Check for NaN
-        logger.info(f"M1 NaN count:\n{m1_data.isna().sum()}")
+        # Mode B
+        sig_b = ModeB_BalancedRange.check_signal(current)
+        if sig_b == 'BUY':
+            signals['B_BUY'].append(i)
+        elif sig_b == 'SELL':
+            signals['B_SELL'].append(i)
         
-        # Convert to H1
-        logger.info("\n" + "="*60)
-        logger.info("STEP 2: Testing H1 Conversion")
-        logger.info("="*60)
-        
-        h1_data = TimeFrameConverter.resample_to_h1(m1_data)
-        
-        logger.info(f"H1 Data Shape: {h1_data.shape}")
-        logger.info(f"H1 First 5 rows:\n{h1_data.head()}")
-        logger.info(f"H1 Date range: {h1_data['time'].min()} to {h1_data['time'].max()}")
-        logger.info(f"H1 NaN count:\n{h1_data.isna().sum()}")
-        
-        # Test indicators
-        logger.info("\n" + "="*60)
-        logger.info("STEP 3: Testing Indicators")
-        logger.info("="*60)
-        
-        detector = RegimeDetector()
-        h1_data = detector.detect(h1_data)
-        
-        logger.info(f"After indicators Shape: {h1_data.shape}")
-        logger.info(f"Indicators columns: {h1_data.columns.tolist()}")
-        logger.info(f"Indicator NaN count:\n{h1_data.isna().sum()}")
-        
-        # Show sample with indicators
-        sample = h1_data[['time', 'close', 'ema50', 'ema200', 'atr14', 'rsi14', 'adx14', 'regime']].tail(20)
-        logger.info(f"Sample with indicators:\n{sample}")
-        
-        # Regime distribution
-        logger.info(f"\nRegime distribution:\n{h1_data['regime'].value_counts()}")
-        
-        # Test signal generation
-        logger.info("\n" + "="*60)
-        logger.info("STEP 4: Testing Signal Generation")
-        logger.info("="*60)
-        
-        from engine.strategies import ModeA_ConservativeTrend, ModeB_BalancedRange, ModeC_AggressiveMomentum
-        
-        signals_a = 0
-        signals_b = 0
-        signals_c = 0
-        
-        for i in range(200, len(h1_data)):
-            current = h1_data.iloc[i]
-            prev = h1_data.iloc[i-1]
-            
-            sig_a = ModeA_ConservativeTrend.check_signal(current, prev)
-            sig_b = ModeB_BalancedRange.check_signal(current)
-            sig_c = ModeC_AggressiveMomentum.check_signal(current, prev)
-            
-            if sig_a:
-                signals_a += 1
-                if signals_a <= 3:
-                    logger.info(f"Mode A Signal {sig_a} at {current['time']}")
-            
-            if sig_b:
-                signals_b += 1
-                if signals_b <= 3:
-                    logger.info(f"Mode B Signal {sig_b} at {current['time']}")
-            
-            if sig_c:
-                signals_c += 1
-                if signals_c <= 3:
-                    logger.info(f"Mode C Signal {sig_c} at {current['time']}")
-        
-        logger.info(f"\nTotal signals in sample:")
-        logger.info(f"  Mode A: {signals_a}")
-        logger.info(f"  Mode B: {signals_b}")
-        logger.info(f"  Mode C: {signals_c}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error during debug: {e}", exc_info=True)
+        # Mode C
+        sig_c = ModeC_AggressiveMomentum.check_signal(current, prev)
+        if sig_c == 'BUY':
+            signals['C_BUY'].append(i)
+        elif sig_c == 'SELL':
+            signals['C_SELL'].append(i)
+    
+    logger.info("\nSignal Counts:")
+    logger.info(f"  Mode A BUY:  {len(signals['A_BUY'])}")
+    logger.info(f"  Mode A SELL: {len(signals['A_SELL'])}")
+    logger.info(f"  Mode A Total: {len(signals['A_BUY']) + len(signals['A_SELL'])}")
+    logger.info("")
+    logger.info(f"  Mode B BUY:  {len(signals['B_BUY'])}")
+    logger.info(f"  Mode B SELL: {len(signals['B_SELL'])}")
+    logger.info(f"  Mode B Total: {len(signals['B_BUY']) + len(signals['B_SELL'])}")
+    logger.info("")
+    logger.info(f"  Mode C BUY:  {len(signals['C_BUY'])}")
+    logger.info(f"  Mode C SELL: {len(signals['C_SELL'])}")
+    logger.info(f"  Mode C Total: {len(signals['C_BUY']) + len(signals['C_SELL'])}")
+    
+    total_signals = sum(len(v) for v in signals.values())
+    logger.info(f"\n✓ TOTAL SIGNALS: {total_signals}")
+    
+    # Show sample signals
+    if signals['A_BUY']:
+        logger.info("\nSample Mode A BUY signals:")
+        for idx in signals['A_BUY'][:3]:
+            row = h1_data.iloc[idx]
+            logger.info(f"  {row['time']}: Close={row['close']:.5f}, RSI={row['rsi14']:.1f}, ADX={row['adx14']:.1f}")
+    
+    if total_signals < 50:
+        logger.warning("\n⚠️  WARNING: Less than 50 signals found!")
+        logger.warning("Strategy conditions may be too strict.")
         return False
+    else:
+        logger.info(f"\n✅ SUCCESS: {total_signals} signals found")
+        return True
 
 if __name__ == '__main__':
-    success = debug_data_loading()
-    
-    if success:
-        print("\n" + "="*60)
-        print("✅ DEBUG COMPLETED - Check debug.log for details")
-        print("="*60)
-    else:
-        print("\n" + "="*60)
-        print("❌ DEBUG FAILED - Check debug.log for errors")
-        print("="*60)
-        sys.exit(1)
+    success = debug_full()
+    sys.exit(0 if success else 1)
