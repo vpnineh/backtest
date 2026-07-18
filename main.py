@@ -1,56 +1,110 @@
 import os
 import glob
 import zipfile
+import json
+import shutil
 import pandas as pd
 import numpy as np
-import json
-from datetime import datetime
 
+
+# =========================
+# CONFIG
+# =========================
 
 INITIAL_BALANCE = 10000
-RISK_A = 0.005
-RISK_B = 0.01
-RISK_C = 0.015
+
+RISK = {
+    "A": 0.005,
+    "B": 0.01,
+    "C": 0.015
+}
+
+ATR_MULT_SL = 1.5
+ATR_MULT_TP = 3
+
+RESULT_DIR = "results"
+TEMP_DIR = "temp_data"
 
 
-def load_files():
+# =========================
+# FILE LOADER
+# =========================
 
-    files = glob.glob("data/*")
 
-    csv_files = []
+def collect_files():
 
-    for f in files:
+    files = []
 
-        if f.endswith(".zip"):
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+    for f in glob.glob("data/*"):
+
+        if f.endswith(".csv"):
+            files.append(f)
+
+
+        elif f.endswith(".zip"):
+
             with zipfile.ZipFile(f) as z:
+
                 for name in z.namelist():
+
                     if name.endswith(".csv"):
-                        z.extract(name,"data/temp")
-                        csv_files.append(
-                            "data/temp/" + name
+
+                        out = os.path.join(
+                            TEMP_DIR,
+                            os.path.basename(name)
                         )
 
-        elif f.endswith(".csv"):
-            csv_files.append(f)
+                        with open(out,"wb") as w:
+                            w.write(
+                                z.read(name)
+                            )
+
+                        files.append(out)
 
 
-    return csv_files
+    return files
 
 
 
-def read_data(file):
+# =========================
+# CSV PARSER
+# =========================
+
+
+def load_csv(path):
 
     try:
 
-        df=pd.read_csv(
-            file,
-            sep=";",
+        df = pd.read_csv(
+            path,
+            sep=None,
+            engine="python",
             header=None
         )
 
-        if len(df.columns)>=6:
 
-            df=df.iloc[:,:6]
+        # remove empty columns
+
+        df = df.dropna(
+            axis=1,
+            how="all"
+        )
+
+
+        if len(df.columns) < 5:
+            return None
+
+
+
+        # HISTDATA FORMAT
+
+        if len(df.columns) >= 6:
+
+
+            df = df.iloc[:,0:6]
 
             df.columns=[
                 "time",
@@ -67,12 +121,12 @@ def read_data(file):
             return None
 
 
-        df["time"]=pd.to_datetime(
+
+        df["time"] = pd.to_datetime(
             df["time"],
             errors="coerce"
         )
 
-        df=df.dropna()
 
         for c in [
             "open",
@@ -80,49 +134,94 @@ def read_data(file):
             "low",
             "close"
         ]:
+
             df[c]=pd.to_numeric(
                 df[c],
                 errors="coerce"
             )
 
 
-        return df.sort_values("time")
+        df=df.dropna()
 
 
-    except Exception:
+        df=df.sort_values(
+            "time"
+        )
+
+
+        return df
+
+
+    except Exception as e:
+
+        print(
+            "LOAD ERROR:",
+            path,
+            e
+        )
 
         return None
 
 
 
-def indicators(df):
+# =========================
+# INDICATORS
+# =========================
 
-    df["ema50"]=(
+
+def add_indicators(df):
+
+
+    df["ema50"] = (
         df.close
         .ewm(span=50)
         .mean()
     )
 
-    df["ema200"]=(
+
+    df["ema200"] = (
         df.close
         .ewm(span=200)
         .mean()
     )
 
 
+
     delta=df.close.diff()
 
-    gain=delta.clip(lower=0)
-    loss=-delta.clip(upper=0)
 
-
-    rs=(
-        gain.rolling(14).mean()
-        /
-        loss.rolling(14).mean()
+    gain=np.where(
+        delta>0,
+        delta,
+        0
     )
 
-    df["rsi"]=100-(100/(1+rs))
+
+    loss=np.where(
+        delta<0,
+        -delta,
+        0
+    )
+
+
+    avg_gain=pd.Series(
+        gain
+    ).rolling(14).mean()
+
+
+    avg_loss=pd.Series(
+        loss
+    ).rolling(14).mean()
+
+
+    rs=avg_gain / avg_loss
+
+
+    df["rsi"] = (
+        100 -
+        (100/(1+rs))
+    )
+
 
 
     tr=pd.concat(
@@ -135,203 +234,349 @@ def indicators(df):
     ).max(axis=1)
 
 
-    df["atr"]=tr.rolling(14).mean()
+
+    df["atr"] = (
+        tr.rolling(14)
+        .mean()
+    )
+
+
+    df["bb_mid"]=(
+        df.close
+        .rolling(20)
+        .mean()
+    )
+
+
+    std=(
+        df.close
+        .rolling(20)
+        .std()
+    )
+
+
+    df["bb_high"]=df.bb_mid+2*std
+    df["bb_low"]=df.bb_mid-2*std
+
 
 
     return df.dropna()
 
 
 
-def backtest(df,mode):
+# =========================
+# STRATEGY
+# =========================
+
+
+def get_signal(row,mode):
+
+
+    price=row.close
+
+
+
+    if mode=="A":
+
+        if (
+            row.ema50 >
+            row.ema200
+            and
+            45 < row.rsi < 65
+        ):
+            return "BUY"
+
+
+
+        if (
+            row.ema50 <
+            row.ema200
+            and
+            35 < row.rsi < 55
+        ):
+            return "SELL"
+
+
+
+    elif mode=="B":
+
+
+        if price < row.bb_low and row.rsi < 35:
+            return "BUY"
+
+
+
+        if price > row.bb_high and row.rsi > 65:
+            return "SELL"
+
+
+
+    elif mode=="C":
+
+
+        if (
+            price > row.ema50
+            and
+            row.atr >
+            row.atr.mean()
+        ):
+            return "BUY"
+
+
+
+        if (
+            price < row.ema50
+            and
+            row.atr >
+            row.atr.mean()
+        ):
+            return "SELL"
+
+
+
+    return None
+
+
+
+
+# =========================
+# BACKTEST
+# =========================
+
+
+def run_backtest(df,mode):
+
 
     balance=INITIAL_BALANCE
+
+
     equity=[]
 
     trades=[]
 
-    position=None
+
+    i=0
 
 
-    for i,row in df.iterrows():
+    while i < len(df)-10:
 
 
-        price=row.close
+        row=df.iloc[i]
 
 
-        signal=None
-
-
-        # MODE A
-        if mode=="A":
-
-            if (
-                row.ema50>row.ema200
-                and row.rsi>45
-                and row.rsi<65
-            ):
-                signal="BUY"
-
-
-            elif (
-                row.ema50<row.ema200
-                and row.rsi>35
-                and row.rsi<55
-            ):
-                signal="SELL"
-
-
-
-        # MODE B
-        elif mode=="B":
-
-            if row.rsi<30:
-
-                signal="BUY"
-
-            elif row.rsi>70:
-
-                signal="SELL"
-
-
-
-        # MODE C
-
-        elif mode=="C":
-
-            if (
-                price>row.ema50
-                and row.atr>df.atr.mean()
-            ):
-                signal="BUY"
-
-            elif (
-                price<row.ema50
-                and row.atr>df.atr.mean()
-            ):
-                signal="SELL"
-
+        signal=get_signal(
+            row,
+            mode
+        )
 
 
         if signal:
 
-            risk={
-                "A":RISK_A,
-                "B":RISK_B,
-                "C":RISK_C
-            }[mode]
+
+            entry=row.close
 
 
-            sl=row.atr*1.5
-            tp=row.atr*3
+            atr=row.atr
 
 
-            if signal=="BUY":
+            sl_distance=atr*ATR_MULT_SL
 
-                result=(
-                    df.close.iloc[
-                        min(i+20,len(df)-1)
-                    ]
-                    -
-                    price
+            tp_distance=atr*ATR_MULT_TP
+
+
+
+            result=0
+
+
+
+            future=df.iloc[
+                i+1:
+                min(
+                    i+50,
+                    len(df)
                 )
+            ]
 
 
-            else:
 
-                result=(
-                    price-
-                    df.close.iloc[
-                        min(i+20,len(df)-1)
-                    ]
-                )
+            for candle in future.itertuples():
 
 
-            money=balance*risk
+                if signal=="BUY":
 
 
-            if result>tp:
+                    if candle.low <= entry-sl_distance:
 
-                balance+=money*2
+                        result=-1
+                        break
 
+
+                    if candle.high >= entry+tp_distance:
+
+                        result=2
+                        break
+
+
+
+                else:
+
+
+                    if candle.high >= entry+sl_distance:
+
+                        result=-1
+                        break
+
+
+                    if candle.low <= entry-tp_distance:
+
+                        result=2
+                        break
+
+
+
+            money=(
+                balance*
+                RISK[mode]
+            )
+
+
+            if result==2:
+
+                balance += money*2
                 trades.append(1)
 
 
-            elif result<-sl:
 
-                balance-=money
+            elif result==-1:
 
+                balance -= money
                 trades.append(-1)
 
 
 
         equity.append(balance)
 
+        i+=1
 
 
-    wins=len(
-        [x for x in trades if x>0]
+
+    wins=sum(
+        x>0 for x in trades
     )
 
-    losses=len(
-        [x for x in trades if x<0]
+
+    losses=sum(
+        x<0 for x in trades
     )
 
 
-    dd=(
-        1-
-        min(equity)/
-        max(equity)
-    )*100
+    peak=max(equity) if equity else INITIAL_BALANCE
+
+
+    dd=[]
+
+
+    for x in equity:
+
+        if x>peak:
+            peak=x
+
+        dd.append(
+            (peak-x)/peak*100
+        )
 
 
     return {
 
         "mode":mode,
-        "balance":round(balance,2),
-        "profit_%":
-            round(
-                (balance/INITIAL_BALANCE-1)*100,
-                2
-            ),
 
-        "trades":len(trades),
+        "final_balance":
+        round(balance,2),
 
-        "winrate":
-            round(
-                wins/max(1,len(trades))*100,
-                2
-            ),
+        "profit_percent":
+        round(
+            (balance/INITIAL_BALANCE-1)*100,
+            2
+        ),
 
-        "drawdown_%":
-            round(dd,2)
+        "trades":
+        len(trades),
+
+        "win_rate":
+        round(
+            wins/max(1,len(trades))*100,
+            2
+        ),
+
+        "max_drawdown":
+        round(
+            max(dd) if dd else 0,
+            2
+        )
 
     }
 
 
 
+
+# =========================
+# MAIN
+# =========================
+
+
 def main():
 
-    files=load_files()
+
+    if os.path.exists(RESULT_DIR):
+        shutil.rmtree(
+            RESULT_DIR
+        )
+
+
+    os.makedirs(
+        RESULT_DIR
+    )
+
+
 
     results=[]
 
 
-    for f in files:
+    files=collect_files()
+
+
+    print(
+        "FILES:",
+        len(files)
+    )
+
+
+
+    for file in files:
+
 
         print(
             "Testing:",
-            f
+            file
         )
 
-        df=read_data(f)
+
+        df=load_csv(file)
+
 
         if df is None:
             continue
 
 
+
+        df=df.set_index(
+            "time"
+        )
+
+
+
         df=df.resample(
-            "1H",
-            on="time"
+            "1h"
         ).agg(
             {
                 "open":"first",
@@ -343,7 +588,14 @@ def main():
         ).dropna()
 
 
-        df=indicators(df)
+
+        if len(df)<300:
+            continue
+
+
+
+        df=add_indicators(df)
+
 
 
         for mode in [
@@ -352,25 +604,25 @@ def main():
             "C"
         ]:
 
-            r=backtest(
+
+            r=run_backtest(
                 df,
                 mode
             )
 
-            r["file"]=os.path.basename(f)
+
+            r["symbol_file"]=(
+                os.path.basename(file)
+            )
+
 
             results.append(r)
 
 
 
-    os.makedirs(
-        "results",
-        exist_ok=True
-    )
-
 
     with open(
-        "results/report.json",
+        RESULT_DIR+"/report.json",
         "w"
     ) as f:
 
@@ -381,19 +633,22 @@ def main():
         )
 
 
-    pd.DataFrame(results).to_csv(
-        "results/report.csv",
+
+    pd.DataFrame(
+        results
+    ).to_csv(
+        RESULT_DIR+"/report.csv",
         index=False
     )
 
 
-    print("\nDONE")
-    print(
-        json.dumps(
-            results,
-            indent=2
-        )
-    )
+
+    print("\n========== DONE ==========")
+
+
+    for r in results:
+
+        print(r)
 
 
 
