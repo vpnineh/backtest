@@ -1,85 +1,94 @@
-# engine/strategies.py
+# engine/strategies.py - RELAXED VERSION
 import pandas as pd
 import numpy as np
 from typing import Optional, Literal
 
 class ModeA_ConservativeTrend:
-    """Mode A: Conservative Trend Following on H1"""
+    """Mode A: Simplified Trend Following"""
     
     @staticmethod
     def check_signal(row: pd.Series, prev_row: pd.Series) -> Optional[Literal['BUY', 'SELL']]:
-        """Check for trend following signals"""
+        """Relaxed trend signals"""
         
-        if row['regime'] != 'TREND':
+        # Skip if indicators not ready
+        if pd.isna(row['ema50']) or pd.isna(row['ema200']) or pd.isna(row['adx14']):
             return None
         
-        # BUY conditions
+        # BUY: Simple trend following
         if (
-            row['ema50'] > row['ema200'] and
-            prev_row['low'] <= prev_row['ema50'] and
-            row['close'] > row['ema50'] and
-            45 <= row['rsi14'] <= 65 and
-            row['adx14'] >= 25
+            row['ema50'] > row['ema200'] and  # Uptrend
+            row['close'] > row['ema50'] and    # Price above EMA
+            row['adx14'] >= 20 and             # Some trend (was 25)
+            row['rsi14'] >= 40 and             # Not oversold (was 45-65)
+            row['rsi14'] <= 70                 # Not overbought
         ):
             return 'BUY'
         
-        # SELL conditions
+        # SELL: Simple trend following
         if (
-            row['ema50'] < row['ema200'] and
-            prev_row['high'] >= prev_row['ema50'] and
-            row['close'] < row['ema50'] and
-            35 <= row['rsi14'] <= 55 and
-            row['adx14'] >= 25
+            row['ema50'] < row['ema200'] and   # Downtrend
+            row['close'] < row['ema50'] and    # Price below EMA
+            row['adx14'] >= 20 and             # Some trend
+            row['rsi14'] >= 30 and             # Not oversold
+            row['rsi14'] <= 60                 # Not overbought (was 35-55)
         ):
             return 'SELL'
         
         return None
 
 class ModeB_BalancedRange:
-    """Mode B: Range Mean Reversion"""
+    """Mode B: Simplified Range Trading"""
     
     @staticmethod
     def check_signal(row: pd.Series) -> Optional[Literal['BUY', 'SELL']]:
-        """Check for range trading signals"""
+        """Relaxed range signals"""
         
-        if row['regime'] != 'RANGE':
+        # Skip if indicators not ready
+        if pd.isna(row['bb_lower']) or pd.isna(row['bb_upper']) or pd.isna(row['rsi14']):
             return None
         
-        # BUY at lower band
-        if row['close'] <= row['bb_lower'] and row['rsi14'] <= 30:
+        # BUY at lower band (relaxed)
+        if (
+            row['close'] <= row['bb_lower'] * 1.001 and  # Near lower band (was exact)
+            row['rsi14'] <= 35                            # Oversold (was 30)
+        ):
             return 'BUY'
         
-        # SELL at upper band
-        if row['close'] >= row['bb_upper'] and row['rsi14'] >= 70:
+        # SELL at upper band (relaxed)
+        if (
+            row['close'] >= row['bb_upper'] * 0.999 and  # Near upper band
+            row['rsi14'] >= 65                            # Overbought (was 70)
+        ):
             return 'SELL'
         
         return None
 
 class ModeC_AggressiveMomentum:
-    """Mode C: Momentum Breakout"""
+    """Mode C: Simplified Momentum"""
     
     @staticmethod
     def check_signal(row: pd.Series, prev_row: pd.Series) -> Optional[Literal['BUY', 'SELL']]:
-        """Check for momentum signals"""
+        """Relaxed momentum signals"""
         
-        if row['regime'] != 'MOMENTUM':
+        # Skip if indicators not ready
+        if pd.isna(row['ema50']) or pd.isna(row['atr14']):
             return None
         
-        candle_body = abs(row['open'] - row['close'])
+        candle_body = abs(row['close'] - row['open'])
         
-        # BUY momentum
+        # BUY momentum (relaxed)
         if (
-            row['close'] > row['ema50'] and
-            candle_body >= row['atr14'] * 0.8 and
-            row['close'] > prev_row['high']
+            row['close'] > row['ema50'] and              # Above EMA
+            candle_body >= row['atr14'] * 0.5 and        # Strong candle (was 0.8)
+            row['close'] > row['open']                    # Bullish candle (removed prev_high condition)
         ):
             return 'BUY'
         
-        # SELL momentum
+        # SELL momentum (relaxed)
         if (
-            row['close'] < row['ema50'] and
-            candle_body >= row['atr14'] * 0.8 and
-            row['close'] < prev_row['low']
+            row['close'] < row['ema50'] and              # Below EMA
+            candle_body >= row['atr14'] * 0.5 and        # Strong candle
+            row['close'] < row['open']                    # Bearish candle
         ):
             return 'SELL'
         
