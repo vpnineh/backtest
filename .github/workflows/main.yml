@@ -13,70 +13,208 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.11'
+        cache: 'pip'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
+    - name: Create results directory
+      run: mkdir -p results
+    
     - name: Run backtest
       run: |
         python main.py
+      continue-on-error: false
     
     - name: Upload results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
+      if: always()
       with:
         name: backtest-results
         path: results/
+        retention-days: 30
     
     - name: Generate summary
+      if: always()
       run: |
-        echo "## Backtest Summary" >> $GITHUB_STEP_SUMMARY
+        echo "# 📊 Backtest Results Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
         if [ -f results/summary.json ]; then
-          echo "### Results Generated Successfully ✓" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-          cat results/summary.json >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "### ⚠️ No results found" >> $GITHUB_STEP_SUMMARY
-        fi
-    
-    - name: Check validation criteria
-      run: |
-        python -c "
+          echo "## ✅ Results Generated Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse and display key metrics
+          python << 'EOF' >> $GITHUB_STEP_SUMMARY
         import json
-        import sys
         
         with open('results/summary.json') as f:
             results = json.load(f)
         
+        print("| Symbol-Mode | Net Profit % | Profit Factor | Max DD % | Sharpe | Win Rate % | Trades |")
+        print("|-------------|--------------|---------------|----------|--------|------------|--------|")
+        
+        for key, metrics in results.items():
+            print(f"| {key} | "
+                  f"{metrics.get('net_profit_pct', 0):.2f}% | "
+                  f"{metrics.get('profit_factor', 0):.2f} | "
+                  f"{metrics.get('max_drawdown_pct', 0):.2f}% | "
+                  f"{metrics.get('sharpe_ratio', 0):.2f} | "
+                  f"{metrics.get('win_rate', 0):.1f}% | "
+                  f"{metrics.get('total_trades', 0)} |")
+        EOF
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Raw Data" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat results/summary.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ⚠️ No results found" >> $GITHUB_STEP_SUMMARY
+          echo "Check the backtest logs for errors." >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Validate results
+      if: success()
+      run: |
+        python << 'EOF'
+        import json
+        import sys
+        
+        print("\n" + "="*60)
+        print("VALIDATION CHECK")
+        print("="*60)
+        
+        with open('results/summary.json') as f:
+            results = json.load(f)
+        
+        passed = []
         failed = []
+        warnings = []
         
         for key, metrics in results.items():
             pf = metrics.get('profit_factor', 0)
             dd = metrics.get('max_drawdown_pct', 100)
             sharpe = metrics.get('sharpe_ratio', 0)
+            wr = metrics.get('win_rate', 0)
+            trades = metrics.get('total_trades', 0)
             
+            result_status = []
+            
+            # Critical checks
             if pf < 1.2:
-                failed.append(f'{key}: Profit Factor {pf:.2f} < 1.2')
+                result_status.append(f"❌ PF {pf:.2f} < 1.2")
+                failed.append(f"{key}: Profit Factor too low")
+            else:
+                result_status.append(f"✅ PF {pf:.2f}")
+            
             if dd > 20:
-                failed.append(f'{key}: Max DD {dd:.2f}% > 20%')
+                result_status.append(f"❌ DD {dd:.2f}% > 20%")
+                failed.append(f"{key}: Drawdown too high")
+            else:
+                result_status.append(f"✅ DD {dd:.2f}%")
+            
             if sharpe < 0.5:
-                failed.append(f'{key}: Sharpe {sharpe:.2f} < 0.5')
+                result_status.append(f"❌ Sharpe {sharpe:.2f} < 0.5")
+                failed.append(f"{key}: Sharpe too low")
+            else:
+                result_status.append(f"✅ Sharpe {sharpe:.2f}")
+            
+            # Warning checks
+            if wr > 70:
+                result_status.append(f"⚠️  WR {wr:.1f}% > 70% (suspicious)")
+                warnings.append(f"{key}: Win rate too high (possible overfitting)")
+            elif wr < 40:
+                result_status.append(f"⚠️  WR {wr:.1f}% < 40%")
+                warnings.append(f"{key}: Win rate too low")
+            else:
+                result_status.append(f"✅ WR {wr:.1f}%")
+            
+            if trades < 50:
+                result_status.append(f"⚠️  Trades {trades} < 50")
+                warnings.append(f"{key}: Too few trades for statistical significance")
+            else:
+                result_status.append(f"✅ Trades {trades}")
+            
+            print(f"\n{key}:")
+            for status in result_status:
+                print(f"  {status}")
+            
+            if not any("❌" in s for s in result_status):
+                passed.append(key)
+        
+        print("\n" + "="*60)
+        print(f"SUMMARY: {len(passed)} passed, {len(failed)} failed, {len(warnings)} warnings")
+        print("="*60)
         
         if failed:
-            print('⚠️ Validation Failed:')
+            print("\n❌ FAILED TESTS:")
             for f in failed:
-                print(f'  - {f}')
+                print(f"  • {f}")
+        
+        if warnings:
+            print("\n⚠️  WARNINGS:")
+            for w in warnings:
+                print(f"  • {w}")
+        
+        if passed:
+            print("\n✅ PASSED TESTS:")
+            for p in passed:
+                print(f"  • {p}")
+        
+        if failed:
+            print("\n🔴 VALIDATION FAILED - System not ready for production")
             sys.exit(1)
+        elif warnings:
+            print("\n🟡 VALIDATION PASSED WITH WARNINGS - Review before production")
+            sys.exit(0)
         else:
-            print('✓ All validation criteria passed!')
-        "
+            print("\n🟢 ALL VALIDATION CHECKS PASSED - System ready for MQL5 conversion")
+            sys.exit(0)
+        EOF
+    
+    - name: Comment PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          if (!fs.existsSync('results/summary.json')) {
+            return;
+          }
+          
+          const results = JSON.parse(fs.readFileSync('results/summary.json', 'utf8'));
+          
+          let comment = '## 📊 Backtest Results\n\n';
+          comment += '| Configuration | Profit % | PF | DD % | Sharpe | Status |\n';
+          comment += '|---------------|----------|----|----|--------|--------|\n';
+          
+          for (const [key, metrics] of Object.entries(results)) {
+            const pf = metrics.profit_factor || 0;
+            const dd = metrics.max_drawdown_pct || 0;
+            const sharpe = metrics.sharpe_ratio || 0;
+            
+            let status = '✅';
+            if (pf < 1.2 || dd > 20 || sharpe < 0.5) {
+              status = '❌';
+            }
+            
+            comment += `| ${key} | ${metrics.net_profit_pct?.toFixed(2)}% | ${pf.toFixed(2)} | ${dd.toFixed(2)}% | ${sharpe.toFixed(2)} | ${status} |\n`;
+          }
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
