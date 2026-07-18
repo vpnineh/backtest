@@ -1,57 +1,82 @@
-name: Adaptive EA Backtest
-
+name: Backtest EA
 
 on:
-
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
-
 jobs:
-
-  test:
-
+  backtest:
     runs-on: ubuntu-latest
-
-
+    
     steps:
-
-
-    - name: Checkout
-      uses: actions/checkout@v4
-
-
-
-    - name: Setup Python
-      uses: actions/setup-python@v5
-
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
-
-        python-version: "3.11"
-
-
-
-    - name: Install
-
-      run:
-
-        pip install pandas numpy
-
-
-
-    - name: Run Backtest
-
-      run:
-
-        python -u main.py
-
-
-
-    - name: Upload Results
-
-      uses: actions/upload-artifact@v4
-
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run backtest
+      run: |
+        python main.py
+    
+    - name: Upload results
+      uses: actions/upload-artifact@v3
       with:
-
         name: backtest-results
-
         path: results/
+    
+    - name: Generate summary
+      run: |
+        echo "## Backtest Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f results/summary.json ]; then
+          echo "### Results Generated Successfully ✓" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat results/summary.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ⚠️ No results found" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Check validation criteria
+      run: |
+        python -c "
+        import json
+        import sys
+        
+        with open('results/summary.json') as f:
+            results = json.load(f)
+        
+        failed = []
+        
+        for key, metrics in results.items():
+            pf = metrics.get('profit_factor', 0)
+            dd = metrics.get('max_drawdown_pct', 100)
+            sharpe = metrics.get('sharpe_ratio', 0)
+            
+            if pf < 1.2:
+                failed.append(f'{key}: Profit Factor {pf:.2f} < 1.2')
+            if dd > 20:
+                failed.append(f'{key}: Max DD {dd:.2f}% > 20%')
+            if sharpe < 0.5:
+                failed.append(f'{key}: Sharpe {sharpe:.2f} < 0.5')
+        
+        if failed:
+            print('⚠️ Validation Failed:')
+            for f in failed:
+                print(f'  - {f}')
+            sys.exit(1)
+        else:
+            print('✓ All validation criteria passed!')
+        "
